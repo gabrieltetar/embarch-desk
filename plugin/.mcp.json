@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "embarch-desk": { "command": "embarch-desk", "args": ["mcp"] }
+  }
+}
