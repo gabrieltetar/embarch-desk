@@ -67,6 +67,14 @@ pub struct State {
     /// (`embarch-chat-desk-proposal.md` 40).
     #[serde(default)]
     pub notes: BTreeMap<String, Vec<Line>>,
+    /// When each item's notes last changed — a note added, a memory file's
+    /// new version, held notes landing, the import, an archived tile's lines
+    /// moving onto the item. A card re-reads its notes only when this moves
+    /// (chat-desk proposal, Interface); a held note lands with its own older
+    /// time, so the newest note's time would not. A state file from before
+    /// it reads the newest note's time until the item's next change.
+    #[serde(default)]
+    pub notes_changed: BTreeMap<String, i64>,
     /// The memory files written before capture existed have been attached
     /// to their items (proposal 47) — once, on the first start with notes.
     #[serde(default)]
@@ -710,18 +718,25 @@ impl State {
 
     /// File a note on an item: a captured memory file on the item itself,
     /// anything else on the day's tile as a line. Returns its id, or `None`
-    /// for an empty one.
+    /// for an empty one. The note is taken now, at its own time.
     pub fn add_note(&mut self, item_id: &str, date: &str, note: Line) -> Option<String> {
         let ms = note.ms;
-        let id = self.file_note(item_id, date, note)?;
+        self.land_note(item_id, date, note, ms)
+    }
+
+    /// [`State::add_note`] for a note landing at `now`, later than it was
+    /// taken: a held one.
+    fn land_note(&mut self, item_id: &str, date: &str, note: Line, now: i64) -> Option<String> {
+        let ms = note.ms;
+        let id = self.file_note(item_id, date, note, now)?;
         if let Some(item) = self.items.get_mut(item_id) {
             item.last_activity_ms = item.last_activity_ms.max(ms);
         }
         Some(id)
     }
 
-    /// [`State::add_note`] without counting the note as activity on the item.
-    fn file_note(&mut self, item_id: &str, date: &str, mut note: Line) -> Option<String> {
+    /// [`State::land_note`] without counting the note as activity on the item.
+    fn file_note(&mut self, item_id: &str, date: &str, mut note: Line, now: i64) -> Option<String> {
         note.text = note.text.trim().to_string();
         if note.text.is_empty() {
             return None;
@@ -730,24 +745,38 @@ impl State {
             note.id = self.new_id("n");
         }
         let id = note.id.clone();
-        if note.is_memory() {
-            self.add_memory(item_id, note);
+        let before = self.notes_ms(item_id);
+        let changed = if note.is_memory() {
+            self.add_memory(item_id, note)
         } else {
             self.tile_mut(item_id, date).lines.push(note);
+            true
+        };
+        if changed {
+            self.notes_moved(item_id, before, now);
         }
         Some(id)
     }
 
+    /// The item's notes changed at `now`; `before` is what [`State::notes_ms`]
+    /// read ahead of the change. Always later than `before`, so a client
+    /// keyed on it re-reads even when two changes share a millisecond.
+    fn notes_moved(&mut self, item_id: &str, before: Option<i64>, now: i64) {
+        let at = before.map_or(now, |b| now.max(b + 1));
+        self.notes_changed.insert(item_id.to_string(), at);
+    }
+
     /// A new version of a memory note. The same text twice is one version;
-    /// past [`MEMORY_VERSIONS_KEPT`] the oldest goes.
-    fn add_memory(&mut self, item_id: &str, mut note: Line) {
+    /// past [`MEMORY_VERSIONS_KEPT`] the oldest goes. False when nothing
+    /// changed.
+    fn add_memory(&mut self, item_id: &str, mut note: Line) -> bool {
         if note.text.chars().count() > MEMORY_TEXT_MAX {
             note.text = note.text.chars().take(MEMORY_TEXT_MAX).collect();
         }
         let kept = self.notes.entry(item_id.to_string()).or_default();
         let same_file = |l: &Line| l.is_memory() && l.source_path == note.source_path;
         if kept.iter().rev().find(|l| same_file(l)).is_some_and(|l| l.text == note.text) {
-            return;
+            return false;
         }
         let path = note.source_path.clone();
         kept.push(note);
@@ -757,6 +786,7 @@ impl State {
                 kept.remove(pos);
             }
         }
+        true
     }
 
     /// Every note on an item, newest first: its tiles' lines, its memory
@@ -776,10 +806,12 @@ impl State {
             .chain(self.notes.get(item_id).into_iter().flatten())
     }
 
-    /// When the item's newest note was taken: a card re-reads its notes only
-    /// when this moves (chat-desk proposal, Interface).
+    /// When the item's notes last changed: a card re-reads its notes only
+    /// when this moves (chat-desk proposal, Interface). An item no change
+    /// has been recorded on yet — notes from a state file older than the
+    /// record — reads its newest note's time.
     pub fn notes_ms(&self, item_id: &str) -> Option<i64> {
-        self.notes_of(item_id).map(|l| l.ms).max()
+        self.notes_changed.get(item_id).copied().or_else(|| self.notes_of(item_id).map(|l| l.ms).max())
     }
 
     /// Each memory file's newest version on an item, newest first.
@@ -850,8 +882,9 @@ impl State {
     /// item alone; else every item whose key its text holds. A file already
     /// on an item is left alone, so a second run adds nothing. An attached
     /// file is not activity on the item: last month's state file must not
-    /// bring a quiet card back to the Desk. Returns the notes added.
-    pub fn import_memories(&mut self, files: &[MemoryFile]) -> usize {
+    /// bring a quiet card back to the Desk, though the item's notes changed
+    /// `now`. Returns the notes added.
+    pub fn import_memories(&mut self, files: &[MemoryFile], now: i64) -> usize {
         let mut added = 0;
         for f in files {
             let name = std::path::Path::new(&f.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -867,7 +900,7 @@ impl State {
                 if has {
                     continue;
                 }
-                if self.file_note(&item, "", Line::memory(f.mtime_ms, &f.path, &f.text)).is_some() {
+                if self.file_note(&item, "", Line::memory(f.mtime_ms, &f.path, &f.text), now).is_some() {
                     added += 1;
                 }
             }
@@ -961,8 +994,9 @@ impl State {
         let held_lines = std::mem::take(&mut sess.held_lines);
         let held_bench = std::mem::take(&mut sess.held_bench);
         let cwd = sess.cwd.clone();
+        // Each lands now, keeping the time it was taken.
         for l in held_lines {
-            self.add_note(item_id, &days.date(l.ms), l);
+            self.land_note(item_id, &days.date(l.ms), l, now);
         }
         for b in held_bench {
             self.add_bench(item_id, b);
@@ -1138,8 +1172,10 @@ impl State {
         let archived: Vec<Tile> = old.iter().filter_map(|id| self.tiles.remove(id)).collect();
         // The tile goes to history; its lines stay on the item, which is
         // where the work's knowledge gathers.
-        for t in &archived {
+        for t in archived.iter().filter(|t| !t.lines.is_empty()) {
+            let before = self.notes_ms(&t.item_id);
             self.notes.entry(t.item_id.clone()).or_default().extend(t.lines.iter().cloned());
+            self.notes_moved(&t.item_id, before, now);
         }
         let open: std::collections::BTreeSet<(String, String)> = self
             .tile_keys()
@@ -1471,6 +1507,7 @@ mod tests {
         let again: State = serde_json::from_value(serde_json::to_value(&st).unwrap()).unwrap();
         assert_eq!(again.tiles["w1@2026-10-22"].lines, lines);
         assert!(!again.settings.chat_panel && again.mailbox.is_empty() && !again.memory_imported);
+        assert_eq!(again.notes_ms("w1"), Some(D0 + 2), "with no change recorded, the newest note's time");
     }
 
     #[test]
@@ -1519,14 +1556,14 @@ mod tests {
             file("/m/bring-up.md", "notes on ABC-2 and ABC-1"),
             file("/m/unrelated.md", "ZZZ-9 only"),
         ];
-        assert_eq!(st.import_memories(&files), 3);
+        assert_eq!(st.import_memories(&files, D0), 3);
         let paths = |w: &str| st.notes.get(w).map(|n| n.iter().map(|l| l.source_path.clone().unwrap()).collect::<Vec<_>>()).unwrap_or_default();
         assert_eq!(paths(&a), ["/m/abc-1-state.md", "/m/bring-up.md"], "the name decides alone when it names an item");
         assert_eq!(paths(&b), ["/m/bring-up.md"]);
         assert!(st.memory_imported);
         assert_eq!(st.notes[&a][0].kind, "memory");
         assert_eq!(st.notes[&a][0].ms, D0, "dated by the file, so no other day's notes change");
-        assert_eq!(st.import_memories(&files), 0, "idempotent");
+        assert_eq!(st.import_memories(&files, D0), 0, "idempotent");
     }
 
     #[test]
@@ -1587,7 +1624,7 @@ mod tests {
         let issue = IssueRef { key: "ABC-1".into(), ..Default::default() };
         let w = st.create_item("quiet", Some(issue), D0 - 30 * DAY);
         let files = [MemoryFile { path: "/m/abc-1.md".into(), mtime_ms: D0, text: "ABC-1: branch".into() }];
-        assert_eq!(st.import_memories(&files), 1);
+        assert_eq!(st.import_memories(&files, D0), 1);
         assert_eq!(st.items[&w].last_activity_ms, D0 - 30 * DAY, "an old file is not this week's work");
     }
 
@@ -1611,5 +1648,51 @@ mod tests {
         assert!(st.mailbox.is_empty());
         assert!(!st.prune(D0 + LAUNCH_CLAIM_MS + 2).1, "and once gone, nothing is");
         assert_eq!(norm_folder("/"), "/");
+    }
+
+    #[test]
+    fn held_notes_landing_on_assignment_move_the_items_notes_time() {
+        let mut st = State::default();
+        let w = st.create_item("x", None, D0);
+        // B writes a line and a memory file before it has an item; A, already
+        // on the item, writes a line after.
+        let mut b = session("b");
+        b.held_lines.push(Line::new(D0 + H, "held line", "agent"));
+        b.held_lines.push(Line::memory(D0 + H, "/m/b.md", "held memory"));
+        st.sessions.insert("b".into(), b);
+        st.add_line(&w, "2026-10-22", "A's line", "agent", D0 + 2 * H);
+        assert_eq!(st.notes_ms(&w), Some(D0 + 2 * H));
+        st.assign_session("b", &w, D0 + 3 * H, &UtcDays, &FakeGit::default());
+        assert_eq!(st.item_notes(&w).len(), 3);
+        assert!(st.notes_ms(&w) >= Some(D0 + 3 * H), "B's notes landed now, though taken before A's: {:?}", st.notes_ms(&w));
+        assert!(st.item_notes(&w).iter().any(|l| l.text == "held line" && l.ms == D0 + H), "a note keeps the time it was taken");
+    }
+
+    #[test]
+    fn every_change_to_an_items_notes_moves_its_notes_time() {
+        let mut st = State::default();
+        let issue = IssueRef { key: "ABC-1".into(), ..Default::default() };
+        let w = st.create_item("x", Some(issue), D0);
+        assert_eq!(st.notes_ms(&w), None);
+        // A line from desk_add_line, the tile or a commit, at its own time.
+        st.add_line(&w, "2026-10-22", "built it", "agent", D0 + H);
+        assert_eq!(st.notes_ms(&w), Some(D0 + H));
+        st.add_line(&w, "2026-10-22", "and flashed it", "agent", D0 + H);
+        assert_eq!(st.notes_ms(&w), Some(D0 + H + 1), "two changes in one millisecond are two moves");
+        // A memory file's new version; the same text again is no change.
+        st.add_note(&w, "2026-10-22", Line::memory(D0 + 2 * H, "/m/a.md", "v1"));
+        assert_eq!(st.notes_ms(&w), Some(D0 + 2 * H));
+        st.add_note(&w, "2026-10-22", Line::memory(D0 + 3 * H, "/m/a.md", "v1"));
+        assert_eq!(st.notes_ms(&w), Some(D0 + 2 * H));
+        // The import attaches last month's file now.
+        let files = [MemoryFile { path: "/m/abc-1-old.md".into(), mtime_ms: D0 - 30 * DAY, text: "ABC-1: old".into() }];
+        assert_eq!(st.import_memories(&files, D0 + 4 * H), 1);
+        assert_eq!(st.notes_ms(&w), Some(D0 + 4 * H));
+        // An archived tile's lines move onto the item.
+        let t = st.tile_mut(&w, "2026-10-22");
+        t.status = TileStatus::Approved;
+        t.acted_ms = Some(D0 + 5 * H);
+        assert_eq!(st.prune(D0 + 9 * DAY).0.len(), 1);
+        assert_eq!(st.notes_ms(&w), Some(D0 + 9 * DAY));
     }
 }

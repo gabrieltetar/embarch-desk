@@ -1977,7 +1977,7 @@ pub async fn import_memories(app: &App) {
     let Some(dir) = crate::memory::claude_dir() else { return };
     let ignore = app.db.read(|st| st.ignore.clone());
     let Ok(files) = tokio::task::spawn_blocking(move || crate::memory::scan(&dir, &ignore)).await else { return };
-    let added = app.db.write(|st| st.import_memories(&files));
+    let added = app.db.write(|st| st.import_memories(&files, now_ms()));
     tracing::info!("attached {added} memory notes from {} memory files", files.len());
 }
 
@@ -2732,7 +2732,7 @@ mod tests {
     }
 
     #[test]
-    fn a_card_carries_its_newest_notes_time() {
+    fn a_card_carries_when_its_notes_last_changed() {
         let mut st = State::default();
         let w = st.create_item("x", None, D0);
         let v = view_json(&st, &Cache::default(), D0 + H, 7, None, &UtcDays);
@@ -2742,6 +2742,14 @@ mod tests {
         st.add_line(&w, "2026-10-21", "older day, added now", "user", D0 + 3 * H);
         let v = view_json(&st, &Cache::default(), D0 + 4 * H, 7, None, &UtcDays);
         assert_eq!(v["cards"][0]["notes_ms"], D0 + 3 * H);
+        // A line held before its session had an item lands with its own,
+        // older time; the card still moves.
+        let mut s = crate::store::testing::session("b");
+        s.held_lines.push(store::Line::new(D0 + H + 1, "held", "agent"));
+        st.sessions.insert("b".into(), s);
+        st.assign_session("b", &w, D0 + 5 * H, &UtcDays, &crate::store::testing::FakeGit::default());
+        let v = view_json(&st, &Cache::default(), D0 + 5 * H, 7, None, &UtcDays);
+        assert_eq!(v["cards"][0]["notes_ms"], D0 + 5 * H);
     }
 
     #[test]
