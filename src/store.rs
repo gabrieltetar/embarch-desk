@@ -595,6 +595,43 @@ pub fn issue_key_in(text: &str) -> Option<String> {
     issue_keys_in(text).into_iter().next()
 }
 
+/// Every `abc123`-shaped token — a key with its dash dropped, the way file
+/// names often carry one — as `ABC-123`, in order, once each.
+pub fn compact_keys_in(text: &str) -> Vec<String> {
+    let mut keys: Vec<String> = vec![];
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_alphabetic() && (i == 0 || !b[i - 1].is_ascii_alphanumeric()) {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            let letters = i - start;
+            let digits_at = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            if (1..=10).contains(&letters) && i > digits_at && (i == b.len() || !b[i].is_ascii_alphanumeric()) {
+                let key = format!("{}-{}", text[start..digits_at].to_ascii_uppercase(), &text[digits_at..i]);
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    keys
+}
+
+/// A memory file's frontmatter, between its opening and closing `---`;
+/// empty when it has none.
+pub fn frontmatter(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("---\n") else { return "" };
+    rest.find("\n---").map_or("", |end| &rest[..end])
+}
+
 /// Every `ABC-123`-shaped token in a text, uppercased, in order, once each.
 pub fn issue_keys_in(text: &str) -> Vec<String> {
     let mut keys: Vec<String> = vec![];
@@ -888,21 +925,19 @@ impl State {
         let mut added = 0;
         for f in files {
             let name = std::path::Path::new(&f.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let items_for = |text: &str| -> Vec<String> {
-                issue_keys_in(text).iter().filter_map(|k| self.item_by_key(k).map(|i| i.id.clone())).collect()
+            // The file's name, else its frontmatter — the agent's own summary
+            // of what the file is about — and one item at most: a body that
+            // mentions three issues in passing is about none of them.
+            let item_for = |text: &str| -> Option<String> {
+                issue_keys_in(text).into_iter().chain(compact_keys_in(text)).find_map(|k| self.item_by_key(&k).map(|i| i.id.clone()))
             };
-            let mut targets = items_for(&name);
-            if targets.is_empty() {
-                targets = items_for(&f.text);
+            let Some(item) = item_for(&name).or_else(|| item_for(frontmatter(&f.text))) else { continue };
+            let has = self.notes.get(&item).is_some_and(|n| n.iter().any(|l| l.source_path.as_deref() == Some(f.path.as_str())));
+            if has {
+                continue;
             }
-            for item in targets {
-                let has = self.notes.get(&item).is_some_and(|n| n.iter().any(|l| l.source_path.as_deref() == Some(f.path.as_str())));
-                if has {
-                    continue;
-                }
-                if self.file_note(&item, "", Line::memory(f.mtime_ms, &f.path, &f.text), now).is_some() {
-                    added += 1;
-                }
+            if self.file_note(&item, "", Line::memory(f.mtime_ms, &f.path, &f.text), now).is_some() {
+                added += 1;
             }
         }
         self.memory_imported = true;
@@ -1545,7 +1580,7 @@ mod tests {
     }
 
     #[test]
-    fn the_import_attaches_a_file_by_its_name_first_then_its_text_and_only_once() {
+    fn the_import_attaches_a_file_by_its_name_else_its_frontmatter_to_one_item_only_once() {
         let mut st = State::default();
         let issue = |k: &str| Some(IssueRef { key: k.into(), ..Default::default() });
         let a = st.create_item("a", issue("ABC-1"), D0);
@@ -1553,13 +1588,15 @@ mod tests {
         let file = |path: &str, text: &str| MemoryFile { path: path.into(), mtime_ms: D0, text: text.into() };
         let files = vec![
             file("/m/abc-1-state.md", "ABC-1 branch; blocked on ABC-2"),
-            file("/m/bring-up.md", "notes on ABC-2 and ABC-1"),
+            file("/m/abc2-driver.md", "---\nname: driver\n---\nmentions ABC-1"),
+            file("/m/bring-up.md", "---\nname: bring-up\ndescription: \"ABC-2 then ABC-1\"\n---\nbody"),
+            file("/m/notes.md", "---\nname: notes\n---\nnotes on ABC-2 and ABC-1"),
             file("/m/unrelated.md", "ZZZ-9 only"),
         ];
         assert_eq!(st.import_memories(&files, D0), 3);
         let paths = |w: &str| st.notes.get(w).map(|n| n.iter().map(|l| l.source_path.clone().unwrap()).collect::<Vec<_>>()).unwrap_or_default();
-        assert_eq!(paths(&a), ["/m/abc-1-state.md", "/m/bring-up.md"], "the name decides alone when it names an item");
-        assert_eq!(paths(&b), ["/m/bring-up.md"]);
+        assert_eq!(paths(&a), ["/m/abc-1-state.md"], "a name decides; a body's mention never does");
+        assert_eq!(paths(&b), ["/m/abc2-driver.md", "/m/bring-up.md"], "abc2 in a name is ABC-2; a frontmatter's first key wins alone");
         assert!(st.memory_imported);
         assert_eq!(st.notes[&a][0].kind, "memory");
         assert_eq!(st.notes[&a][0].ms, D0, "dated by the file, so no other day's notes change");
