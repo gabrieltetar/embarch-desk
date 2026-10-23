@@ -67,26 +67,45 @@ pub fn prepare(main_clone: &Path, issue_key: &str, branch: &str) -> Result<Prepa
         // never touched, named instead.
         bail!("{} already exists and is not on {branch}", path.display());
     }
-    if let Err(e) = git(main_clone, &["fetch", "--quiet", "origin"]) {
-        warnings.push(format!("could not fetch origin, using local refs: {e:#}"));
+    let remote = remote_of(main_clone);
+    if let Err(e) = git(main_clone, &["fetch", "--quiet", &remote]) {
+        warnings.push(format!("could not fetch {remote}, using local refs: {e:#}"));
     }
     let p = path.to_string_lossy().into_owned();
     let how = if has_ref(main_clone, &format!("refs/heads/{branch}")) {
         git(main_clone, &["worktree", "add", &p, branch])?;
         "local branch".to_string()
-    } else if has_ref(main_clone, &format!("refs/remotes/origin/{branch}")) {
-        git(main_clone, &["worktree", "add", "--track", "-b", branch, &p, &format!("origin/{branch}")])?;
+    } else if has_ref(main_clone, &format!("refs/remotes/{remote}/{branch}")) {
+        git(main_clone, &["worktree", "add", "--track", "-b", branch, &p, &format!("{remote}/{branch}")])?;
         "remote branch".to_string()
     } else {
-        let base = git(main_clone, &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+        let base = git(main_clone, &["symbolic-ref", "--quiet", "--short", &format!("refs/remotes/{remote}/HEAD")])
             .ok()
             .filter(|b| !b.is_empty())
-            .or_else(|| ["origin/main", "origin/master"].iter().find(|b| has_ref(main_clone, b)).map(|b| b.to_string()))
-            .context("no remote default branch to start from (origin/HEAD, origin/main or origin/master)")?;
+            .or_else(|| ["main", "master"].iter().map(|b| format!("{remote}/{b}")).find(|b| has_ref(main_clone, b)))
+            .with_context(|| format!("no remote default branch to start from ({remote}/HEAD, {remote}/main or {remote}/master)"))?;
         git(main_clone, &["worktree", "add", "--no-track", "-b", branch, &p, &base])?;
         format!("new from {base}")
     };
     Ok(Prepared { path, branch: branch.into(), how, warnings })
+}
+
+/// The remote a clone works against: the one its checked-out branch tracks,
+/// else its only remote, else `origin`. A clone whose remote is named after
+/// its organisation, not `origin`, is common.
+fn remote_of(main_clone: &Path) -> String {
+    let tracked = git(main_clone, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .ok()
+        .and_then(|b| git(main_clone, &["config", &format!("branch.{b}.remote")]).ok())
+        .filter(|r| !r.is_empty() && r != ".");
+    if let Some(r) = tracked {
+        return r;
+    }
+    let remotes: Vec<String> = git(main_clone, &["remote"]).map(|o| o.lines().map(str::to_string).collect()).unwrap_or_default();
+    match remotes.as_slice() {
+        [only] => only.clone(),
+        _ => "origin".into(),
+    }
 }
 
 /// Sessions the desk opens run in auto mode: a local settings file in the
@@ -168,6 +187,17 @@ mod tests {
         let b = prepare(&clone, "ABC-2", "user/abc-2-on-remote").unwrap();
         assert_eq!(b.how, "remote branch");
         assert_eq!(git(&b.path, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(), "user/abc-2-on-remote");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_remote_not_named_origin_is_the_one_used() {
+        let (root, clone) = fixture();
+        sh(&clone, &["remote", "rename", "origin", "acme"]);
+        let a = prepare(&clone, "ABC-1", "user/abc-1-new").unwrap();
+        assert!(a.how.starts_with("new from acme/"), "{}", a.how);
+        let b = prepare(&clone, "ABC-2", "user/abc-2-on-remote").unwrap();
+        assert_eq!(b.how, "remote branch");
         std::fs::remove_dir_all(root).unwrap();
     }
 
