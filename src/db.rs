@@ -23,12 +23,15 @@ impl Db {
     pub fn open(dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join("state.json");
-        let state = match std::fs::read(&path) {
+        let mut state: State = match std::fs::read(&path) {
             Ok(b) => serde_json::from_slice(&b).with_context(|| format!("parsing {}", path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        Ok(Self { dir, state: Mutex::new(state), dirty: AtomicBool::new(false) })
+        // Lines from before notes existed are notes of kind done; they get
+        // their ids here.
+        let migrated = state.migrate();
+        Ok(Self { dir, state: Mutex::new(state), dirty: AtomicBool::new(migrated) })
     }
 
     pub fn read<R>(&self, f: impl FnOnce(&State) -> R) -> R {

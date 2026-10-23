@@ -1,7 +1,8 @@
 //! `embarch-desk mcp`: the agent-facing tools, shipped in the plugin.
 //!
 //! Agents manage work items — look up what a session is on, put it on one,
-//! create or link one, add a line to its tile. **No tool approves, discards
+//! create or link one, add a note to it, pull everything the desk holds
+//! about it (`desk_work_item`). **No tool approves, discards
 //! or archives anything**: ✓, ✕ and archive are the user's, on the Desk tab.
 //!
 //! Claude Code gives an MCP server no session identity, so every
@@ -54,8 +55,11 @@ pub struct SetWorkItemParams {
 pub struct LineParams {
     /// The desk session id given in this session's context.
     pub session_id: String,
-    /// One short past-tense line: what was found or done, concretely. No issue key needed.
+    /// One short line: what was done, found or decided, concretely. No issue key needed.
     pub text: String,
+    /// done (the default: a piece of work finished), finding (something learned), decision (a choice made, and why), handoff (what the next session needs to know), todo (something left to do).
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -191,10 +195,27 @@ impl DeskMcp {
         }
     }
 
-    #[tool(description = "Add one line to this session's time tile for today: a milestone with no commit — an investigation's finding, a flash or study result. Commits are added automatically; do not repeat them. Claude later turns the day's lines into the Harvest note.")]
+    #[tool(description = "Add a note to this session's work item: one short line, unasked, whenever something worth keeping happens — kind done (the default) for a piece of work finished without a commit, finding, decision, handoff or todo. Too many rather than too few; the user cuts. Commits and memory-file writes are added automatically; do not repeat them. The day's notes become the Harvest note.")]
     async fn desk_add_line(&self, Parameters(p): Parameters<LineParams>) -> Result<CallToolResult, McpError> {
-        match self.client.post(&format!("/sessions/{}/line", p.session_id), json!({ "text": p.text })).await {
+        match self.client.post(&format!("/sessions/{}/line", p.session_id), json!({ "text": p.text, "kind": p.kind })).await {
             Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "Everything the desk holds about this session's work item: the Linear issue with its description and latest comments, PRs, sessions, notes (each memory file's newest state, the latest lines) and bench activity, newest first, cut at 16,000 characters. Call it when starting on the item or whenever you need its context. Use the desk session id from this session's context.")]
+    async fn desk_work_item(&self, Parameters(p): Parameters<SessionParams>) -> Result<CallToolResult, McpError> {
+        let sess = match self.client.get(&format!("/sessions/{}", p.session_id)).await {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        let Some(item) = sess["work_item"]["id"].as_str() else {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                "This session is not on a work item yet. Ask the user which one it is and call desk_set_work_item.",
+            )]));
+        };
+        match self.client.get(&format!("/items/{}/brief", crate::uri::encode(item))).await {
+            Ok(v) => Ok(CallToolResult::success(vec![ContentBlock::text(v["text"].as_str().unwrap_or_default())])),
             Err(e) => err(e),
         }
     }
@@ -346,10 +367,11 @@ impl ServerHandler for DeskMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "embarch-desk: the one access point to Linear and Harvest, and the work item this session's \
-             time and lines belong to. Read Linear with linear_get_issue, linear_my_issues and linear_search; \
+             time and notes belong to. desk_work_item returns everything the desk holds about the session's \
+             item. Read Linear with linear_get_issue, linear_my_issues and linear_search; \
              move a status with linear_set_status; propose a comment or an issue with linear_draft_comment or \
              linear_draft_issue — they wait for the user's Send on the Desk tab. Read Harvest with \
-             harvest_entries and harvest_projects; time is never logged from a session: add a line with \
+             harvest_entries and harvest_projects; time is never logged from a session: add notes with \
              desk_add_line and the user sends the tile. desk_timer_start/stop track work away from Claude. \
              The session's context carries its desk session id; when the desk asks which work item a session \
              is on, ask the user and call desk_set_work_item.",
@@ -362,4 +384,20 @@ pub async fn serve() -> anyhow::Result<()> {
     let running = server.serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pull_is_a_session_tool_and_a_note_takes_a_kind() {
+        let tools = DeskMcp::tool_router().list_all();
+        let tool = |name: &str| tools.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("no tool {name}"));
+        let pull = serde_json::to_value(&tool("desk_work_item").input_schema).unwrap();
+        assert_eq!(pull["required"], json!(["session_id"]));
+        let line = serde_json::to_value(&tool("desk_add_line").input_schema).unwrap();
+        assert!(line["properties"]["kind"].is_object(), "{line}");
+        assert_eq!(line["required"], json!(["session_id", "text"]));
+    }
 }

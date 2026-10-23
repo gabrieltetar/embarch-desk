@@ -8,8 +8,9 @@
 //!   id — the tools need it, and nothing else identifies a session to them.
 //! - **UserPromptSubmit** on a session with no work item asks, every prompt,
 //!   until it is answered (proposal decision 7).
-//! - **PostToolUse** turns a `git commit` into a tile line and an
-//!   `embarch-api` build, flash or study into bench activity.
+//! - **PostToolUse** turns a `git commit` into a tile line, an
+//!   `embarch-api` build, flash or study into bench activity, and a write
+//!   to a Claude Code memory file into the item's memory note.
 //!
 //! A session under an ignored path is dropped at the door: no time, no
 //! question, no context.
@@ -125,9 +126,11 @@ fn assigned_text(state: &State, session_id: &str, item_id: &str) -> String {
         .unwrap_or_else(|| item_id.to_string());
     format!(
         "EmbArch Desk: desk session id `{session_id}`; this session is on work item {item_id}: \
-         {label}. When you finish a piece of work that has no commit — an investigation's \
-         finding, a flash or study result — add one short line to its time tile with the \
-         `desk_add_line` tool. Commits are added automatically."
+         {label}. The desk holds everything about it — the issue and its comments, PRs, \
+         sessions, notes taken about the work, bench activity: call `desk_work_item` for it \
+         when you need the item's context. As you work, add short notes with `desk_add_line` \
+         — kind done for work finished without a commit, finding, decision, handoff or todo — \
+         too many rather than too few. Commits and memory files are added automatically."
     )
 }
 
@@ -164,23 +167,23 @@ pub fn apply(
     }
     let ignore = state.ignore.clone();
     let desk_here = state.desk_for_path(&ev.cwd);
-    let sess = state.sessions.entry(ev.session_id.clone()).or_insert_with(|| Session {
-        id: ev.session_id.clone(),
-        cwd: ev.cwd.clone(),
-        desk_id: desk_here,
-        item_id: None,
-        ignored: store::is_ignored(&ev.cwd, &ignore),
-        started_ms: now,
-        last_ms: now,
-        spans: vec![],
-        commits: vec![],
-        held_lines: vec![],
-        held_bench: vec![],
-        ended: false,
-        last_reply: None,
-        last_reply_ms: 0,
-        waiting: None,
+    let sess = state.sessions.entry(ev.session_id.clone()).or_insert_with(|| {
+        let mut s = Session::new(&ev.session_id, &ev.cwd, now);
+        s.desk_id = desk_here.clone();
+        s.ignored = store::is_ignored(&ev.cwd, &ignore);
+        s
     });
+    // A session the panel put on its item before starting it (chat proposal
+    // decision 10) learns its folder from its first event.
+    if sess.cwd.is_empty() && !ev.cwd.is_empty() {
+        sess.cwd = ev.cwd.clone();
+        sess.desk_id = sess.desk_id.clone().or(desk_here);
+        let item = sess.item_id.clone();
+        if let Some(w) = item.and_then(|i| state.items.get_mut(&i)).filter(|w| w.repo_path.is_none()) {
+            w.repo_path = git.toplevel(&ev.cwd);
+        }
+    }
+    let sess = state.sessions.get_mut(&ev.session_id)?;
     if sess.ignored {
         return None;
     }
@@ -193,6 +196,7 @@ pub fn apply(
                 sess.last_reply_ms = now;
             }
             sess.waiting = None;
+            sess.busy = false;
         }
         "Notification" => {
             sess.waiting = Some(match (ev.notification_type.as_deref(), ev.message.as_deref()) {
@@ -203,12 +207,22 @@ pub fn apply(
                 _ => "you".to_string(),
             });
         }
-        "UserPromptSubmit" | "PostToolUse" => sess.waiting = None,
+        "UserPromptSubmit" | "PostToolUse" => {
+            sess.waiting = None;
+            sess.busy = true;
+        }
+        "SessionStart" => {
+            sess.waiting = None;
+            sess.busy = false;
+        }
         _ => {}
     }
     store::record_activity(sess, now, days);
-    if ev.hook_event_name == "SessionEnd" {
-        sess.ended = true;
+    // A resumed session lives again: the panel closes an idle chat's process
+    // and resumes it on the next message (chat proposal decision 41).
+    sess.ended = ev.hook_event_name == "SessionEnd";
+    if sess.ended {
+        sess.busy = false;
     }
     let cwd = if ev.cwd.is_empty() { sess.cwd.clone() } else { ev.cwd.clone() };
 
@@ -270,7 +284,7 @@ fn post_tool_use(state: &mut State, ev: &HookEvent, cwd: &str, now: i64, days: &
         sess.commits.drain(..excess);
         match sess.item_id.clone() {
             Some(item) => state.add_line(&item, &days.date(now), &subject, "commit", now),
-            None => sess.held_lines.push(Line { ms: now, text: subject, source: "commit".into() }),
+            None => sess.held_lines.push(Line::new(now, &subject, "commit")),
         }
         return;
     }
@@ -281,6 +295,32 @@ fn post_tool_use(state: &mut State, ev: &HookEvent, cwd: &str, now: i64, days: &
             Some(item) => state.add_bench(&item, bench),
             None => sess.held_bench.push(bench),
         }
+    }
+}
+
+/// The memory file a PostToolUse `Write`, `Edit` or `MultiEdit` just wrote,
+/// if it wrote one (`embarch-chat-desk-proposal.md` 45). The server reads
+/// its text and hands it to [`capture_memory`].
+pub fn memory_write(ev: &HookEvent, claude_dir: &std::path::Path) -> Option<String> {
+    if ev.hook_event_name != "PostToolUse" || !matches!(ev.tool_name.as_deref(), Some("Write" | "Edit" | "MultiEdit")) {
+        return None;
+    }
+    let path = ev.tool_input.as_ref()?.get("file_path")?.as_str()?;
+    crate::memory::is_memory_file(path, claude_dir).then(|| path.to_string())
+}
+
+/// A memory file's text after a write becomes the newest version of its
+/// note on the session's work item — the session decides the item, not the
+/// file's name — held until the session has one, as lines are.
+pub fn capture_memory(state: &mut State, session_id: &str, path: &str, text: &str, now: i64, days: &dyn Days) {
+    let Some(sess) = state.sessions.get_mut(session_id).filter(|s| !s.ignored) else { return };
+    let mut note = Line::memory(now, path, text);
+    note.session_id = Some(session_id.to_string());
+    match sess.item_id.clone() {
+        Some(item) => {
+            state.add_note(&item, &days.date(now), note);
+        }
+        None => sess.held_lines.push(note),
     }
 }
 
@@ -350,7 +390,7 @@ mod tests {
         st.pending_launches.push(PendingLaunch { item_id: w.clone(), repo: "/w/r".into(), expires_ms: D0 + H });
         let out = apply(&mut st, &ev("SessionStart", "s", "/w/r/app"), D0, &UtcDays, &FakeGit::default(), 7).unwrap();
         assert_eq!(st.sessions["s"].item_id.as_deref(), Some(w.as_str()));
-        assert!(out.contains("desk_add_line"));
+        assert!(out.contains("desk_add_line") && out.contains("desk_work_item"), "{out}");
         assert!(st.pending_launches.is_empty());
     }
 
@@ -406,6 +446,69 @@ mod tests {
         st.open_desk = Some(b);
         let in_open = apply(&mut st, &ev("SessionStart", "t", "/w/b"), D0 + 2, &UtcDays, &git, 7).unwrap();
         assert!(!in_open.contains("desk_open"));
+    }
+
+    fn write(sid: &str, tool: &str, path: &str) -> HookEvent {
+        let mut e = ev("PostToolUse", sid, "/w/r");
+        e.tool_name = Some(tool.into());
+        e.tool_input = Some(serde_json::json!({ "file_path": path }));
+        e
+    }
+
+    #[test]
+    fn a_memory_write_becomes_the_sessions_items_note_held_until_it_has_one() {
+        let claude = std::path::Path::new("/h/.claude");
+        let file = "/h/.claude/projects/-w-r/memory/loader-state.md";
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            assert_eq!(memory_write(&write("s", tool, file), claude).as_deref(), Some(file));
+        }
+        assert!(memory_write(&write("s", "Read", file), claude).is_none());
+        assert!(memory_write(&write("s", "Write", "/h/.claude/projects/-w-r/memory/MEMORY.md"), claude).is_none());
+        assert!(memory_write(&write("s", "Write", "/w/r/memory/x.md"), claude).is_none());
+
+        let mut st = State::default();
+        let git = FakeGit::default();
+        apply(&mut st, &ev("SessionStart", "s", "/w/r"), D0, &UtcDays, &git, 7);
+        capture_memory(&mut st, "s", file, "branch user/abc-1", D0 + 1, &UtcDays);
+        assert_eq!(st.sessions["s"].held_lines[0].kind, "memory");
+        // The session decides the item, not the file's name.
+        let w = st.create_item("Loader", None, D0);
+        st.assign_session("s", &w, D0 + 2, &UtcDays, &git);
+        capture_memory(&mut st, "s", file, "branch user/abc-1; PR open", D0 + 3, &UtcDays);
+        let notes = &st.notes[&w];
+        assert_eq!(notes.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["branch user/abc-1", "branch user/abc-1; PR open"]);
+        assert!(notes.iter().all(|l| l.session_id.as_deref() == Some("s") && l.source_path.as_deref() == Some(file) && !l.id.is_empty()));
+        assert!(st.tiles.is_empty(), "a memory file is not a tile line");
+
+        let mut ignored = State { ignore: vec!["/g/embarch".into()], ..Default::default() };
+        apply(&mut ignored, &ev("SessionStart", "f", "/g/embarch/x"), D0, &UtcDays, &git, 7);
+        capture_memory(&mut ignored, "f", file, "fleet", D0 + 1, &UtcDays);
+        assert!(ignored.sessions["f"].held_lines.is_empty());
+    }
+
+    #[test]
+    fn a_session_the_panel_put_on_its_item_learns_its_folder_and_a_resumed_one_lives_again() {
+        let mut st = State::default();
+        let w = st.create_item("x", None, D0);
+        let mut pre = Session::new("c", "", D0);
+        pre.client = Some("embarch-chat".into());
+        st.sessions.insert("c".into(), pre);
+        st.assign_session("c", &w, D0, &UtcDays, &FakeGit { toplevel: Some("/elsewhere".into()), ..Default::default() });
+        assert_eq!(st.items[&w].repo_path, None, "no folder yet, so no repo guessed from the desk's own");
+        let git = FakeGit { toplevel: Some("/w/fw-abc-1".into()), ..Default::default() };
+        let out = apply(&mut st, &ev("SessionStart", "c", "/w/fw-abc-1"), D0 + 1, &UtcDays, &git, 7).unwrap();
+        assert!(out.contains(&w));
+        assert_eq!(st.sessions["c"].cwd, "/w/fw-abc-1");
+        assert_eq!(st.items[&w].repo_path.as_deref(), Some("/w/fw-abc-1"));
+        apply(&mut st, &ev("UserPromptSubmit", "c", "/w/fw-abc-1"), D0 + 2, &UtcDays, &git, 7);
+        assert!(st.sessions["c"].busy);
+        apply(&mut st, &ev("Stop", "c", "/w/fw-abc-1"), D0 + 3, &UtcDays, &git, 7);
+        assert!(!st.sessions["c"].busy);
+        apply(&mut st, &ev("SessionEnd", "c", "/w/fw-abc-1"), D0 + 4, &UtcDays, &git, 7);
+        assert!(st.sessions["c"].ended);
+        apply(&mut st, &ev("SessionStart", "c", "/w/fw-abc-1"), D0 + 5, &UtcDays, &git, 7);
+        assert!(!st.sessions["c"].ended, "the panel resumed it");
+        assert_eq!(st.sessions["c"].client.as_deref(), Some("embarch-chat"));
     }
 
     #[test]

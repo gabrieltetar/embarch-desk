@@ -13,9 +13,9 @@ use crate::claude;
 use crate::connectors::Connectors;
 use crate::db::Db;
 use crate::events::{self, HookEvent};
-use crate::store::{self, Days, HarvestTarget, LocalDays, PendingLaunch, RealGit, State, TileStatus};
-use crate::{github, harvest, linear, localrepo, slack, uri};
-use axum::extract::{Path, State as Ax};
+use crate::store::{self, Days, HarvestTarget, LocalDays, MailboxEntry, PendingLaunch, RealGit, State, TakeError, TileStatus};
+use crate::{brief, github, harvest, linear, localrepo, slack, uri};
+use axum::extract::{Path, Query, State as Ax};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -47,6 +47,8 @@ pub struct Cache {
     pub logged_fetched: HashMap<String, i64>,
     /// `claude agents --json`, by session id: live state of every session.
     pub agents: HashMap<String, Value>,
+    /// When `agents` was read.
+    pub agents_ms: i64,
     pub wsl_distro: Option<String>,
 }
 
@@ -124,6 +126,11 @@ pub fn router(app: Shared) -> Router {
         .route("/harvest/entry/{account}/{id}", axum::routing::patch(edit_entry).delete(remove_entry))
         .route("/pickup", get(pickup))
         .route("/items/{id}/start", post(start_work))
+        .route("/items/{id}/brief", get(item_brief))
+        .route("/items/{id}/notes", get(item_notes))
+        .route("/mailbox", get(get_mailbox).post(post_mailbox))
+        .route("/mailbox/{id}/take", post(take_mailbox))
+        .route("/settings", get(get_settings).put(put_settings))
         .route("/sync", post(sync_now))
         .route_layer(axum::middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
@@ -190,6 +197,31 @@ fn open_tile_keys(st: &State) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A session's state — `busy`, `waiting`, `idle` or `ended` — and what it
+/// waits for: the hooks, which are instant, joined with `claude agents`,
+/// read every 30 seconds — whichever saw the session last.
+pub fn session_state(cache: &Cache, s: &store::Session) -> (&'static str, Option<String>) {
+    let agent = cache.agents.get(&s.id).filter(|_| cache.agents_ms >= s.last_ms);
+    let reported = agent.and_then(|a| match a["status"].as_str() {
+        Some("busy") => Some("busy"),
+        Some("waiting") => Some("waiting"),
+        Some("idle") => Some("idle"),
+        _ => None,
+    });
+    match reported {
+        Some(st) => {
+            let waiting = (st == "waiting")
+                .then(|| agent.and_then(|a| a["waitingFor"].as_str()).map(str::to_string).or_else(|| s.waiting.clone()))
+                .flatten();
+            (st, waiting)
+        }
+        None if s.ended => ("ended", None),
+        None if s.waiting.is_some() => ("waiting", s.waiting.clone()),
+        None if s.busy => ("busy", None),
+        None => ("idle", None),
+    }
+}
+
 /// A card's live sessions (`embarch-desk-sessions-proposal.md` 6–8): the
 /// state `claude agents --json` reports, the last reply and what it waits
 /// for from the hooks, an Answer link on claude.ai (Remote Control) and a
@@ -201,17 +233,18 @@ fn session_rows(cache: &Cache, sessions: &[&store::Session], now: i64) -> Vec<Va
         .map(|s| {
             let a = cache.agents.get(&s.id);
             let status = a.and_then(|a| a["status"].as_str()).unwrap_or(if s.ended { "ended" } else { "unknown" });
-            let waiting = a.and_then(|a| a["waitingFor"].as_str()).map(str::to_string).or_else(|| s.waiting.clone());
-            let name = a.and_then(|a| a["name"].as_str()).map(str::to_string).unwrap_or_else(|| {
-                std::path::Path::new(&s.cwd).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "session".into())
-            });
+            let name = session_name(cache, s);
+            let (state, waiting_for) = session_state(cache, s);
             (
                 s.last_ms,
                 json!({
                     "session_id": s.id,
                     "name": name,
                     "status": status,
-                    "waiting_for": waiting,
+                    "state": state,
+                    "waiting_for": waiting_for,
+                    "last_ms": s.last_ms,
+                    "client": s.client,
                     "last_reply": s.last_reply,
                     "last_reply_ms": s.last_reply_ms,
                     "cwd": s.cwd,
@@ -224,6 +257,43 @@ fn session_rows(cache: &Cache, sessions: &[&store::Session], now: i64) -> Vec<Va
         .collect();
     rows.sort_by_key(|(ms, _)| std::cmp::Reverse(*ms));
     rows.into_iter().map(|(_, v)| v).collect()
+}
+
+fn session_name(cache: &Cache, s: &store::Session) -> String {
+    cache.agents.get(&s.id).and_then(|a| a["name"].as_str()).map(str::to_string).unwrap_or_else(|| {
+        std::path::Path::new(&s.cwd).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "session".into())
+    })
+}
+
+/// Every live session the desk tracks, on a card or not, for the panel's
+/// thread list (chat proposal decisions 9, 20, 32): sessions under an
+/// ignored path — the fleet — stay out; one the user untracked shows as such.
+fn view_sessions(st: &State, cache: &Cache, now: i64) -> Vec<Value> {
+    let mut rows: Vec<&store::Session> = st
+        .sessions
+        .values()
+        .filter(|s| !State::is_timer_session(&s.id))
+        .filter(|s| !s.ignored || !store::is_ignored(&s.cwd, &st.ignore))
+        .filter(|s| cache.agents.contains_key(&s.id) || now - s.last_ms < 30 * 60_000)
+        .collect();
+    rows.sort_by_key(|s| std::cmp::Reverse(s.last_ms));
+    rows.into_iter()
+        .map(|s| {
+            let (state, waiting_for) = session_state(cache, s);
+            json!({
+                "session_id": s.id,
+                "name": session_name(cache, s),
+                "item_id": s.item_id,
+                "desk_id": s.desk_id,
+                "untracked": s.ignored,
+                "state": state,
+                "waiting_for": waiting_for,
+                "last_ms": s.last_ms,
+                "cwd": s.cwd,
+                "client": s.client,
+            })
+        })
+        .collect()
 }
 
 pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, days: &dyn Days) -> Value {
@@ -299,6 +369,8 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, days: &d
         "today": today,
         "window_days": window_days,
         "cards": cards,
+        "sessions": view_sessions(st, cache, now),
+        "settings": st.settings,
         "sessions_waiting": waiting,
         "slack": {
             "mentions": cache.slack.iter().filter(|f| f.kind == "mention").count(),
@@ -334,7 +406,18 @@ async fn view(Ax(app): Ax<Shared>) -> ApiResult {
 
 async fn hook(Ax(app): Ax<Shared>, Json(ev): Json<HookEvent>) -> ApiResult {
     let now = now_ms();
-    let ctx = app.db.write(|st| events::apply(st, &ev, now, &LocalDays, &RealGit, app.window_days));
+    // A memory file's text is read here, after the write, so `events` stays
+    // pure.
+    let memory = crate::memory::claude_dir()
+        .and_then(|d| events::memory_write(&ev, &d))
+        .and_then(|p| crate::memory::read_text(std::path::Path::new(&p)).map(|t| (p, t)));
+    let ctx = app.db.write(|st| {
+        let ctx = events::apply(st, &ev, now, &LocalDays, &RealGit, app.window_days);
+        if let Some((path, text)) = &memory {
+            events::capture_memory(st, &ev.session_id, path, text, now, &LocalDays);
+        }
+        ctx
+    });
     Ok(Json(json!({ "context": ctx })))
 }
 
@@ -535,6 +618,7 @@ async fn get_session(Ax(app): Ax<Shared>, Path(sid): Path<String>) -> ApiResult 
                 "session_id": s.id,
                 "cwd": s.cwd,
                 "untracked": s.ignored,
+                "client": s.client,
                 "work_item": item.map(|i| json!({ "id": i.id, "title": i.title, "issue": i.issue, "repo_path": i.repo_path })),
                 "today_tile": s.item_id.as_ref().map(|i| tile_json(st, i, &today)),
             })
@@ -555,28 +639,19 @@ struct Assign {
     desk: Option<String>,
     #[serde(default)]
     untracked: bool,
+    /// `embarch-chat` when the panel runs the session (chat proposal 10).
+    #[serde(default)]
+    client: Option<String>,
 }
 
 async fn assign_session(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): Json<Assign>) -> ApiResult {
     let now = now_ms();
+    let client = clean(&b.client).map(|c| c.chars().take(40).collect::<String>());
     app.db.write(|st| {
-        st.sessions.entry(sid.clone()).or_insert_with(|| store::Session {
-            id: sid.clone(),
-            cwd: String::new(),
-            desk_id: None,
-            item_id: None,
-            ignored: false,
-            started_ms: now,
-            last_ms: now,
-            spans: vec![],
-            commits: vec![],
-            held_lines: vec![],
-            held_bench: vec![],
-            ended: false,
-            last_reply: None,
-            last_reply_ms: 0,
-            waiting: None,
-        });
+        let s = st.sessions.entry(sid.clone()).or_insert_with(|| store::Session::new(&sid, "", now));
+        if client.is_some() {
+            s.client = client;
+        }
     });
     if b.untracked {
         app.db.write(|st| st.untrack_session(&sid));
@@ -597,20 +672,40 @@ async fn assign_session(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): J
 #[derive(Deserialize)]
 struct LineBody {
     text: String,
+    /// `done` (the default), `finding`, `decision`, `handoff` or `todo`.
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+impl LineBody {
+    /// The note it makes, its kind checked.
+    fn note(&self, ms: i64, source: &str) -> Result<store::Line, ApiError> {
+        let mut note = store::Line::new(ms, self.text.trim(), source);
+        if let Some(k) = clean(&self.kind) {
+            let k = k.to_ascii_lowercase();
+            if !store::NOTE_KINDS.contains(&k.as_str()) {
+                return Err(bad(format!("unknown kind {k:?}; one of {}", store::NOTE_KINDS.join(", "))));
+            }
+            note.kind = k;
+        }
+        Ok(note)
+    }
 }
 
 async fn session_line(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): Json<LineBody>) -> ApiResult {
     let now = now_ms();
     let today = LocalDays.date(now);
+    let mut note = b.note(now, "agent")?;
+    note.session_id = Some(sid.clone());
     let landed = app.db.write(|st| {
         let sess = st.sessions.get_mut(&sid)?;
         match sess.item_id.clone() {
             Some(item) => {
-                st.add_line(&item, &today, &b.text, "agent", now);
-                Some(json!({ "tile": format!("{item}@{today}") }))
+                let id = st.add_note(&item, &today, note);
+                Some(json!({ "tile": format!("{item}@{today}"), "note_id": id }))
             }
             None => {
-                sess.held_lines.push(store::Line { ms: now, text: b.text.trim().to_string(), source: "agent".into() });
+                sess.held_lines.push(note);
                 Some(json!({ "held": true, "note": "the session has no work item yet; the line lands when it gets one" }))
             }
         }
@@ -636,9 +731,10 @@ fn require_open(st: &State, id: &str) -> Result<(), ApiError> {
 
 async fn tile_line(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<LineBody>) -> ApiResult {
     let (item, date) = split_tile_id(&id)?;
+    let note = b.note(now_ms(), "user")?;
     app.db.write(|st| {
         require_open(st, &id)?;
-        st.add_line(&item, &date, &b.text, "user", now_ms());
+        st.add_note(&item, &date, note);
         Ok::<_, ApiError>(())
     })?;
     Ok(Json(app.db.read(|st| tile_json(st, &item, &date))))
@@ -713,12 +809,23 @@ async fn harvest_targets(Ax(app): Ax<Shared>) -> ApiResult {
 }
 
 pub fn polish_prompt(item_label: &str, date: &str, hours: f64, lines: &[store::Line], targets: &[harvest::Target], recent: &[Value]) -> String {
-    let mut p = format!("Work item: {item_label}\nDate: {date}, about {hours:.2} hours.\n\nWhat was done, from the sessions' lines (commits and milestones):\n");
+    let mut p = format!(
+        "Work item: {item_label}\nDate: {date}, about {hours:.2} hours.\n\nWhat was done, from the day's notes \
+         (commits, milestones, findings, decisions, handoffs, to-dos, and the memory files the sessions kept):\n"
+    );
     if lines.is_empty() {
-        p.push_str("- (no lines were recorded; write from the work item alone)\n");
+        p.push_str("- (no notes were recorded; write from the work item alone)\n");
     }
     for l in lines.iter().take(60) {
-        p.push_str(&format!("- [{}] {}\n", l.source, l.text));
+        match l.kind.as_str() {
+            "done" => p.push_str(&format!("- [{}] {}\n", l.source, l.text)),
+            "memory" => {
+                let name = l.source_path.as_deref().and_then(|p| p.rsplit('/').next()).unwrap_or("memory");
+                let flat = l.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                p.push_str(&format!("- [memory file {name}, as it stood] {}\n", crate::brief::cut(&flat, 800)));
+            }
+            k => p.push_str(&format!("- [{k}] {}\n", l.text)),
+        }
     }
     if targets.is_empty() {
         p.push_str(
@@ -755,8 +862,9 @@ pub fn polish_prompt(item_label: &str, date: &str, hours: f64, lines: &[store::L
     p
 }
 
-/// Opening a tile turns its lines into one Harvest note and guesses where
-/// the time goes — one `claude -p` call per tile (proposal decision 13).
+/// Opening a tile turns that day's notes into one Harvest note and guesses
+/// where the time goes — one `claude -p` call per tile (decision 13; what
+/// goes to Harvest is the summary of the day's notes, chat-desk proposal 43).
 async fn polish_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     let (item, date) = split_tile_id(&id)?;
     let (label, hours, lines) = app.db.read(|st| {
@@ -767,7 +875,8 @@ async fn polish_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
             None => format!("{} (no Linear issue)", w.title),
         };
         let t = tile_json(st, &item, &date);
-        let lines = st.tiles.get(&id).map(|t| t.lines.clone()).unwrap_or_default();
+        // That day's notes of every kind (proposal 43).
+        let lines = st.day_notes(&item, &date, &LocalDays);
         Ok::<_, ApiError>((label, t["hours"].as_f64().unwrap_or(0.0), lines))
     })?;
     let (desk_target, _) = app.db.read(|st| st.tile_target(&item, &date));
@@ -1627,23 +1736,194 @@ async fn start_work(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
     warnings.extend(prepared.warnings.iter().cloned());
     let wt = prepared.path.display().to_string();
-    app.db.write(|st| {
+    let prompt = start_prompt(&issue, &id, &branch);
+    let mailbox_id = app.db.write(|st| {
         if let Some(i) = st.items.get_mut(&id) {
             i.repo_path = Some(wt.clone());
             i.last_activity_ms = now;
         }
         st.pending_launches.retain(|p| p.item_id != id);
         st.pending_launches.push(PendingLaunch { item_id: id.clone(), repo: wt.clone(), expires_ms: now + store::LAUNCH_CLAIM_MS });
+        // With the chat panel on, the worktree's window takes the start from
+        // the mailbox and sends the prompt itself (chat-desk proposal 11, 33).
+        st.settings.chat_panel.then(|| st.post_mail(start_entry(&id, &wt, &prompt), now))
     });
-    Ok(Json(json!({
+    let mut out = json!({
         "worktree": wt,
         "branch": prepared.branch,
         "how": prepared.how,
         "moved_to": moved_to,
         "warnings": warnings,
         "folder_uri": uri::folder_uri(&wt, app.wsl_distro.as_deref()),
-        "claude_uri": uri::claude_uri(&start_prompt(&issue, &id, &branch)),
-    })))
+    });
+    match mailbox_id {
+        Some(m) => out["mailbox_id"] = json!(m),
+        None => out["claude_uri"] = json!(uri::claude_uri(&prompt)),
+    }
+    Ok(Json(out))
+}
+
+fn start_entry(item_id: &str, folder: &str, prompt: &str) -> MailboxEntry {
+    MailboxEntry {
+        id: String::new(),
+        kind: "start".into(),
+        item_id: Some(item_id.to_string()),
+        session_id: None,
+        folder: folder.to_string(),
+        prompt: Some(prompt.to_string()),
+        created_ms: 0,
+        expires_ms: 0,
+        taken_ms: None,
+    }
+}
+
+// ---------------------------------------------------------------- the chat panel
+//
+// embarch-chat-desk-proposal.md: the mailbox the panel polls (33), the
+// setting that sends Start work into it (11), the pull a chat reads (40) and
+// the work item's notes (46).
+
+#[derive(Deserialize)]
+struct NewMail {
+    kind: String,
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    folder: String,
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+/// Leave a request — start a chat on an item, or focus a session — for the
+/// window whose folder matches. It expires as a launch claim does.
+async fn post_mailbox(Ax(app): Ax<Shared>, Json(b): Json<NewMail>) -> ApiResult {
+    let folder = b.folder.trim();
+    if !folder.starts_with('/') {
+        return Err(bad("folder must be an absolute path"));
+    }
+    let (item_id, session_id) = (clean(&b.item_id), clean(&b.session_id));
+    match b.kind.as_str() {
+        "start" => {
+            let item = item_id.as_deref().ok_or_else(|| bad("a start needs item_id"))?;
+            if !app.db.read(|st| st.items.contains_key(item)) {
+                return Err(missing(format!("no work item {item}")));
+            }
+        }
+        "focus" if session_id.is_none() => return Err(bad("a focus needs session_id")),
+        "focus" => {}
+        k => return Err(bad(format!("unknown kind {k:?}; start or focus"))),
+    }
+    let entry = MailboxEntry {
+        id: String::new(),
+        kind: b.kind.clone(),
+        item_id,
+        session_id,
+        folder: folder.to_string(),
+        prompt: clean(&b.prompt),
+        created_ms: 0,
+        expires_ms: 0,
+        taken_ms: None,
+    };
+    let id = app.db.write(|st| st.post_mail(entry, now_ms()));
+    Ok(Json(json!({ "id": id })))
+}
+
+#[derive(Deserialize)]
+struct MailQuery {
+    #[serde(default)]
+    folder: Option<String>,
+}
+
+async fn get_mailbox(Ax(app): Ax<Shared>, Query(q): Query<MailQuery>) -> ApiResult {
+    let folder = clean(&q.folder).filter(|f| f.starts_with('/')).ok_or_else(|| bad("give folder, an absolute path"))?;
+    let now = now_ms();
+    Ok(Json(app.db.read(|st| json!({ "entries": st.mail_for(&folder, now) }))))
+}
+
+/// The entry, once: a second take is a 409.
+async fn take_mailbox(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
+    match app.db.write(|st| st.take_mail(&id, now_ms())) {
+        Ok(m) => Ok(Json(json!(m))),
+        Err(TakeError::Unknown) => Err(missing("no such mailbox entry")),
+        Err(TakeError::Taken) => Err(ApiError(StatusCode::CONFLICT, "this entry was already taken".into())),
+        Err(TakeError::Expired) => Err(ApiError(StatusCode::CONFLICT, "this entry expired".into())),
+    }
+}
+
+async fn get_settings(Ax(app): Ax<Shared>) -> ApiResult {
+    Ok(Json(json!(app.db.read(|st| st.settings.clone()))))
+}
+
+#[derive(Deserialize)]
+struct SettingsPatch {
+    #[serde(default)]
+    chat_panel: Option<bool>,
+}
+
+async fn put_settings(Ax(app): Ax<Shared>, Json(b): Json<SettingsPatch>) -> ApiResult {
+    let s = app.db.write(|st| {
+        if let Some(on) = b.chat_panel {
+            st.settings.chat_panel = on;
+        }
+        st.settings.clone()
+    });
+    Ok(Json(json!(s)))
+}
+
+/// The pull (proposal 40): everything about the item, newest first, cut at
+/// 16,000 characters. The issue is read fresh from Linear; when it cannot
+/// be, the brief says so and carries the rest.
+async fn item_brief(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
+    let key = app
+        .db
+        .read(|st| st.items.get(&id).map(|i| i.issue.as_ref().map(|r| r.key.clone())))
+        .ok_or_else(|| missing("no such work item"))?;
+    let (issue, issue_error) = match key {
+        None => (None, None),
+        Some(k) => match linear_accounts() {
+            Ok(accounts) => match linear::read_issue(&accounts, &k).await {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+            Err(e) => (None, Some(e.1)),
+        },
+    };
+    let cache = app.cache.lock().expect("cache");
+    let text = app
+        .db
+        .read(|st| brief::render(st, &cache, &id, issue.as_ref(), issue_error.as_deref(), &LocalDays))
+        .ok_or_else(|| missing("no such work item"))?;
+    Ok(Json(json!({ "item_id": id, "text": text, "chars": text.chars().count(), "max_chars": brief::BRIEF_MAX })))
+}
+
+/// Every note on the item, newest first (proposal 46).
+async fn item_notes(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
+    app.db.read(|st| {
+        if !st.items.contains_key(&id) {
+            return Err(missing("no such work item"));
+        }
+        let latest: Vec<&str> = st.memory_latest(&id).iter().map(|l| l.id.as_str()).collect();
+        let notes: Vec<Value> = st
+            .item_notes(&id)
+            .into_iter()
+            .map(|l| brief::note_json(l, !l.is_memory() || latest.contains(&l.id.as_str()), &LocalDays))
+            .collect();
+        Ok(Json(json!({ "item_id": id, "notes": notes })))
+    })
+}
+
+/// Attach the memory files written before capture existed to the items
+/// whose issue key they hold — once, on the first start with notes
+/// (proposal 47).
+pub async fn import_memories(app: &App) {
+    if app.db.read(|st| st.memory_imported) {
+        return;
+    }
+    let Some(dir) = crate::memory::claude_dir() else { return };
+    let Ok(files) = tokio::task::spawn_blocking(move || crate::memory::scan(&dir)).await else { return };
+    let added = app.db.write(|st| st.import_memories(&files));
+    tracing::info!("attached {added} memory notes from {} memory files", files.len());
 }
 
 // ---------------------------------------------------------------- what Harvest already holds
@@ -1862,7 +2142,9 @@ pub async fn sync_once(app: &App, force_issues: bool) {
     }
 
     if let Some(agents) = live_agents().await {
-        app.cache.lock().expect("cache").agents = agents;
+        let mut c = app.cache.lock().expect("cache");
+        c.agents = agents;
+        c.agents_ms = now_ms();
     }
     let today = LocalDays.date(now);
     let fetched = app.cache.lock().expect("cache").logged_fetched.get(&today).copied().unwrap_or(0);
@@ -2070,7 +2352,7 @@ mod tests {
         s1.last_reply = Some("Here is the summary.".into());
         crate::store::record_activity(&mut s1, D0 + H, &UtcDays);
         st.sessions.insert("abc-123".into(), s1);
-        let mut cache = Cache { wsl_distro: Some("Ubuntu".into()), ..Default::default() };
+        let mut cache = Cache { wsl_distro: Some("Ubuntu".into()), agents_ms: D0 + 2 * H, ..Default::default() };
         cache.agents.insert("abc-123".into(), json!({"sessionId": "abc-123", "status": "waiting", "waitingFor": "permission prompt", "name": "fw-abc-1"}));
         let v = view_json(&st, &cache, D0 + 2 * H, 7, &UtcDays);
         let row = &v["cards"][0]["live_sessions"][0];
@@ -2090,12 +2372,89 @@ mod tests {
 
     #[test]
     fn the_polish_prompt_carries_lines_targets_and_the_reply_shape() {
-        let lines = vec![store::Line { ms: 0, text: "smp: retry a busy upload".into(), source: "commit".into() }];
+        let lines = vec![store::Line::new(0, "smp: retry a busy upload", "commit")];
         let targets = vec![harvest::Target {
             account_id: 1, account_name: "a".into(), project_id: 2, project_name: "Fw".into(),
             client_name: "C".into(), task_id: 3, task_name: "Dev".into(),
         }];
         let p = polish_prompt("ABC-123 Bootload", "2026-10-22", 2.5, &lines, &targets, &[]);
         assert!(p.contains("smp: retry a busy upload") && p.contains("1 / 2 / 3: C / Fw / Dev") && p.contains("\"note\""));
+    }
+
+    #[test]
+    fn the_polish_reads_the_days_notes_of_every_kind() {
+        let mut st = State::default();
+        let w = st.create_item("Loader", None, D0);
+        st.add_line(&w, "2026-10-22", "smp: retry a busy upload", "commit", D0 + H);
+        let mut d = store::Line::new(D0 + 2 * H, "keep the loader in RRAM", "agent");
+        d.kind = "decision".into();
+        st.add_note(&w, "2026-10-22", d);
+        st.add_note(&w, "2026-10-22", store::Line::memory(D0 + 3 * H, "/h/.claude/projects/-w/memory/loader.md", "# Loader\n\nbranch user/abc-1,\nPR open"));
+        st.add_line(&w, "2026-10-23", "the next day", "agent", D0 + 25 * H);
+        let p = polish_prompt("Loader", "2026-10-22", 3.0, &st.day_notes(&w, "2026-10-22", &UtcDays), &[], &[]);
+        assert!(p.contains("- [commit] smp: retry a busy upload\n- [decision] keep the loader in RRAM\n- [memory file loader.md, as it stood] # Loader branch user/abc-1, PR open\n"), "{p}");
+        assert!(!p.contains("the next day"));
+    }
+
+    #[test]
+    fn the_hooks_and_claude_agents_join_on_whichever_saw_the_session_last() {
+        let mut s = crate::store::testing::session("s");
+        s.last_ms = D0 + 10;
+        s.busy = true;
+        let mut cache = Cache::default();
+        cache.agents.insert("s".into(), json!({"sessionId": "s", "status": "waiting", "waitingFor": "permission prompt"}));
+        cache.agents_ms = D0;
+        assert_eq!(session_state(&cache, &s), ("busy", None), "a hook after the read wins");
+        cache.agents_ms = D0 + 20;
+        assert_eq!(session_state(&cache, &s), ("waiting", Some("permission prompt".into())));
+        s.busy = false;
+        s.waiting = Some("your reply".into());
+        assert_eq!(session_state(&Cache::default(), &s), ("waiting", Some("your reply".into())));
+        s.waiting = None;
+        assert_eq!(session_state(&Cache::default(), &s), ("idle", None));
+        s.ended = true;
+        assert_eq!(session_state(&Cache::default(), &s), ("ended", None));
+    }
+
+    #[test]
+    fn the_view_lists_every_live_session_with_its_state_and_client_but_not_the_fleets() {
+        let mut st = State { ignore: vec!["/g/embarch".into()], ..Default::default() };
+        let w = st.create_item("x", None, D0);
+        let mut chat = crate::store::testing::session("chat");
+        chat.item_id = Some(w.clone());
+        chat.client = Some("embarch-chat".into());
+        chat.busy = true;
+        chat.last_ms = D0 + H;
+        let mut fleet = crate::store::testing::session("fleet");
+        fleet.cwd = "/g/embarch/embarch-ui".into();
+        fleet.ignored = true;
+        fleet.last_ms = D0 + H;
+        let mut mine = crate::store::testing::session("untracked");
+        mine.ignored = true;
+        mine.last_ms = D0 + H;
+        let mut old = crate::store::testing::session("old");
+        old.last_ms = D0 - 2 * H;
+        for s in [chat, fleet, mine, old] {
+            st.sessions.insert(s.id.clone(), s);
+        }
+        let v = view_json(&st, &Cache::default(), D0 + H + 1, 7, &UtcDays);
+        let ids: Vec<&str> = v["sessions"].as_array().unwrap().iter().map(|s| s["session_id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.contains(&"chat") && ids.contains(&"untracked"));
+        let chat = v["sessions"].as_array().unwrap().iter().find(|s| s["session_id"] == "chat").unwrap();
+        assert_eq!((chat["state"].as_str(), chat["client"].as_str(), chat["item_id"].as_str()), (Some("busy"), Some("embarch-chat"), Some(w.as_str())));
+        assert_eq!(chat["last_ms"], D0 + H);
+        let row = &v["cards"][0]["live_sessions"][0];
+        assert_eq!((row["state"].as_str(), row["client"].as_str(), row["cwd"].as_str()), (Some("busy"), Some("embarch-chat"), Some("/w/repo")));
+        assert_eq!(v["settings"]["chat_panel"], false);
+    }
+
+    #[test]
+    fn a_start_entry_carries_the_item_the_worktree_and_the_prompt() {
+        let mut st = State::default();
+        let m = st.post_mail(start_entry("w3", "/w/fw-abc-7", "Read ABC-7"), D0);
+        let got = st.take_mail(&m, D0 + 1).unwrap();
+        assert_eq!((got.kind.as_str(), got.item_id.as_deref(), got.folder.as_str(), got.prompt.as_deref()), ("start", Some("w3"), "/w/fw-abc-7", Some("Read ABC-7")));
+        assert_eq!(got.expires_ms, D0 + store::LAUNCH_CLAIM_MS);
     }
 }

@@ -3,6 +3,7 @@
 //! embarch-doc/embarch-desk/spec.md is current truth.
 
 mod claude;
+mod brief;
 mod client;
 mod connectors;
 mod db;
@@ -13,6 +14,7 @@ mod hook;
 mod linear;
 mod localrepo;
 mod mcp;
+mod memory;
 mod paths;
 mod server;
 mod service;
@@ -203,6 +205,7 @@ async fn serve() -> Result<()> {
         .with_context(|| format!("binding {addr} — is another desk already running?"))?;
     tracing::info!("embarch-desk listening on http://{addr}");
     server::publish_open(&app);
+    server::import_memories(&app).await;
     tokio::spawn(server::flush_loop(app.clone()));
     tokio::spawn(server::sync_loop(app.clone()));
     let shutdown_app = app.clone();

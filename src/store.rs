@@ -61,6 +61,77 @@ pub struct State {
     /// Harvest app, or by a tile's ✓. A tile proposes only the gap.
     #[serde(default)]
     pub harvest_logged: BTreeMap<String, Vec<LoggedEntry>>,
+    /// Notes kept on the work item itself rather than on a day's tile, by
+    /// item id: captured memory files, every version, and the lines of tiles
+    /// already archived — the work's knowledge outlives its tiles
+    /// (`embarch-chat-desk-proposal.md` 40).
+    #[serde(default)]
+    pub notes: BTreeMap<String, Vec<Line>>,
+    /// The memory files written before capture existed have been attached
+    /// to their items (proposal 47) — once, on the first start with notes.
+    #[serde(default)]
+    pub memory_imported: bool,
+    /// Requests for the embarch-chat panel: start a chat, or focus one, in
+    /// the window whose folder matches (proposal 33).
+    #[serde(default)]
+    pub mailbox: Vec<MailboxEntry>,
+    #[serde(default)]
+    pub settings: Settings,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Settings {
+    /// Start work leaves its start in the mailbox for the embarch-chat panel
+    /// instead of pre-filling Claude Code's. Off until the chat ships (chat
+    /// proposal decision 4).
+    #[serde(default)]
+    pub chat_panel: bool,
+}
+
+/// One request waiting for a VS Code window's embarch-chat panel, taken once
+/// by the window whose folder matches — decision 25's launch claim extended
+/// to the panel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MailboxEntry {
+    pub id: String,
+    /// `start` (a chat on an item, with a prompt) or `focus` (a session).
+    pub kind: String,
+    #[serde(default)]
+    pub item_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub folder: String,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    pub created_ms: i64,
+    pub expires_ms: i64,
+    /// Kept until it expires, so a second take is told it is gone.
+    #[serde(default)]
+    pub taken_ms: Option<i64>,
+}
+
+/// Why a mailbox entry could not be taken.
+#[derive(Debug, PartialEq)]
+pub enum TakeError {
+    Unknown,
+    Taken,
+    Expired,
+}
+
+/// The kinds a session or the user may give a note. `memory` is the
+/// desk's own: a captured memory file.
+pub const NOTE_KINDS: &[&str] = &["done", "finding", "decision", "handoff", "todo"];
+/// A captured memory file keeps this many versions; older ones go.
+pub const MEMORY_VERSIONS_KEPT: usize = 20;
+/// A memory file is kept up to this many characters.
+pub const MEMORY_TEXT_MAX: usize = 32_000;
+
+/// A memory file on disk, as the import reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryFile {
+    pub path: String,
+    pub mtime_ms: i64,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -225,6 +296,37 @@ pub struct Session {
     /// cleared by the next prompt or tool call.
     #[serde(default)]
     pub waiting: Option<String>,
+    /// Between a prompt or a tool call and the Stop that ends the turn.
+    #[serde(default)]
+    pub busy: bool,
+    /// What runs the session when it says so on assign: `embarch-chat` for
+    /// the panel's chats.
+    #[serde(default)]
+    pub client: Option<String>,
+}
+
+impl Session {
+    pub fn new(id: &str, cwd: &str, now: i64) -> Self {
+        Session {
+            id: id.to_string(),
+            cwd: cwd.to_string(),
+            desk_id: None,
+            item_id: None,
+            ignored: false,
+            started_ms: now,
+            last_ms: now,
+            spans: vec![],
+            commits: vec![],
+            held_lines: vec![],
+            held_bench: vec![],
+            ended: false,
+            last_reply: None,
+            last_reply_ms: 0,
+            waiting: None,
+            busy: false,
+            client: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -235,12 +337,57 @@ pub struct Span {
     pub last_ms: i64,
 }
 
+/// A note — notes and tile lines are one stream (proposal 43): a tile line
+/// is a note of kind `done`. Lines written before notes existed read as
+/// `done` and get an id when the state loads.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Line {
     pub ms: i64,
     pub text: String,
-    /// `commit`, `agent` or `user`.
+    /// `commit`, `agent`, `user` or `memory`.
     pub source: String,
+    #[serde(default)]
+    pub id: String,
+    /// `done`, `finding`, `decision`, `handoff`, `todo`, or `memory` for a
+    /// captured memory file.
+    #[serde(default = "kind_done")]
+    pub kind: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// A memory note's file: one note per file, its versions kept.
+    #[serde(default)]
+    pub source_path: Option<String>,
+}
+
+fn kind_done() -> String {
+    "done".to_string()
+}
+
+impl Line {
+    /// A plain tile line: kind `done`, no session.
+    pub fn new(ms: i64, text: &str, source: &str) -> Self {
+        Line {
+            ms,
+            text: text.to_string(),
+            source: source.to_string(),
+            id: String::new(),
+            kind: kind_done(),
+            session_id: None,
+            source_path: None,
+        }
+    }
+
+    /// A version of a captured memory file.
+    pub fn memory(ms: i64, path: &str, text: &str) -> Self {
+        let mut l = Line::new(ms, text, "memory");
+        l.kind = "memory".into();
+        l.source_path = Some(path.to_string());
+        l
+    }
+
+    pub fn is_memory(&self) -> bool {
+        self.kind == "memory"
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -335,6 +482,8 @@ pub trait Days {
     fn date(&self, ms: i64) -> String;
     /// The first millisecond of the day after the one `ms` falls in.
     fn next_midnight(&self, ms: i64) -> i64;
+    /// `2026-10-22 14:03`, for text a session reads.
+    fn stamp(&self, ms: i64) -> String;
 }
 
 pub struct LocalDays;
@@ -346,6 +495,15 @@ impl Days for LocalDays {
             .timestamp_millis_opt(ms)
             .single()
             .map(|t| t.date_naive().to_string())
+            .unwrap_or_default()
+    }
+
+    fn stamp(&self, ms: i64) -> String {
+        use chrono::TimeZone;
+        chrono::Local
+            .timestamp_millis_opt(ms)
+            .single()
+            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_default()
     }
 
@@ -404,6 +562,15 @@ impl Git for RealGit {
     }
 }
 
+/// A folder as the mailbox compares it: no trailing slash.
+pub fn norm_folder(path: &str) -> String {
+    let p = path.trim();
+    match p.trim_end_matches('/') {
+        "" if p.starts_with('/') => "/".to_string(),
+        t => t.to_string(),
+    }
+}
+
 /// Is `path` inside one of the ignored prefixes? Matched on whole path
 /// components, so `/a/embarch` does not swallow `/a/embarch-client`.
 pub fn is_ignored(path: &str, ignore: &[String]) -> bool {
@@ -417,6 +584,12 @@ pub fn is_ignored(path: &str, ignore: &[String]) -> bool {
 /// The first `ABC-123`-shaped token in a branch name, uppercased — Linear's
 /// own branch names carry one (`user/abc-123-bootload-over-smp`).
 pub fn issue_key_in(text: &str) -> Option<String> {
+    issue_keys_in(text).into_iter().next()
+}
+
+/// Every `ABC-123`-shaped token in a text, uppercased, in order, once each.
+pub fn issue_keys_in(text: &str) -> Vec<String> {
+    let mut keys: Vec<String> = vec![];
     let b = text.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -432,14 +605,18 @@ pub fn issue_key_in(text: &str) -> Option<String> {
                     j += 1;
                 }
                 if j == b.len() || !b[j].is_ascii_alphanumeric() {
-                    return Some(text[start..j].to_ascii_uppercase());
+                    let key = text[start..j].to_ascii_uppercase();
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                    i = j;
                 }
             }
         } else {
             i += 1;
         }
     }
-    None
+    keys
 }
 
 impl State {
@@ -528,18 +705,185 @@ impl State {
     }
 
     pub fn add_line(&mut self, item_id: &str, date: &str, text: &str, source: &str, ms: i64) {
-        let text = text.trim();
-        if text.is_empty() {
-            return;
+        self.add_note(item_id, date, Line::new(ms, text, source));
+    }
+
+    /// File a note on an item: a captured memory file on the item itself,
+    /// anything else on the day's tile as a line. Returns its id, or `None`
+    /// for an empty one.
+    pub fn add_note(&mut self, item_id: &str, date: &str, mut note: Line) -> Option<String> {
+        note.text = note.text.trim().to_string();
+        if note.text.is_empty() {
+            return None;
         }
-        self.tile_mut(item_id, date).lines.push(Line {
-            ms,
-            text: text.to_string(),
-            source: source.to_string(),
-        });
+        if note.id.is_empty() {
+            note.id = self.new_id("n");
+        }
+        let (id, ms) = (note.id.clone(), note.ms);
+        if note.is_memory() {
+            self.add_memory(item_id, note);
+        } else {
+            self.tile_mut(item_id, date).lines.push(note);
+        }
         if let Some(item) = self.items.get_mut(item_id) {
             item.last_activity_ms = item.last_activity_ms.max(ms);
         }
+        Some(id)
+    }
+
+    /// A new version of a memory note. The same text twice is one version;
+    /// past [`MEMORY_VERSIONS_KEPT`] the oldest goes.
+    fn add_memory(&mut self, item_id: &str, mut note: Line) {
+        if note.text.chars().count() > MEMORY_TEXT_MAX {
+            note.text = note.text.chars().take(MEMORY_TEXT_MAX).collect();
+        }
+        let kept = self.notes.entry(item_id.to_string()).or_default();
+        let same_file = |l: &Line| l.is_memory() && l.source_path == note.source_path;
+        if kept.iter().rev().find(|l| same_file(l)).is_some_and(|l| l.text == note.text) {
+            return;
+        }
+        let path = note.source_path.clone();
+        kept.push(note);
+        let versions = kept.iter().filter(|l| l.is_memory() && l.source_path == path).count();
+        if versions > MEMORY_VERSIONS_KEPT {
+            if let Some(pos) = kept.iter().position(|l| l.is_memory() && l.source_path == path) {
+                kept.remove(pos);
+            }
+        }
+    }
+
+    /// Every note on an item, newest first: its tiles' lines, its memory
+    /// files' versions and the lines of its archived tiles.
+    pub fn item_notes(&self, item_id: &str) -> Vec<&Line> {
+        let mut out: Vec<&Line> = self
+            .tiles
+            .values()
+            .filter(|t| t.item_id == item_id)
+            .flat_map(|t| t.lines.iter())
+            .chain(self.notes.get(item_id).into_iter().flatten())
+            .collect();
+        out.sort_by_key(|l| std::cmp::Reverse(l.ms));
+        out
+    }
+
+    /// Each memory file's newest version on an item, newest first.
+    pub fn memory_latest(&self, item_id: &str) -> Vec<&Line> {
+        let mut seen: Vec<&Option<String>> = vec![];
+        let mut out = vec![];
+        for l in self.item_notes(item_id).into_iter().filter(|l| l.is_memory()) {
+            if !seen.contains(&&l.source_path) {
+                seen.push(&l.source_path);
+                out.push(l);
+            }
+        }
+        out
+    }
+
+    /// A day's notes on an item, every kind, oldest first: what the Harvest
+    /// note summarises (proposal 43). A memory file written several times
+    /// that day is one note, as it stood last.
+    pub fn day_notes(&self, item_id: &str, date: &str, days: &dyn Days) -> Vec<Line> {
+        let mut seen: Vec<&Option<String>> = vec![];
+        let mut out: Vec<Line> = vec![];
+        for l in self.item_notes(item_id).into_iter().filter(|l| days.date(l.ms) == date) {
+            if l.is_memory() {
+                if seen.contains(&&l.source_path) {
+                    continue;
+                }
+                seen.push(&l.source_path);
+            }
+            out.push(l.clone());
+        }
+        out.reverse();
+        out
+    }
+
+    /// Lines from before notes existed get their ids. Their kind already
+    /// reads as `done`; nothing else changes. True when it gave any.
+    pub fn migrate(&mut self) -> bool {
+        let before = self.next_id;
+        let mut next = self.next_id;
+        let mut give = |l: &mut Line| {
+            if l.id.is_empty() {
+                next += 1;
+                l.id = format!("n{next}");
+            }
+        };
+        for t in self.tiles.values_mut() {
+            t.lines.iter_mut().for_each(&mut give);
+        }
+        for s in self.sessions.values_mut() {
+            s.held_lines.iter_mut().for_each(&mut give);
+        }
+        for n in self.notes.values_mut() {
+            n.iter_mut().for_each(&mut give);
+        }
+        self.next_id = next;
+        next != before
+    }
+
+    /// Attach the memory files written before capture to the items whose
+    /// issue key they hold (proposal 47): a key in the file's name names its
+    /// item alone; else every item whose key its text holds. A file already
+    /// on an item is left alone, so a second run adds nothing. Returns the
+    /// notes added.
+    pub fn import_memories(&mut self, files: &[MemoryFile]) -> usize {
+        let mut added = 0;
+        for f in files {
+            let name = std::path::Path::new(&f.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let items_for = |text: &str| -> Vec<String> {
+                issue_keys_in(text).iter().filter_map(|k| self.item_by_key(k).map(|i| i.id.clone())).collect()
+            };
+            let mut targets = items_for(&name);
+            if targets.is_empty() {
+                targets = items_for(&f.text);
+            }
+            for item in targets {
+                let has = self.notes.get(&item).is_some_and(|n| n.iter().any(|l| l.source_path.as_deref() == Some(f.path.as_str())));
+                if has {
+                    continue;
+                }
+                if self.add_note(&item, "", Line::memory(f.mtime_ms, &f.path, &f.text)).is_some() {
+                    added += 1;
+                }
+            }
+        }
+        self.memory_imported = true;
+        added
+    }
+
+    /// Leave a request for the window whose folder is `folder`.
+    pub fn post_mail(&mut self, mut entry: MailboxEntry, now: i64) -> String {
+        entry.id = self.new_id("m");
+        entry.folder = norm_folder(&entry.folder);
+        entry.created_ms = now;
+        entry.expires_ms = now + LAUNCH_CLAIM_MS;
+        entry.taken_ms = None;
+        let id = entry.id.clone();
+        self.mailbox.push(entry);
+        id
+    }
+
+    /// The entries still waiting for a window on `folder`.
+    pub fn mail_for(&self, folder: &str, now: i64) -> Vec<&MailboxEntry> {
+        let folder = norm_folder(folder);
+        self.mailbox
+            .iter()
+            .filter(|m| m.taken_ms.is_none() && m.expires_ms > now && m.folder == folder)
+            .collect()
+    }
+
+    /// Take an entry, once.
+    pub fn take_mail(&mut self, id: &str, now: i64) -> Result<MailboxEntry, TakeError> {
+        let m = self.mailbox.iter_mut().find(|m| m.id == id).ok_or(TakeError::Unknown)?;
+        if m.taken_ms.is_some() {
+            return Err(TakeError::Taken);
+        }
+        if m.expires_ms <= now {
+            return Err(TakeError::Expired);
+        }
+        m.taken_ms = Some(now);
+        Ok(m.clone())
     }
 
     pub fn add_bench(&mut self, item_id: &str, ev: BenchEvent) {
@@ -589,14 +933,16 @@ impl State {
         let held_bench = std::mem::take(&mut sess.held_bench);
         let cwd = sess.cwd.clone();
         for l in held_lines {
-            self.add_line(item_id, &days.date(l.ms), &l.text, &l.source, l.ms);
+            self.add_note(item_id, &days.date(l.ms), l);
         }
         for b in held_bench {
             self.add_bench(item_id, b);
         }
         if let Some(item) = self.items.get_mut(item_id) {
             item.last_activity_ms = item.last_activity_ms.max(now);
-            if item.repo_path.is_none() {
+            // A session the panel assigned before it started has no folder
+            // yet; its first event sets the repo instead.
+            if item.repo_path.is_none() && !cwd.is_empty() {
                 item.repo_path = git.toplevel(&cwd);
             }
         }
@@ -696,23 +1042,8 @@ impl State {
         }
         self.stop_timer(now, days);
         let sid = self.new_id("timer-");
-        let mut sess = Session {
-            id: sid.clone(),
-            cwd: String::new(),
-            desk_id: None,
-            item_id: Some(item_id.to_string()),
-            ignored: false,
-            started_ms: now,
-            last_ms: now,
-            spans: vec![],
-            commits: vec![],
-            held_lines: vec![],
-            held_bench: vec![],
-            ended: false,
-            last_reply: None,
-            last_reply_ms: 0,
-            waiting: None,
-        };
+        let mut sess = Session::new(&sid, "", now);
+        sess.item_id = Some(item_id.to_string());
         record_activity(&mut sess, now, days);
         self.sessions.insert(sid.clone(), sess);
         self.timer = Some(Timer { session_id: sid, item_id: item_id.to_string(), started_ms: now });
@@ -773,6 +1104,11 @@ impl State {
             .map(|t| t.id.clone())
             .collect();
         let archived: Vec<Tile> = old.iter().filter_map(|id| self.tiles.remove(id)).collect();
+        // The tile goes to history; its lines stay on the item, which is
+        // where the work's knowledge gathers.
+        for t in &archived {
+            self.notes.entry(t.item_id.clone()).or_default().extend(t.lines.iter().cloned());
+        }
         let open: std::collections::BTreeSet<(String, String)> = self
             .tile_keys()
             .into_iter()
@@ -791,6 +1127,7 @@ impl State {
                 })
         });
         self.pending_launches.retain(|p| p.expires_ms > now);
+        self.mailbox.retain(|m| m.expires_ms > now);
         if let Some(cutoff) = chrono::DateTime::from_timestamp_millis(now - 14 * 86_400_000) {
             let cutoff = cutoff.date_naive().to_string();
             self.harvest_logged.retain(|d, _| d.as_str() >= cutoff.as_str());
@@ -845,6 +1182,9 @@ pub mod testing {
         fn next_midnight(&self, ms: i64) -> i64 {
             (ms.div_euclid(86_400_000) + 1) * 86_400_000
         }
+        fn stamp(&self, ms: i64) -> String {
+            chrono::DateTime::from_timestamp_millis(ms).unwrap().format("%Y-%m-%d %H:%M").to_string()
+        }
     }
 
     #[derive(Default)]
@@ -866,23 +1206,7 @@ pub mod testing {
     }
 
     pub fn session(id: &str) -> Session {
-        Session {
-            id: id.into(),
-            cwd: "/w/repo".into(),
-            desk_id: None,
-            item_id: None,
-            ignored: false,
-            started_ms: 0,
-            last_ms: 0,
-            spans: vec![],
-            commits: vec![],
-            held_lines: vec![],
-            held_bench: vec![],
-            ended: false,
-            last_reply: None,
-            last_reply_ms: 0,
-            waiting: None,
-        }
+        Session::new(id, "/w/repo", 0)
     }
 }
 
@@ -977,7 +1301,7 @@ mod tests {
         let mut st = State::default();
         let w = st.create_item("x", None, D0);
         let mut s = session("s");
-        s.held_lines.push(Line { ms: D0 + H, text: "fix the race".into(), source: "commit".into() });
+        s.held_lines.push(Line::new(D0 + H, "fix the race", "commit"));
         s.held_bench.push(BenchEvent { ms: D0 + H, tool: "flash".into(), ok: true });
         st.sessions.insert("s".into(), s);
         let git = FakeGit { toplevel: Some("/w/repo".into()), ..Default::default() };
@@ -1088,5 +1412,107 @@ mod tests {
         assert_eq!(issue_key_in("feature/abc-12x"), None);
         assert_eq!(issue_key_in("main"), None);
         assert_eq!(issue_key_in("fix: x2-3 then ws-12 done").as_deref(), Some("WS-12"));
+        assert_eq!(issue_keys_in("ABC-1 blocks abc-22; see ABC-1 and ABC-3x"), ["ABC-1", "ABC-22"]);
+    }
+
+    #[test]
+    fn lines_from_before_notes_load_as_done_notes_with_ids_and_nothing_is_lost() {
+        // The shape the state file had before notes: lines are {ms, text, source}.
+        let old = serde_json::json!({
+            "next_id": 4,
+            "items": { "w1": { "id": "w1", "title": "Loader", "created_ms": D0, "last_activity_ms": D0 } },
+            "sessions": { "s": { "id": "s", "cwd": "/w/r", "started_ms": D0, "last_ms": D0,
+                "held_lines": [{ "ms": D0 + 3, "text": "held", "source": "commit" }] } },
+            "tiles": { "w1@2026-10-22": { "id": "w1@2026-10-22", "item_id": "w1", "date": "2026-10-22",
+                "lines": [{ "ms": D0 + 1, "text": "smp: retry", "source": "commit" }, { "ms": D0 + 2, "text": "flashed", "source": "agent" }] } },
+        });
+        let mut st: State = serde_json::from_value(old).unwrap();
+        assert!(st.migrate());
+        let lines = st.tiles["w1@2026-10-22"].lines.clone();
+        assert_eq!(lines.iter().map(|l| (l.text.as_str(), l.kind.as_str())).collect::<Vec<_>>(), [("smp: retry", "done"), ("flashed", "done")]);
+        assert_eq!((lines[0].id.as_str(), lines[1].id.as_str()), ("n5", "n6"));
+        assert_eq!(st.sessions["s"].held_lines[0].id, "n7");
+        assert_eq!(st.next_id, 7, "new ids never collide with the ones given");
+        assert!(!st.migrate(), "a second load changes nothing");
+        let again: State = serde_json::from_value(serde_json::to_value(&st).unwrap()).unwrap();
+        assert_eq!(again.tiles["w1@2026-10-22"].lines, lines);
+        assert!(!again.settings.chat_panel && again.mailbox.is_empty() && !again.memory_imported);
+    }
+
+    #[test]
+    fn notes_are_one_stream_and_a_memory_files_versions_stay_on_the_item() {
+        let mut st = State::default();
+        let w = st.create_item("x", None, D0);
+        st.add_line(&w, "2026-10-22", "built the loader", "agent", D0 + H);
+        let mut f = Line::new(D0 + 2 * H, "the loader needs 432 KB", "agent");
+        f.kind = "finding".into();
+        st.add_note(&w, "2026-10-22", f);
+        assert!(st.add_note(&w, "2026-10-22", Line::new(D0, "   ", "agent")).is_none());
+        st.add_note(&w, "2026-10-22", Line::memory(D0 + 3 * H, "/m/a.md", "v1"));
+        st.add_note(&w, "2026-10-22", Line::memory(D0 + 4 * H, "/m/a.md", "v1"));
+        st.add_note(&w, "2026-10-22", Line::memory(D0 + 5 * H, "/m/a.md", "v2"));
+        st.add_note(&w, "2026-10-23", Line::memory(D0 + DAY, "/m/b.md", "other"));
+        let tile = &st.tiles[&format!("{w}@2026-10-22")];
+        assert_eq!(tile.lines.len(), 2, "a memory file is no tile line");
+        assert_eq!(st.notes[&w].len(), 3, "the same text twice is one version");
+        let all: Vec<&str> = st.item_notes(&w).iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(all, ["other", "v2", "v1", "the loader needs 432 KB", "built the loader"]);
+        let latest: Vec<&str> = st.memory_latest(&w).iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(latest, ["other", "v2"]);
+        let day: Vec<(String, String)> = st.day_notes(&w, "2026-10-22", &UtcDays).into_iter().map(|l| (l.kind, l.text)).collect();
+        assert_eq!(day, [("done".into(), "built the loader".into()), ("finding".into(), "the loader needs 432 KB".into()), ("memory".into(), "v2".into())]);
+        for i in 0..MEMORY_VERSIONS_KEPT + 5 {
+            st.add_note(&w, "2026-10-24", Line::memory(D0 + 2 * DAY + i as i64, "/m/c.md", &format!("c{i}")));
+        }
+        assert_eq!(st.notes[&w].iter().filter(|l| l.source_path.as_deref() == Some("/m/c.md")).count(), MEMORY_VERSIONS_KEPT);
+        // An acted tile goes to history; its lines stay on the item.
+        let t = st.tile_mut(&w, "2026-10-22");
+        t.status = TileStatus::Approved;
+        t.acted_ms = Some(D0);
+        assert_eq!(st.prune(D0 + 8 * DAY).len(), 1);
+        assert!(st.item_notes(&w).iter().any(|l| l.text == "built the loader"));
+    }
+
+    #[test]
+    fn the_import_attaches_a_file_by_its_name_first_then_its_text_and_only_once() {
+        let mut st = State::default();
+        let issue = |k: &str| Some(IssueRef { key: k.into(), ..Default::default() });
+        let a = st.create_item("a", issue("ABC-1"), D0);
+        let b = st.create_item("b", issue("ABC-2"), D0);
+        let file = |path: &str, text: &str| MemoryFile { path: path.into(), mtime_ms: D0, text: text.into() };
+        let files = vec![
+            file("/m/abc-1-state.md", "ABC-1 branch; blocked on ABC-2"),
+            file("/m/bring-up.md", "notes on ABC-2 and ABC-1"),
+            file("/m/unrelated.md", "ZZZ-9 only"),
+        ];
+        assert_eq!(st.import_memories(&files), 3);
+        let paths = |w: &str| st.notes.get(w).map(|n| n.iter().map(|l| l.source_path.clone().unwrap()).collect::<Vec<_>>()).unwrap_or_default();
+        assert_eq!(paths(&a), ["/m/abc-1-state.md", "/m/bring-up.md"], "the name decides alone when it names an item");
+        assert_eq!(paths(&b), ["/m/bring-up.md"]);
+        assert!(st.memory_imported);
+        assert_eq!(st.notes[&a][0].kind, "memory");
+        assert_eq!(st.notes[&a][0].ms, D0, "dated by the file, so no other day's notes change");
+        assert_eq!(st.import_memories(&files), 0, "idempotent");
+    }
+
+    #[test]
+    fn a_mailbox_entry_is_for_its_folder_taken_once_and_expires_as_a_claim_does() {
+        let mut st = State::default();
+        let entry = |folder: &str| MailboxEntry {
+            id: String::new(), kind: "focus".into(), item_id: None, session_id: Some("s".into()),
+            folder: folder.into(), prompt: None, created_ms: 0, expires_ms: 0, taken_ms: None,
+        };
+        let m = st.post_mail(entry("/w/fw-abc-1/"), D0);
+        let other = st.post_mail(entry("/w/fw"), D0);
+        assert_eq!(st.mail_for("/w/fw-abc-1", D0 + 1).iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), [m.as_str()]);
+        assert!(st.mail_for("/w", D0 + 1).is_empty(), "only the window whose folder matches");
+        assert_eq!(st.take_mail(&m, D0 + 2).unwrap().folder, "/w/fw-abc-1");
+        assert_eq!(st.take_mail(&m, D0 + 3), Err(TakeError::Taken));
+        assert!(st.mail_for("/w/fw-abc-1", D0 + 4).is_empty());
+        assert_eq!(st.take_mail(&other, D0 + LAUNCH_CLAIM_MS), Err(TakeError::Expired));
+        assert_eq!(st.take_mail("m404", D0), Err(TakeError::Unknown));
+        st.prune(D0 + LAUNCH_CLAIM_MS + 1);
+        assert!(st.mailbox.is_empty());
+        assert_eq!(norm_folder("/"), "/");
     }
 }
