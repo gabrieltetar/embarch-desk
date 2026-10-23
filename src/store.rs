@@ -711,7 +711,17 @@ impl State {
     /// File a note on an item: a captured memory file on the item itself,
     /// anything else on the day's tile as a line. Returns its id, or `None`
     /// for an empty one.
-    pub fn add_note(&mut self, item_id: &str, date: &str, mut note: Line) -> Option<String> {
+    pub fn add_note(&mut self, item_id: &str, date: &str, note: Line) -> Option<String> {
+        let ms = note.ms;
+        let id = self.file_note(item_id, date, note)?;
+        if let Some(item) = self.items.get_mut(item_id) {
+            item.last_activity_ms = item.last_activity_ms.max(ms);
+        }
+        Some(id)
+    }
+
+    /// [`State::add_note`] without counting the note as activity on the item.
+    fn file_note(&mut self, item_id: &str, date: &str, mut note: Line) -> Option<String> {
         note.text = note.text.trim().to_string();
         if note.text.is_empty() {
             return None;
@@ -719,14 +729,11 @@ impl State {
         if note.id.is_empty() {
             note.id = self.new_id("n");
         }
-        let (id, ms) = (note.id.clone(), note.ms);
+        let id = note.id.clone();
         if note.is_memory() {
             self.add_memory(item_id, note);
         } else {
             self.tile_mut(item_id, date).lines.push(note);
-        }
-        if let Some(item) = self.items.get_mut(item_id) {
-            item.last_activity_ms = item.last_activity_ms.max(ms);
         }
         Some(id)
     }
@@ -755,15 +762,18 @@ impl State {
     /// Every note on an item, newest first: its tiles' lines, its memory
     /// files' versions and the lines of its archived tiles.
     pub fn item_notes(&self, item_id: &str) -> Vec<&Line> {
-        let mut out: Vec<&Line> = self
-            .tiles
-            .values()
-            .filter(|t| t.item_id == item_id)
-            .flat_map(|t| t.lines.iter())
-            .chain(self.notes.get(item_id).into_iter().flatten())
-            .collect();
+        let mut out: Vec<&Line> = self.notes_of(item_id).collect();
         out.sort_by_key(|l| std::cmp::Reverse(l.ms));
         out
+    }
+
+    fn notes_of<'a>(&'a self, item_id: &str) -> impl Iterator<Item = &'a Line> + 'a {
+        let id = item_id.to_string();
+        self.tiles
+            .values()
+            .filter(move |t| t.item_id == id)
+            .flat_map(|t| t.lines.iter())
+            .chain(self.notes.get(item_id).into_iter().flatten())
     }
 
     /// Each memory file's newest version on an item, newest first.
@@ -780,21 +790,19 @@ impl State {
     }
 
     /// A day's notes on an item, every kind, oldest first: what the Harvest
-    /// note summarises (proposal 43). A memory file written several times
-    /// that day is one note, as it stood last.
+    /// note summarises (proposal 43). The day's tile's lines are its own
+    /// whenever they were added — tiles stay open, so a line added to
+    /// yesterday's this morning is yesterday's; the notes kept on the item
+    /// itself count on the day they were taken. A memory file written
+    /// several times that day is one note, as it stood last.
     pub fn day_notes(&self, item_id: &str, date: &str, days: &dyn Days) -> Vec<Line> {
-        let mut seen: Vec<&Option<String>> = vec![];
-        let mut out: Vec<Line> = vec![];
-        for l in self.item_notes(item_id).into_iter().filter(|l| days.date(l.ms) == date) {
-            if l.is_memory() {
-                if seen.contains(&&l.source_path) {
-                    continue;
-                }
-                seen.push(&l.source_path);
-            }
-            out.push(l.clone());
-        }
-        out.reverse();
+        let mut kept: Vec<&Line> = self.notes.get(item_id).into_iter().flatten().filter(|l| days.date(l.ms) == date).collect();
+        kept.sort_by_key(|l| std::cmp::Reverse(l.ms));
+        let mut seen = std::collections::HashSet::new();
+        kept.retain(|l| !l.is_memory() || seen.insert(&l.source_path));
+        let tile = self.tiles.get(&format!("{item_id}@{date}")).into_iter().flat_map(|t| t.lines.iter());
+        let mut out: Vec<Line> = tile.chain(kept).cloned().collect();
+        out.sort_by_key(|l| l.ms);
         out
     }
 
@@ -825,8 +833,9 @@ impl State {
     /// Attach the memory files written before capture to the items whose
     /// issue key they hold (proposal 47): a key in the file's name names its
     /// item alone; else every item whose key its text holds. A file already
-    /// on an item is left alone, so a second run adds nothing. Returns the
-    /// notes added.
+    /// on an item is left alone, so a second run adds nothing. An attached
+    /// file is not activity on the item: last month's state file must not
+    /// bring a quiet card back to the Desk. Returns the notes added.
     pub fn import_memories(&mut self, files: &[MemoryFile]) -> usize {
         let mut added = 0;
         for f in files {
@@ -843,7 +852,7 @@ impl State {
                 if has {
                     continue;
                 }
-                if self.add_note(&item, "", Line::memory(f.mtime_ms, &f.path, &f.text)).is_some() {
+                if self.file_note(&item, "", Line::memory(f.mtime_ms, &f.path, &f.text)).is_some() {
                     added += 1;
                 }
             }
@@ -852,10 +861,15 @@ impl State {
         added
     }
 
-    /// Leave a request for the window whose folder is `folder`.
+    /// Leave a request for the window whose folder is `folder`. A start
+    /// replaces one for the same item and folder the window has not taken
+    /// yet: Start work pressed twice while the window opens is one chat.
     pub fn post_mail(&mut self, mut entry: MailboxEntry, now: i64) -> String {
         entry.id = self.new_id("m");
         entry.folder = norm_folder(&entry.folder);
+        if entry.kind == "start" {
+            self.mailbox.retain(|m| m.kind != "start" || m.taken_ms.is_some() || m.item_id != entry.item_id || m.folder != entry.folder);
+        }
         entry.created_ms = now;
         entry.expires_ms = now + LAUNCH_CLAIM_MS;
         entry.taken_ms = None;
@@ -1493,6 +1507,50 @@ mod tests {
         assert_eq!(st.notes[&a][0].kind, "memory");
         assert_eq!(st.notes[&a][0].ms, D0, "dated by the file, so no other day's notes change");
         assert_eq!(st.import_memories(&files), 0, "idempotent");
+    }
+
+    #[test]
+    fn a_line_added_to_yesterdays_tile_this_morning_is_yesterdays_note() {
+        let mut st = State::default();
+        let w = st.create_item("x", None, D0);
+        st.add_line(&w, "2026-10-22", "agent line", "agent", D0 + H);
+        // Tiles stay open until acted on: the next morning, the user adds a
+        // line to yesterday's tile.
+        st.add_line(&w, "2026-10-22", "user line, next morning", "user", D0 + DAY + 9 * H);
+        st.add_line(&w, "2026-10-23", "today's own line", "agent", D0 + DAY + 10 * H);
+        st.add_note(&w, "", Line::memory(D0 + DAY + 11 * H, "/m/a.md", "today's memory"));
+        let day = |d: &str| st.day_notes(&w, d, &UtcDays).into_iter().map(|l| l.text).collect::<Vec<_>>();
+        assert_eq!(day("2026-10-22"), ["agent line", "user line, next morning"]);
+        assert_eq!(day("2026-10-23"), ["today's own line", "today's memory"]);
+    }
+
+    #[test]
+    fn a_second_start_work_before_the_window_takes_the_first_is_one_start() {
+        let mut st = State::default();
+        let start = |item: &str, folder: &str| MailboxEntry {
+            id: String::new(), kind: "start".into(), item_id: Some(item.into()), session_id: None,
+            folder: folder.into(), prompt: Some("Read ABC-1".into()), created_ms: 0, expires_ms: 0, taken_ms: None,
+        };
+        st.post_mail(start("w1", "/w/fw-abc-1"), D0);
+        let second = st.post_mail(start("w1", "/w/fw-abc-1/"), D0 + 1);
+        let other = st.post_mail(start("w2", "/w/fw-abc-1"), D0 + 2);
+        let ids: Vec<&str> = st.mail_for("/w/fw-abc-1", D0 + 3).iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, [second.as_str(), other.as_str()]);
+        // One already taken is the window's: a new start is a new chat.
+        st.take_mail(&second, D0 + 4).unwrap();
+        let third = st.post_mail(start("w1", "/w/fw-abc-1"), D0 + 5);
+        assert!(st.take_mail(&second, D0 + 6) == Err(TakeError::Taken));
+        assert_eq!(st.mail_for("/w/fw-abc-1", D0 + 6).len(), 2, "{third} and {other}");
+    }
+
+    #[test]
+    fn the_import_does_not_bring_a_quiet_card_back() {
+        let mut st = State::default();
+        let issue = IssueRef { key: "ABC-1".into(), ..Default::default() };
+        let w = st.create_item("quiet", Some(issue), D0 - 30 * DAY);
+        let files = [MemoryFile { path: "/m/abc-1.md".into(), mtime_ms: D0, text: "ABC-1: branch".into() }];
+        assert_eq!(st.import_memories(&files), 1);
+        assert_eq!(st.items[&w].last_activity_ms, D0 - 30 * DAY, "an old file is not this week's work");
     }
 
     #[test]

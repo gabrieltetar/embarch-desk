@@ -13,7 +13,7 @@
 //!   to a Claude Code memory file into the item's memory note.
 //!
 //! A session under an ignored path is dropped at the door: no time, no
-//! question, no context.
+//! question, no context. One the user untracked moves only its state.
 
 use crate::store::{self, BenchEvent, Days, Git, Line, Session, State};
 use serde::Deserialize;
@@ -184,7 +184,7 @@ pub fn apply(
         }
     }
     let sess = state.sessions.get_mut(&ev.session_id)?;
-    if sess.ignored {
+    if sess.ignored && store::is_ignored(&sess.cwd, &ignore) {
         return None;
     }
     // What the card's session row shows: the last reply, and whether it
@@ -217,13 +217,26 @@ pub fn apply(
         }
         _ => {}
     }
-    store::record_activity(sess, now, days);
     // A resumed session lives again: the panel closes an idle chat's process
-    // and resumes it on the next message (chat proposal decision 41).
-    sess.ended = ev.hook_event_name == "SessionEnd";
+    // and resumes it on the next message (chat proposal decision 41), and a
+    // resume arrives as SessionStart. Any other event after SessionEnd is a
+    // hook delivered late, and leaves it ended.
+    match ev.hook_event_name.as_str() {
+        "SessionEnd" => sess.ended = true,
+        "SessionStart" => sess.ended = false,
+        _ => {}
+    }
     if sess.ended {
         sess.busy = false;
     }
+    // One the user untracked still shows its state in the panel's thread
+    // list (chat proposal decisions 9, 20); it makes no time and is never
+    // asked.
+    if sess.ignored {
+        sess.last_ms = sess.last_ms.max(now);
+        return None;
+    }
+    store::record_activity(sess, now, days);
     let cwd = if ev.cwd.is_empty() { sess.cwd.clone() } else { ev.cwd.clone() };
 
     if sess.item_id.is_none() {
@@ -320,7 +333,12 @@ pub fn capture_memory(state: &mut State, session_id: &str, path: &str, text: &st
         Some(item) => {
             state.add_note(&item, &days.date(now), note);
         }
-        None => sess.held_lines.push(note),
+        // Held, only the file's newest state matters: it lands as one
+        // version.
+        None => {
+            sess.held_lines.retain(|l| !l.is_memory() || l.source_path != note.source_path);
+            sess.held_lines.push(note);
+        }
     }
 }
 
@@ -509,6 +527,55 @@ mod tests {
         apply(&mut st, &ev("SessionStart", "c", "/w/fw-abc-1"), D0 + 5, &UtcDays, &git, 7);
         assert!(!st.sessions["c"].ended, "the panel resumed it");
         assert_eq!(st.sessions["c"].client.as_deref(), Some("embarch-chat"));
+    }
+
+    #[test]
+    fn a_memory_file_held_for_a_session_with_no_item_keeps_only_its_newest_state() {
+        let file = "/h/.claude/projects/-w-r/memory/loader-state.md";
+        let other = "/h/.claude/projects/-w-r/memory/bring-up.md";
+        let mut st = State::default();
+        apply(&mut st, &ev("SessionStart", "s", "/w/r"), D0, &UtcDays, &FakeGit::default(), 7);
+        for i in 0..50 {
+            capture_memory(&mut st, "s", file, &format!("state {i}"), D0 + i, &UtcDays);
+        }
+        capture_memory(&mut st, "s", other, "bring-up", D0 + 60, &UtcDays);
+        let held: Vec<&str> = st.sessions["s"].held_lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(held, ["state 49", "bring-up"]);
+    }
+
+    #[test]
+    fn a_hook_delivered_after_session_end_leaves_the_session_ended() {
+        let mut st = State::default();
+        let git = FakeGit::default();
+        apply(&mut st, &ev("SessionStart", "s", "/w/r"), D0, &UtcDays, &git, 7);
+        apply(&mut st, &ev("SessionEnd", "s", "/w/r"), D0 + 1, &UtcDays, &git, 7);
+        for late in ["Stop", "Notification", "PostToolUse", "UserPromptSubmit"] {
+            apply(&mut st, &ev(late, "s", "/w/r"), D0 + 2, &UtcDays, &git, 7);
+            assert!(st.sessions["s"].ended, "{late} after SessionEnd");
+        }
+        apply(&mut st, &ev("SessionStart", "s", "/w/r"), D0 + 3, &UtcDays, &git, 7);
+        assert!(!st.sessions["s"].ended, "a resume arrives as SessionStart");
+    }
+
+    #[test]
+    fn an_untracked_sessions_hooks_move_its_state_but_make_no_time() {
+        let mut st = State { ignore: vec!["/g/embarch".into()], ..Default::default() };
+        let git = FakeGit::default();
+        apply(&mut st, &ev("SessionStart", "u", "/w/r"), D0, &UtcDays, &git, 7);
+        st.untrack_session("u");
+        assert!(apply(&mut st, &ev("UserPromptSubmit", "u", "/w/r"), D0 + H, &UtcDays, &git, 7).is_none(), "never asked");
+        let s = &st.sessions["u"];
+        assert!(s.busy && s.last_ms == D0 + H && s.spans.is_empty());
+        let mut n = ev("Notification", "u", "/w/r");
+        n.notification_type = Some("permission_prompt".into());
+        apply(&mut st, &n, D0 + H + 1, &UtcDays, &git, 7);
+        assert_eq!(st.sessions["u"].waiting.as_deref(), Some("permission prompt"));
+        apply(&mut st, &ev("SessionEnd", "u", "/w/r"), D0 + H + 2, &UtcDays, &git, 7);
+        assert!(st.sessions["u"].ended && st.sessions["u"].spans.is_empty());
+        // The fleet's sessions still stop at the door.
+        apply(&mut st, &ev("SessionStart", "f", "/g/embarch/x"), D0, &UtcDays, &git, 7);
+        apply(&mut st, &ev("UserPromptSubmit", "f", "/g/embarch/x"), D0 + H, &UtcDays, &git, 7);
+        assert!(!st.sessions["f"].busy && st.sessions["f"].last_ms == D0);
     }
 
     #[test]

@@ -395,9 +395,17 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, days: &d
     })
 }
 
+/// Only a running timer moves on a read: anything else marked dirty here
+/// would rewrite the whole state file every time a window polls.
+fn tick_timer(app: &App, now: i64) {
+    if app.db.read(|st| st.timer.is_some()) {
+        app.db.write(|st| st.tick_timer(now, &LocalDays));
+    }
+}
+
 async fn view(Ax(app): Ax<Shared>) -> ApiResult {
     let now = now_ms();
-    app.db.write(|st| st.tick_timer(now, &LocalDays));
+    tick_timer(&app, now);
     let cache = app.cache.lock().expect("cache");
     Ok(Json(app.db.read(|st| view_json(st, &cache, now, app.window_days, &LocalDays))))
 }
@@ -408,9 +416,10 @@ async fn hook(Ax(app): Ax<Shared>, Json(ev): Json<HookEvent>) -> ApiResult {
     let now = now_ms();
     // A memory file's text is read here, after the write, so `events` stays
     // pure.
-    let memory = crate::memory::claude_dir()
-        .and_then(|d| events::memory_write(&ev, &d))
-        .and_then(|p| crate::memory::read_text(std::path::Path::new(&p)).map(|t| (p, t)));
+    let memory = crate::memory::claude_dir().and_then(|d| {
+        let p = events::memory_write(&ev, &d)?;
+        crate::memory::read_text(std::path::Path::new(&p), &d).map(|t| (p, t))
+    });
     let ctx = app.db.write(|st| {
         let ctx = events::apply(st, &ev, now, &LocalDays, &RealGit, app.window_days);
         if let Some((path, text)) = &memory {
@@ -816,7 +825,13 @@ pub fn polish_prompt(item_label: &str, date: &str, hours: f64, lines: &[store::L
     if lines.is_empty() {
         p.push_str("- (no notes were recorded; write from the work item alone)\n");
     }
-    for l in lines.iter().take(60) {
+    // The newest 60: a busy day's end — its handoff, its to-dos — is what
+    // must not fall off.
+    let skip = lines.len().saturating_sub(60);
+    if skip > 0 {
+        p.push_str(&format!("- ({skip} earlier notes left out)\n"));
+    }
+    for l in lines.iter().skip(skip) {
         match l.kind.as_str() {
             "done" => p.push_str(&format!("- [{}] {}\n", l.source, l.text)),
             "memory" => {
@@ -1787,40 +1802,33 @@ fn start_entry(item_id: &str, folder: &str, prompt: &str) -> MailboxEntry {
 struct NewMail {
     kind: String,
     #[serde(default)]
-    item_id: Option<String>,
-    #[serde(default)]
     session_id: Option<String>,
     folder: String,
-    #[serde(default)]
-    prompt: Option<String>,
 }
 
-/// Leave a request — start a chat on an item, or focus a session — for the
-/// window whose folder matches. It expires as a launch claim does.
+/// Leave a focus — bring up a session's thread — for the window whose folder
+/// matches. It expires as a launch claim does. A start is left by Start
+/// work alone, with the prompt the desk writes: a route taking a caller's
+/// prompt would let any page that reaches the desk run one in auto mode.
 async fn post_mailbox(Ax(app): Ax<Shared>, Json(b): Json<NewMail>) -> ApiResult {
     let folder = b.folder.trim();
     if !folder.starts_with('/') {
         return Err(bad("folder must be an absolute path"));
     }
-    let (item_id, session_id) = (clean(&b.item_id), clean(&b.session_id));
+    let session_id = clean(&b.session_id);
     match b.kind.as_str() {
-        "start" => {
-            let item = item_id.as_deref().ok_or_else(|| bad("a start needs item_id"))?;
-            if !app.db.read(|st| st.items.contains_key(item)) {
-                return Err(missing(format!("no work item {item}")));
-            }
-        }
         "focus" if session_id.is_none() => return Err(bad("a focus needs session_id")),
         "focus" => {}
-        k => return Err(bad(format!("unknown kind {k:?}; start or focus"))),
+        "start" => return Err(bad("a start is left by Start work (POST /items/{id}/start), not posted")),
+        k => return Err(bad(format!("unknown kind {k:?}; focus"))),
     }
     let entry = MailboxEntry {
         id: String::new(),
-        kind: b.kind.clone(),
-        item_id,
+        kind: "focus".into(),
+        item_id: None,
         session_id,
         folder: folder.to_string(),
-        prompt: clean(&b.prompt),
+        prompt: None,
         created_ms: 0,
         expires_ms: 0,
         taken_ms: None,
@@ -1915,13 +1923,15 @@ async fn item_notes(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
 
 /// Attach the memory files written before capture existed to the items
 /// whose issue key they hold — once, on the first start with notes
-/// (proposal 47).
+/// (proposal 47). It runs beside the server, never ahead of it: hooks wait
+/// on nothing.
 pub async fn import_memories(app: &App) {
     if app.db.read(|st| st.memory_imported) {
         return;
     }
     let Some(dir) = crate::memory::claude_dir() else { return };
-    let Ok(files) = tokio::task::spawn_blocking(move || crate::memory::scan(&dir)).await else { return };
+    let ignore = app.db.read(|st| st.ignore.clone());
+    let Ok(files) = tokio::task::spawn_blocking(move || crate::memory::scan(&dir, &ignore)).await else { return };
     let added = app.db.write(|st| st.import_memories(&files));
     tracing::info!("attached {added} memory notes from {} memory files", files.len());
 }
@@ -2141,10 +2151,10 @@ pub async fn sync_once(app: &App, force_issues: bool) {
         c.last_slack_ms = now;
     }
 
-    if let Some(agents) = live_agents().await {
+    if let Some((asked_ms, agents)) = live_agents("claude").await {
         let mut c = app.cache.lock().expect("cache");
         c.agents = agents;
-        c.agents_ms = now_ms();
+        c.agents_ms = asked_ms;
     }
     let today = LocalDays.date(now);
     let fetched = app.cache.lock().expect("cache").logged_fetched.get(&today).copied().unwrap_or(0);
@@ -2153,7 +2163,7 @@ pub async fn sync_once(app: &App, force_issues: bool) {
             tracing::warn!("reading Harvest for {today}: {e:#}");
         }
     }
-    app.db.write(|st| st.tick_timer(now, &LocalDays));
+    tick_timer(app, now);
     let archived = app.db.write(|st| st.prune(now));
     if let Err(e) = app.db.archive(&archived) {
         tracing::warn!("archiving tiles failed: {e:#}");
@@ -2161,23 +2171,26 @@ pub async fn sync_once(app: &App, force_issues: bool) {
 }
 
 /// Every live Claude Code session — interactive and background — as
-/// `claude agents --json` reports it, by session id. `None` when the CLI is
-/// missing or answers nothing usable; the cards then fall back to the hooks.
-async fn live_agents() -> Option<HashMap<String, Value>> {
+/// `claude agents --json` reports it, by session id, with when it was asked:
+/// what it reports is as of then, not of when it answers, so a hook landing
+/// while it runs stays newer. `None` when the CLI is missing or answers
+/// nothing usable; the cards then fall back to the hooks.
+async fn live_agents(program: &str) -> Option<(i64, HashMap<String, Value>)> {
+    let asked_ms = now_ms();
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        tokio::process::Command::new("claude").args(["agents", "--json"]).env("EMBARCH_DESK_INTERNAL", "1").output(),
+        tokio::process::Command::new(program).args(["agents", "--json"]).env("EMBARCH_DESK_INTERNAL", "1").output(),
     )
     .await
     .ok()?
     .ok()?;
     let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-    Some(
-        v.as_array()?
-            .iter()
-            .filter_map(|a| a["sessionId"].as_str().map(|id| (id.to_string(), a.clone())))
-            .collect(),
-    )
+    let agents = v
+        .as_array()?
+        .iter()
+        .filter_map(|a| a["sessionId"].as_str().map(|id| (id.to_string(), a.clone())))
+        .collect();
+    Some((asked_ms, agents))
 }
 
 pub async fn sync_loop(app: Shared) {
@@ -2447,6 +2460,77 @@ mod tests {
         let row = &v["cards"][0]["live_sessions"][0];
         assert_eq!((row["state"].as_str(), row["client"].as_str(), row["cwd"].as_str()), (Some("busy"), Some("embarch-chat"), Some("/w/repo")));
         assert_eq!(v["settings"]["chat_panel"], false);
+    }
+
+    fn scratch_app() -> (Shared, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("desk-app-{}", crate::paths::random_hex(4).unwrap()));
+        let app = Arc::new(App {
+            db: Db::open(dir.clone()).unwrap(),
+            token: "t".into(),
+            cache: Mutex::new(Cache::default()),
+            wsl_distro: None,
+            window_days: 7,
+            model: String::new(),
+        });
+        (app, dir)
+    }
+
+    #[tokio::test]
+    async fn the_mailbox_takes_a_focus_and_a_start_only_from_start_work() {
+        let (app, dir) = scratch_app();
+        let w = app.db.write(|st| st.create_item("x", None, D0));
+        let post = |b: Value| post_mailbox(Ax(app.clone()), Json(serde_json::from_value(b).unwrap()));
+        // A page that reaches the desk must not get a prompt run in auto mode.
+        let start = post(json!({"kind": "start", "item_id": w, "folder": "/w/fw-abc-1", "prompt": "run this"})).await;
+        assert!(start.is_err());
+        assert!(app.db.read(|st| st.mailbox.is_empty()));
+        let Ok(Json(v)) = post(json!({"kind": "focus", "session_id": "s", "folder": "/w/fw-abc-1", "prompt": "ignored"})).await else { panic!("a focus is taken") };
+        let m = app.db.read(|st| st.mailbox[0].clone());
+        assert_eq!((v["id"].as_str(), m.kind.as_str(), m.session_id.as_deref(), m.prompt), (Some(m.id.as_str()), "focus", Some("s"), None));
+        assert!(post(json!({"kind": "focus", "folder": "/w/fw-abc-1"})).await.is_err(), "a focus needs its session");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn reading_the_view_rewrites_the_state_only_while_a_timer_runs() {
+        let (app, dir) = scratch_app();
+        let w = app.db.write(|st| st.create_item("x", None, D0));
+        app.db.flush().unwrap();
+        std::fs::remove_file(dir.join("state.json")).unwrap();
+        assert!(view(Ax(app.clone())).await.is_ok());
+        app.db.flush().unwrap();
+        assert!(!dir.join("state.json").exists(), "a poll with nothing running changes nothing");
+        app.db.write(|st| st.start_timer(&w, now_ms(), &LocalDays));
+        app.db.flush().unwrap();
+        std::fs::remove_file(dir.join("state.json")).unwrap();
+        assert!(view(Ax(app.clone())).await.is_ok());
+        app.db.flush().unwrap();
+        assert!(dir.join("state.json").exists(), "a running timer ticks on a read");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn claude_agents_is_dated_by_when_it_was_asked_not_when_it_answered() {
+        let dir = std::env::temp_dir().join(format!("desk-agents-{}", crate::paths::random_hex(4).unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cli = dir.join("claude");
+        std::fs::write(&cli, "#!/bin/sh\nsleep 0.4\necho '[{\"sessionId\": \"s\", \"status\": \"waiting\"}]'\n").unwrap();
+        std::fs::set_permissions(&cli, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let before = now_ms();
+        let (asked_ms, agents) = live_agents(cli.to_str().unwrap()).await.unwrap();
+        assert!(now_ms() - before >= 400);
+        // A hook that lands while the CLI runs is newer than its answer.
+        assert!(asked_ms - before < 200, "{}", asked_ms - before);
+        assert_eq!(agents["s"]["status"], "waiting");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_polish_keeps_the_days_newest_notes_when_there_are_too_many() {
+        let lines: Vec<store::Line> = (0..70).map(|i| store::Line::new(i, &format!("note {i}"), "agent")).collect();
+        let p = polish_prompt("Loader", "2026-10-22", 3.0, &lines, &[], &[]);
+        assert!(p.contains("] note 69\n") && p.contains("] note 10\n"), "{p}");
+        assert!(!p.contains("] note 9\n") && p.contains("10 earlier notes left out"), "{p}");
     }
 
     #[test]
