@@ -19,6 +19,7 @@ mod service;
 mod slack;
 mod store;
 mod uri;
+mod worktree;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -191,7 +192,7 @@ async fn serve() -> Result<()> {
     let app = Arc::new(server::App {
         db: db::open_default()?,
         token: paths::desk_token()?,
-        cache: Mutex::new(server::Cache::default()),
+        cache: Mutex::new(server::Cache { wsl_distro: server::detect_wsl_distro(), ..Default::default() }),
         wsl_distro: server::detect_wsl_distro(),
         window_days: std::env::var("EMBARCH_DESK_WINDOW_DAYS").ok().and_then(|d| d.parse().ok()).unwrap_or(7),
         model: std::env::var("EMBARCH_DESK_MODEL").unwrap_or_else(|_| claude::DEFAULT_MODEL.into()),

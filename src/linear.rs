@@ -52,11 +52,12 @@ fn issue_from(acct: &Account, v: &Value, now: i64) -> Option<IssueRef> {
         team_id: v["team"]["id"].as_str().unwrap_or_default().to_string(),
         project_id: v["project"]["id"].as_str().unwrap_or_default().to_string(),
         project_name: v["project"]["name"].as_str().unwrap_or_default().to_string(),
+        branch_name: v["branchName"].as_str().unwrap_or_default().to_string(),
         refreshed_ms: now,
     })
 }
 
-const ISSUE_FIELDS: &str = "id identifier title url state { id name type } team { id key } project { id name }";
+const ISSUE_FIELDS: &str = "id identifier title url branchName state { id name type } team { id key } project { id name }";
 
 /// Find an issue by key (`ABC-123`) in whichever connected workspace has it.
 pub async fn find_issue(accounts: &[Account], key: &str, now: i64) -> Result<Option<IssueRef>> {
@@ -340,9 +341,39 @@ pub async fn create_issue(
     bail!("no connected Linear workspace has a team {team_key}")
 }
 
+/// The state Start work moves an issue to: the team's "In Progress", else
+/// its first started state — and only forward: an issue already started,
+/// done or canceled stays where it is.
+pub fn start_state(states: &[Value], current_type: &str) -> Option<String> {
+    if !matches!(current_type, "triage" | "backlog" | "unstarted" | "") {
+        return None;
+    }
+    let started: Vec<&Value> = states.iter().filter(|s| s["type"] == "started").collect();
+    started
+        .iter()
+        .find(|s| s["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case("in progress")))
+        .or_else(|| started.first())
+        .and_then(|s| s["id"].as_str().map(str::to_string))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_work_moves_an_issue_forward_to_in_progress_only() {
+        let states = vec![
+            json!({"id": "a", "name": "Todo", "type": "unstarted"}),
+            json!({"id": "b", "name": "Investigating", "type": "started"}),
+            json!({"id": "c", "name": "In Progress", "type": "started"}),
+            json!({"id": "d", "name": "Done", "type": "completed"}),
+        ];
+        assert_eq!(start_state(&states, "unstarted").as_deref(), Some("c"));
+        assert_eq!(start_state(&states, "backlog").as_deref(), Some("c"));
+        assert_eq!(start_state(&states, "started"), None);
+        assert_eq!(start_state(&states, "completed"), None);
+        assert_eq!(start_state(&states[..2], "unstarted").as_deref(), Some("b"));
+    }
 
     #[test]
     fn an_issue_reads_out_of_the_graphql_shape() {

@@ -165,6 +165,9 @@ pub struct IssueRef {
     pub project_id: String,
     #[serde(default)]
     pub project_name: String,
+    /// Linear's git branch name for the issue, which Start work checks out.
+    #[serde(default)]
+    pub branch_name: String,
     pub refreshed_ms: i64,
 }
 
@@ -213,6 +216,15 @@ pub struct Session {
     pub held_bench: Vec<BenchEvent>,
     #[serde(default)]
     pub ended: bool,
+    /// What Claude last said (the Stop hook's `last_assistant_message`).
+    #[serde(default)]
+    pub last_reply: Option<String>,
+    #[serde(default)]
+    pub last_reply_ms: i64,
+    /// Set by a Notification hook (a permission prompt, an idle prompt),
+    /// cleared by the next prompt or tool call.
+    #[serde(default)]
+    pub waiting: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -697,6 +709,9 @@ impl State {
             held_lines: vec![],
             held_bench: vec![],
             ended: false,
+            last_reply: None,
+            last_reply_ms: 0,
+            waiting: None,
         };
         record_activity(&mut sess, now, days);
         self.sessions.insert(sid.clone(), sess);
@@ -864,6 +879,9 @@ pub mod testing {
             held_lines: vec![],
             held_bench: vec![],
             ended: false,
+            last_reply: None,
+            last_reply_ms: 0,
+            waiting: None,
         }
     }
 }

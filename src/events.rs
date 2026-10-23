@@ -30,6 +30,14 @@ pub struct HookEvent {
     pub tool_input: Option<Value>,
     #[serde(default)]
     pub tool_response: Option<Value>,
+    /// Stop: the text of Claude's final response.
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
+    /// Notification: `permission_prompt`, `idle_prompt`, …
+    #[serde(default)]
+    pub notification_type: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// The `embarch-api` tools that count as bench activity. Anything else it
@@ -169,9 +177,34 @@ pub fn apply(
         held_lines: vec![],
         held_bench: vec![],
         ended: false,
+        last_reply: None,
+        last_reply_ms: 0,
+        waiting: None,
     });
     if sess.ignored {
         return None;
+    }
+    // What the card's session row shows: the last reply, and whether it
+    // waits on the user.
+    match ev.hook_event_name.as_str() {
+        "Stop" => {
+            if let Some(m) = ev.last_assistant_message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                sess.last_reply = Some(m.chars().take(800).collect());
+                sess.last_reply_ms = now;
+            }
+            sess.waiting = None;
+        }
+        "Notification" => {
+            sess.waiting = Some(match (ev.notification_type.as_deref(), ev.message.as_deref()) {
+                (Some("permission_prompt"), _) => "permission prompt".to_string(),
+                (Some("idle_prompt"), _) => "your reply".to_string(),
+                (_, Some(m)) if !m.is_empty() => m.chars().take(120).collect(),
+                (Some(t), _) => t.replace('_', " "),
+                _ => "you".to_string(),
+            });
+        }
+        "UserPromptSubmit" | "PostToolUse" => sess.waiting = None,
+        _ => {}
     }
     store::record_activity(sess, now, days);
     if ev.hook_event_name == "SessionEnd" {
@@ -268,7 +301,26 @@ mod tests {
             tool_name: None,
             tool_input: None,
             tool_response: None,
+            last_assistant_message: None,
+            notification_type: None,
+            message: None,
         }
+    }
+
+    #[test]
+    fn the_last_reply_and_waiting_state_follow_the_hooks() {
+        let mut st = State::default();
+        let git = FakeGit::default();
+        apply(&mut st, &ev("SessionStart", "s", "/w/r"), D0, &UtcDays, &git, 7);
+        let mut n = ev("Notification", "s", "/w/r");
+        n.notification_type = Some("permission_prompt".into());
+        apply(&mut st, &n, D0 + 1, &UtcDays, &git, 7);
+        assert_eq!(st.sessions["s"].waiting.as_deref(), Some("permission prompt"));
+        let mut stop = ev("Stop", "s", "/w/r");
+        stop.last_assistant_message = Some("Summary: the loader needs 432 KB.".into());
+        apply(&mut st, &stop, D0 + 2, &UtcDays, &git, 7);
+        assert_eq!(st.sessions["s"].waiting, None);
+        assert_eq!(st.sessions["s"].last_reply.as_deref(), Some("Summary: the loader needs 432 KB."));
     }
 
     #[test]

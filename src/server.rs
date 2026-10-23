@@ -45,6 +45,9 @@ pub struct Cache {
     pub last_status_ms: i64,
     pub last_slack_ms: i64,
     pub logged_fetched: HashMap<String, i64>,
+    /// `claude agents --json`, by session id: live state of every session.
+    pub agents: HashMap<String, Value>,
+    pub wsl_distro: Option<String>,
 }
 
 pub fn now_ms() -> i64 {
@@ -119,6 +122,8 @@ pub fn router(app: Shared) -> Router {
         .route("/linear/projects", get(linear_projects))
         .route("/github/repos", get(github_repos))
         .route("/harvest/entry/{account}/{id}", axum::routing::patch(edit_entry).delete(remove_entry))
+        .route("/pickup", get(pickup))
+        .route("/items/{id}/start", post(start_work))
         .route("/sync", post(sync_now))
         .route_layer(axum::middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
@@ -185,6 +190,42 @@ fn open_tile_keys(st: &State) -> Vec<(String, String)> {
         .collect()
 }
 
+/// A card's live sessions (`embarch-desk-sessions-proposal.md` 6–8): the
+/// state `claude agents --json` reports, the last reply and what it waits
+/// for from the hooks, an Answer link on claude.ai (Remote Control) and a
+/// Jump into VS Code.
+fn session_rows(cache: &Cache, sessions: &[&store::Session], now: i64) -> Vec<Value> {
+    let mut rows: Vec<(i64, Value)> = sessions
+        .iter()
+        .filter(|s| cache.agents.contains_key(&s.id) || (!s.ended && now - s.last_ms < 30 * 60_000))
+        .map(|s| {
+            let a = cache.agents.get(&s.id);
+            let status = a.and_then(|a| a["status"].as_str()).unwrap_or(if s.ended { "ended" } else { "unknown" });
+            let waiting = a.and_then(|a| a["waitingFor"].as_str()).map(str::to_string).or_else(|| s.waiting.clone());
+            let name = a.and_then(|a| a["name"].as_str()).map(str::to_string).unwrap_or_else(|| {
+                std::path::Path::new(&s.cwd).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "session".into())
+            });
+            (
+                s.last_ms,
+                json!({
+                    "session_id": s.id,
+                    "name": name,
+                    "status": status,
+                    "waiting_for": waiting,
+                    "last_reply": s.last_reply,
+                    "last_reply_ms": s.last_reply_ms,
+                    "cwd": s.cwd,
+                    "answer_url": format!("https://claude.ai/code/{}", s.id),
+                    "folder_uri": (!s.cwd.is_empty()).then(|| uri::folder_uri(&s.cwd, cache.wsl_distro.as_deref())),
+                    "session_uri": format!("vscode://anthropic.claude-code/open?session={}", uri::encode(&s.id)),
+                }),
+            )
+        })
+        .collect();
+    rows.sort_by_key(|(ms, _)| std::cmp::Reverse(*ms));
+    rows.into_iter().map(|(_, v)| v).collect()
+}
+
 pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, days: &dyn Days) -> Value {
     let today = days.date(now);
     let open = open_tile_keys(st);
@@ -241,6 +282,7 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, days: &d
                 "last_activity_ms": item.last_activity_ms,
                 "sessions": { "live": live, "today": today_sessions, "total": sessions.len() },
                 "logged_today": (st.logged_hours(&item.id, &today) * 100.0).round() / 100.0,
+                "live_sessions": session_rows(cache, &sessions, now),
                 "bench": bench.iter().map(|(t, (n, f))| json!({ "tool": t, "count": n, "failed": f })).collect::<Vec<_>>(),
                 "tiles": tiles,
             })
@@ -531,6 +573,9 @@ async fn assign_session(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): J
             held_lines: vec![],
             held_bench: vec![],
             ended: false,
+            last_reply: None,
+            last_reply_ms: 0,
+            waiting: None,
         });
     });
     if b.untracked {
@@ -1494,6 +1539,113 @@ async fn day(Ax(app): Ax<Shared>, Path(date): Path<String>) -> ApiResult {
     Ok(Json(app.db.read(|st| day_json(st, &date, now))))
 }
 
+// ---------------------------------------------------------------- picking up an issue
+//
+// embarch-desk-sessions-proposal.md: the open desk's issues with no card
+// yet, and Start work — the issue to In Progress, a worktree beside the main
+// clone on Linear's branch, auto mode, the launch claim, and the VS Code
+// links with the read-and-summarize prompt pre-filled. The owner presses
+// Enter: nothing documented submits a VS Code chat from outside.
+
+async fn pickup(Ax(app): Ax<Shared>) -> ApiResult {
+    let scope = open_linear(&app);
+    let issues = linear::my_issues(&linear_accounts()?, scope.as_ref()).await?;
+    let carded: std::collections::HashSet<String> = app.db.read(|st| {
+        st.items
+            .values()
+            .filter(|i| !i.archived)
+            .filter_map(|i| i.issue.as_ref().map(|r| r.key.to_ascii_uppercase()))
+            .collect()
+    });
+    let open: Vec<Value> = issues
+        .into_iter()
+        .filter(|i| i["key"].as_str().is_some_and(|k| !carded.contains(&k.to_ascii_uppercase())))
+        .collect();
+    Ok(Json(json!({ "scope": scope.map(|b| if b.project_name.is_empty() { format!("team {}", b.team_key) } else { b.project_name }), "issues": open })))
+}
+
+pub fn start_prompt(issue: &store::IssueRef, item_id: &str, branch: &str) -> String {
+    format!(
+        "Read {} — {} ({}) with the desk's linear_get_issue tool: the description and every comment, and \
+         its PR if one is linked. Summarize what is asked, what is already done and what is still open, \
+         then wait for my first instruction. (EmbArch desk work item {item_id}; this worktree is on {branch}.)",
+        issue.key, issue.title, issue.url
+    )
+}
+
+/// The clone a worktree comes from: the card's own repo when it is a main
+/// clone (a worktree's `.git` is a file, a clone's a directory), else the
+/// desk's first firmware repo.
+fn main_clone(st: &State, item: &store::WorkItem) -> Option<String> {
+    item.repo_path
+        .clone()
+        .filter(|p| std::path::Path::new(p).join(".git").is_dir())
+        .or_else(|| item.desk_id.as_ref().and_then(|k| st.desks.get(k)).and_then(|d| d.firmware_repos.first().cloned()))
+}
+
+async fn start_work(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
+    let now = now_ms();
+    let (issue, main) = app
+        .db
+        .read(|st| st.items.get(&id).map(|i| (i.issue.clone(), main_clone(st, i))))
+        .ok_or_else(|| missing("no such work item"))?;
+    let issue = issue.ok_or_else(|| bad("Start work needs a Linear issue on the card"))?;
+    let main = main.ok_or_else(|| ApiError(StatusCode::CONFLICT, "no repo to start from: pick the card's repo, or give its desk a firmware repo".into()))?;
+    let accounts = linear_accounts()?;
+    // Fresh from Linear: its branch name and state may have changed.
+    let issue = linear::find_issue(&accounts, &issue.key, now).await?.unwrap_or(issue);
+    let branch = if issue.branch_name.is_empty() {
+        issue.key.to_ascii_lowercase()
+    } else {
+        issue.branch_name.clone()
+    };
+    let mut warnings: Vec<String> = vec![];
+    let mut moved_to = None;
+    match linear::states(&accounts, &issue).await {
+        Ok(states) => {
+            if let Some(sid) = linear::start_state(&states, &issue.state_type) {
+                match linear::set_state(&accounts, &issue, &sid, now).await {
+                    Ok(updated) => {
+                        moved_to = Some(updated.state_name.clone());
+                        app.db.write(|st| st.items.get_mut(&id).map(|i| i.issue = Some(updated)));
+                    }
+                    Err(e) => warnings.push(format!("could not move the issue: {e:#}")),
+                }
+            }
+        }
+        Err(e) => warnings.push(format!("could not read the team's states: {e:#}")),
+    }
+    let key = issue.key.clone();
+    let br = branch.clone();
+    let main_path = std::path::PathBuf::from(&main);
+    let prepared = tokio::task::spawn_blocking(move || {
+        let p = crate::worktree::prepare(&main_path, &key, &br)?;
+        crate::worktree::set_auto_mode(&p.path)?;
+        Ok::<_, anyhow::Error>(p)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    warnings.extend(prepared.warnings.iter().cloned());
+    let wt = prepared.path.display().to_string();
+    app.db.write(|st| {
+        if let Some(i) = st.items.get_mut(&id) {
+            i.repo_path = Some(wt.clone());
+            i.last_activity_ms = now;
+        }
+        st.pending_launches.retain(|p| p.item_id != id);
+        st.pending_launches.push(PendingLaunch { item_id: id.clone(), repo: wt.clone(), expires_ms: now + store::LAUNCH_CLAIM_MS });
+    });
+    Ok(Json(json!({
+        "worktree": wt,
+        "branch": prepared.branch,
+        "how": prepared.how,
+        "moved_to": moved_to,
+        "warnings": warnings,
+        "folder_uri": uri::folder_uri(&wt, app.wsl_distro.as_deref()),
+        "claude_uri": uri::claude_uri(&start_prompt(&issue, &id, &branch)),
+    })))
+}
+
 // ---------------------------------------------------------------- what Harvest already holds
 //
 // The day list merges the entries Harvest already has — logged by hand, by
@@ -1709,6 +1861,9 @@ pub async fn sync_once(app: &App, force_issues: bool) {
         c.last_slack_ms = now;
     }
 
+    if let Some(agents) = live_agents().await {
+        app.cache.lock().expect("cache").agents = agents;
+    }
     let today = LocalDays.date(now);
     let fetched = app.cache.lock().expect("cache").logged_fetched.get(&today).copied().unwrap_or(0);
     if force_issues || now - fetched > 2 * 60_000 {
@@ -1721,6 +1876,26 @@ pub async fn sync_once(app: &App, force_issues: bool) {
     if let Err(e) = app.db.archive(&archived) {
         tracing::warn!("archiving tiles failed: {e:#}");
     }
+}
+
+/// Every live Claude Code session — interactive and background — as
+/// `claude agents --json` reports it, by session id. `None` when the CLI is
+/// missing or answers nothing usable; the cards then fall back to the hooks.
+async fn live_agents() -> Option<HashMap<String, Value>> {
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::process::Command::new("claude").args(["agents", "--json"]).env("EMBARCH_DESK_INTERNAL", "1").output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    Some(
+        v.as_array()?
+            .iter()
+            .filter_map(|a| a["sessionId"].as_str().map(|id| (id.to_string(), a.clone())))
+            .collect(),
+    )
 }
 
 pub async fn sync_loop(app: Shared) {
@@ -1883,6 +2058,34 @@ mod tests {
         assert_eq!(item["harvest_entries"][0]["id"], 1);
         assert!(rows.iter().any(|r| r["title"] == "Weekly sync" && r["status"] == "harvest_only"));
         assert_eq!(d["total_hours"], 3.5, "1h unsent + 2.5h already in Harvest");
+    }
+
+    #[test]
+    fn a_cards_live_sessions_carry_state_last_reply_and_both_links() {
+        let mut st = State::default();
+        let w = st.create_item("x", None, D0);
+        let mut s1 = crate::store::testing::session("abc-123");
+        s1.item_id = Some(w.clone());
+        s1.cwd = "/w/fw-abc-1".into();
+        s1.last_reply = Some("Here is the summary.".into());
+        crate::store::record_activity(&mut s1, D0 + H, &UtcDays);
+        st.sessions.insert("abc-123".into(), s1);
+        let mut cache = Cache { wsl_distro: Some("Ubuntu".into()), ..Default::default() };
+        cache.agents.insert("abc-123".into(), json!({"sessionId": "abc-123", "status": "waiting", "waitingFor": "permission prompt", "name": "fw-abc-1"}));
+        let v = view_json(&st, &cache, D0 + 2 * H, 7, &UtcDays);
+        let row = &v["cards"][0]["live_sessions"][0];
+        assert_eq!((row["status"].as_str(), row["waiting_for"].as_str()), (Some("waiting"), Some("permission prompt")));
+        assert_eq!(row["answer_url"], "https://claude.ai/code/abc-123");
+        assert_eq!(row["session_uri"], "vscode://anthropic.claude-code/open?session=abc-123");
+        assert_eq!(row["folder_uri"], "vscode://vscode-remote/wsl+Ubuntu/w/fw-abc-1");
+        assert_eq!(row["last_reply"], "Here is the summary.");
+    }
+
+    #[test]
+    fn the_start_prompt_names_the_issue_the_tool_and_the_branch() {
+        let issue = store::IssueRef { key: "ABC-7".into(), title: "Loader".into(), url: "https://linear.app/x/issue/ABC-7".into(), ..Default::default() };
+        let p = start_prompt(&issue, "w9", "user/abc-7-loader");
+        assert!(p.contains("ABC-7") && p.contains("linear_get_issue") && p.contains("user/abc-7-loader") && p.contains("wait for my first instruction"));
     }
 
     #[test]
