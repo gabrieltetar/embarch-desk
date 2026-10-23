@@ -1,4 +1,4 @@
-//! GitHub: the PRs that carry a work item's issue key, with their CI state.
+//! GitHub: the PRs that carry a work item's issue key, and their state.
 //! Read-only in v1 (proposal decision 14).
 
 use crate::connectors::{http, Account};
@@ -42,32 +42,6 @@ pub fn names_key(title: &str, branch: &str, key: &str) -> bool {
     })
 }
 
-fn summarize_checks(runs: &Value, combined: &Value) -> String {
-    let mut any = false;
-    let mut pending = false;
-    for r in runs["check_runs"].as_array().into_iter().flatten() {
-        any = true;
-        match (r["status"].as_str(), r["conclusion"].as_str()) {
-            (Some("completed"), Some("success" | "neutral" | "skipped")) => {}
-            (Some("completed"), _) => return "failure".into(),
-            _ => pending = true,
-        }
-    }
-    match combined["state"].as_str() {
-        Some("failure" | "error") => return "failure".into(),
-        Some("pending") if combined["total_count"].as_u64().unwrap_or(0) > 0 => pending = true,
-        Some("success") => any = true,
-        _ => {}
-    }
-    if pending {
-        "pending".into()
-    } else if any {
-        "success".into()
-    } else {
-        "none".into()
-    }
-}
-
 /// The repos the user can see, most recently pushed first — the desk
 /// form's suggestions.
 pub async fn user_repos(accounts: &[Account]) -> Result<Vec<String>> {
@@ -107,18 +81,6 @@ pub async fn prs_for(accounts: &[Account], key: &str, repos: &[String]) -> Resul
                 continue;
             }
             let repo = pr["base"]["repo"]["full_name"].as_str().unwrap_or_default().to_string();
-            let sha = pr["head"]["sha"].as_str().unwrap_or_default();
-            let ci = if sha.is_empty() {
-                "none".to_string()
-            } else {
-                let runs = get(acct, &format!("{API}/repos/{repo}/commits/{sha}/check-runs?per_page=100"))
-                    .await
-                    .unwrap_or(Value::Null);
-                let combined = get(acct, &format!("{API}/repos/{repo}/commits/{sha}/status"))
-                    .await
-                    .unwrap_or(Value::Null);
-                summarize_checks(&runs, &combined)
-            };
             let state = if pr["merged"].as_bool() == Some(true) {
                 "merged"
             } else {
@@ -131,7 +93,6 @@ pub async fn prs_for(accounts: &[Account], key: &str, repos: &[String]) -> Resul
                 url: pr["html_url"].as_str().unwrap_or_default().to_string(),
                 state: state.to_string(),
                 draft: pr["draft"].as_bool().unwrap_or(false),
-                ci,
             });
         }
     }
@@ -142,7 +103,6 @@ pub async fn prs_for(accounts: &[Account], key: &str, repos: &[String]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn a_desks_repos_scope_the_pr_search() {
@@ -158,14 +118,4 @@ mod tests {
         assert!(!names_key("XABC-123", "", "ABC-123"));
     }
 
-    #[test]
-    fn ci_is_failure_if_anything_failed_and_pending_while_anything_runs() {
-        let ok = json!({"check_runs": [{"status": "completed", "conclusion": "success"}]});
-        let bad = json!({"check_runs": [{"status": "completed", "conclusion": "success"}, {"status": "completed", "conclusion": "failure"}]});
-        let running = json!({"check_runs": [{"status": "in_progress", "conclusion": null}]});
-        assert_eq!(summarize_checks(&ok, &Value::Null), "success");
-        assert_eq!(summarize_checks(&bad, &Value::Null), "failure");
-        assert_eq!(summarize_checks(&running, &Value::Null), "pending");
-        assert_eq!(summarize_checks(&Value::Null, &json!({"state": "pending", "total_count": 0})), "none");
-    }
 }

@@ -177,8 +177,6 @@ pub struct PrRef {
     /// `open`, `closed` or `merged`.
     pub state: String,
     pub draft: bool,
-    /// `success`, `failure`, `pending` or `none`.
-    pub ci: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
