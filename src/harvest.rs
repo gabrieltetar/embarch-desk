@@ -103,10 +103,10 @@ pub async fn targets(conns: &[Account]) -> Result<Vec<Target>> {
     Ok(out)
 }
 
-/// The user's own entries from the last `days` days, as `(account, project,
-/// task, notes)` — the examples a project guess is made from.
-pub async fn recent_entries(conns: &[Account], days: i64) -> Result<Vec<Value>> {
-    let from = (chrono::Local::now() - chrono::Duration::days(days)).date_naive();
+/// The user's own entries from `from` to `to` (YYYY-MM-DD, inclusive), as
+/// `(account, project, task, notes, date, hours)` — what an agent reads back,
+/// and the examples a project guess is made from.
+pub async fn entries_between(conns: &[Account], from: &str, to: &str) -> Result<Vec<Value>> {
     let mut out = vec![];
     for (c, a) in accounts(conns).await? {
         let me = get(&c.token, Some(a.account_id), &format!("{API}/users/me")).await?;
@@ -114,19 +114,25 @@ pub async fn recent_entries(conns: &[Account], days: i64) -> Result<Vec<Value>> 
         let v = get(
             &c.token,
             Some(a.account_id),
-            &format!("{API}/time_entries?user_id={uid}&from={from}&per_page=100"),
+            &format!("{API}/time_entries?user_id={uid}&from={from}&to={to}&per_page=100"),
         )
         .await?;
         for e in v["time_entries"].as_array().into_iter().flatten() {
             out.push(json!({
-                "account_id": a.account_id,
-                "project_id": e["project"]["id"], "project": e["project"]["name"],
+                "account_id": a.account_id, "account": a.name,
+                "project_id": e["project"]["id"], "project": e["project"]["name"], "client": e["client"]["name"],
                 "task_id": e["task"]["id"], "task": e["task"]["name"],
                 "notes": e["notes"], "date": e["spent_date"], "hours": e["hours"],
             }));
         }
     }
     Ok(out)
+}
+
+pub async fn recent_entries(conns: &[Account], days: i64) -> Result<Vec<Value>> {
+    let today = chrono::Local::now().date_naive();
+    let from = today - chrono::Duration::days(days);
+    entries_between(conns, &from.to_string(), &today.to_string()).await
 }
 
 pub async fn create_entry(

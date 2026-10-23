@@ -124,6 +124,150 @@ pub async fn set_state(accounts: &[Account], issue: &IssueRef, state_id: &str, n
     issue_from(acct, &d["issueUpdate"]["issue"], now).ok_or_else(|| anyhow!("Linear returned no issue"))
 }
 
+/// The account a key's team belongs to: the one that knows the issue.
+async fn account_for_key<'a>(accounts: &'a [Account], key: &str) -> Result<(&'a Account, Value)> {
+    let q = "query($id: String!) { issue(id: $id) { id identifier title url description priorityLabel \
+             createdAt updatedAt state { id name type } team { id key name } assignee { name } \
+             project { name } labels { nodes { name } } \
+             comments(first: 25) { nodes { body createdAt user { name } } } } }";
+    let mut last_err = None;
+    for acct in accounts {
+        match gql(acct, q, json!({ "id": key })).await {
+            Ok(d) if d["issue"].is_object() => return Ok((acct, d["issue"].clone())),
+            Ok(_) => {}
+            Err(e) if e.to_string().to_lowercase().contains("not found") => {}
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("no connected Linear workspace has {key}")))
+}
+
+/// An issue as an agent reads it: description, assignee, labels and the
+/// latest comments, oldest first.
+pub async fn read_issue(accounts: &[Account], key: &str) -> Result<Value> {
+    let (acct, i) = account_for_key(accounts, key).await?;
+    let comments: Vec<Value> = i["comments"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| json!({ "author": c["user"]["name"], "at": c["createdAt"], "body": c["body"] }))
+        .rev()
+        .collect();
+    Ok(json!({
+        "workspace": acct.label,
+        "key": i["identifier"], "title": i["title"], "url": i["url"],
+        "state": i["state"]["name"], "priority": i["priorityLabel"],
+        "team": i["team"]["key"], "project": i["project"]["name"], "assignee": i["assignee"]["name"],
+        "labels": i["labels"]["nodes"].as_array().map(|l| l.iter().map(|x| x["name"].clone()).collect::<Vec<_>>()),
+        "description": i["description"],
+        "comments": comments,
+        "updated": i["updatedAt"],
+    }))
+}
+
+fn issue_rows(acct: &Account, nodes: &Value) -> Vec<Value> {
+    nodes
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|n| {
+            json!({
+                "workspace": acct.label, "key": n["identifier"], "title": n["title"],
+                "state": n["state"]["name"], "url": n["url"], "updated": n["updatedAt"],
+            })
+        })
+        .collect()
+}
+
+/// Open issues assigned to the user, in every connected workspace.
+pub async fn my_issues(accounts: &[Account]) -> Result<Vec<Value>> {
+    let q = "{ viewer { assignedIssues(first: 50, orderBy: updatedAt, \
+             filter: { state: { type: { nin: [\"completed\", \"canceled\"] } } }) \
+             { nodes { identifier title url updatedAt state { name } } } } }";
+    let mut out = vec![];
+    for acct in accounts {
+        let d = gql(acct, q, json!({})).await?;
+        out.extend(issue_rows(acct, &d["viewer"]["assignedIssues"]["nodes"]));
+    }
+    Ok(out)
+}
+
+/// Issues whose title contains the words, or the one a key names.
+pub async fn search(accounts: &[Account], query: &str) -> Result<Vec<Value>> {
+    if let Some(key) = crate::store::issue_key_in(query).filter(|k| k.eq_ignore_ascii_case(query.trim())) {
+        return Ok(match read_issue(accounts, &key).await {
+            Ok(v) => vec![v],
+            Err(_) => vec![],
+        });
+    }
+    let q = "query($q: String!) { issues(first: 20, orderBy: updatedAt, \
+             filter: { title: { containsIgnoreCase: $q } }) \
+             { nodes { identifier title url updatedAt state { name } } } }";
+    let mut out = vec![];
+    for acct in accounts {
+        let d = gql(acct, q, json!({ "q": query.trim() })).await?;
+        out.extend(issue_rows(acct, &d["issues"]["nodes"]));
+    }
+    Ok(out)
+}
+
+/// A status move by the state's name, as an agent says it ("In Review").
+pub async fn set_state_by_name(accounts: &[Account], key: &str, name: &str, now: i64) -> Result<IssueRef> {
+    let issue = find_issue(accounts, key, now).await?.ok_or_else(|| anyhow!("no connected Linear workspace has {key}"))?;
+    let all = states(accounts, &issue).await?;
+    let want = name.trim().to_lowercase();
+    let st = all
+        .iter()
+        .find(|s| s["name"].as_str().is_some_and(|n| n.to_lowercase() == want))
+        .ok_or_else(|| {
+            let names: Vec<&str> = all.iter().filter_map(|s| s["name"].as_str()).collect();
+            anyhow!("{key}'s team has no state {name:?}; it has: {}", names.join(", "))
+        })?;
+    set_state(accounts, &issue, st["id"].as_str().unwrap_or_default(), now).await
+}
+
+/// Post an approved comment. Only the Desk tab's Send reaches this.
+pub async fn post_comment(accounts: &[Account], key: &str, body: &str) -> Result<String> {
+    let (acct, i) = account_for_key(accounts, key).await?;
+    let d = gql(
+        acct,
+        "mutation($id: String!, $b: String!) { commentCreate(input: { issueId: $id, body: $b }) { success comment { url } } }",
+        json!({ "id": i["id"], "b": body }),
+    )
+    .await?;
+    if d["commentCreate"]["success"].as_bool() != Some(true) {
+        bail!("Linear refused the comment");
+    }
+    Ok(d["commentCreate"]["comment"]["url"].as_str().unwrap_or_default().to_string())
+}
+
+/// Create an approved issue in the team with this key, in whichever
+/// workspace has that team.
+pub async fn create_issue(accounts: &[Account], team_key: &str, title: &str, description: &str) -> Result<(String, String)> {
+    for acct in accounts {
+        let d = gql(
+            acct,
+            "query($k: String!) { teams(filter: { key: { eqIgnoreCase: $k } }) { nodes { id key } } }",
+            json!({ "k": team_key }),
+        )
+        .await?;
+        let Some(team) = d["teams"]["nodes"].as_array().and_then(|n| n.first().cloned()) else { continue };
+        let d = gql(
+            acct,
+            "mutation($t: String!, $title: String!, $d: String) { issueCreate(input: { teamId: $t, title: $title, description: $d }) \
+             { success issue { identifier url } } }",
+            json!({ "t": team["id"], "title": title, "d": description }),
+        )
+        .await?;
+        if d["issueCreate"]["success"].as_bool() != Some(true) {
+            bail!("Linear refused the issue");
+        }
+        let i = &d["issueCreate"]["issue"];
+        return Ok((i["identifier"].as_str().unwrap_or_default().into(), i["url"].as_str().unwrap_or_default().into()));
+    }
+    bail!("no connected Linear workspace has a team {team_key}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

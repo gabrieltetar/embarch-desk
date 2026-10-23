@@ -41,6 +41,14 @@ pub struct State {
     /// repos go here, which is also what keeps the agent fleet out.
     #[serde(default)]
     pub ignore: Vec<String>,
+    /// What agents asked to write to Linear, waiting for the user's Send.
+    #[serde(default)]
+    pub drafts: BTreeMap<String, Draft>,
+    /// The one manual timer — work away from Claude Code (bench, calls,
+    /// meetings). It runs as a session of its own, so its time is spans like
+    /// any other and lands on the same tile.
+    #[serde(default)]
+    pub timer: Option<Timer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +189,39 @@ pub struct Tile {
     /// record stays true after its sessions are pruned.
     #[serde(default)]
     pub final_seconds: Option<i64>,
+}
+
+/// A write an agent proposed. Prose never leaves the desk unseen (decision
+/// 15): an agent's comment or new issue waits here until the user sends it,
+/// as edited, from the Desk tab.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Draft {
+    pub id: String,
+    /// `linear_comment` or `linear_issue`.
+    pub kind: String,
+    /// The issue a comment answers.
+    #[serde(default)]
+    pub issue_key: Option<String>,
+    /// The team a new issue goes to.
+    #[serde(default)]
+    pub team_key: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub body: String,
+    #[serde(default)]
+    pub item_id: Option<String>,
+    pub created_ms: i64,
+    /// `open`, `sent` or `discarded`.
+    pub status: String,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Timer {
+    pub session_id: String,
+    pub item_id: String,
+    pub started_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -462,6 +503,66 @@ impl State {
         true
     }
 
+    pub fn is_timer_session(id: &str) -> bool {
+        id.starts_with("timer-")
+    }
+
+    /// Start the manual timer on an item, stopping any running one first —
+    /// one timer at a time, the way Harvest's own works.
+    pub fn start_timer(&mut self, item_id: &str, now: i64, days: &dyn Days) -> bool {
+        if !self.items.contains_key(item_id) {
+            return false;
+        }
+        self.stop_timer(now, days);
+        let sid = self.new_id("timer-");
+        let mut sess = Session {
+            id: sid.clone(),
+            cwd: String::new(),
+            item_id: Some(item_id.to_string()),
+            ignored: false,
+            started_ms: now,
+            last_ms: now,
+            spans: vec![],
+            commits: vec![],
+            held_lines: vec![],
+            held_bench: vec![],
+            ended: false,
+        };
+        record_activity(&mut sess, now, days);
+        self.sessions.insert(sid.clone(), sess);
+        self.timer = Some(Timer { session_id: sid, item_id: item_id.to_string(), started_ms: now });
+        if let Some(i) = self.items.get_mut(item_id) {
+            i.last_activity_ms = now;
+        }
+        true
+    }
+
+    /// Bring a running timer's span up to `now`. A timer is never idle, so
+    /// the 8-hour gap rule must not end it: tick it as often as the view is read.
+    pub fn tick_timer(&mut self, now: i64, days: &dyn Days) {
+        let Some(t) = self.timer.clone() else { return };
+        if let Some(s) = self.sessions.get_mut(&t.session_id) {
+            let last = s.last_ms;
+            // Fill the gap in steps under the cap, so a long-running timer
+            // read rarely still counts in full.
+            let mut at = last;
+            while now - at > MAX_GAP_MS {
+                at += MAX_GAP_MS;
+                record_activity(s, at, days);
+            }
+            record_activity(s, now, days);
+        }
+    }
+
+    pub fn stop_timer(&mut self, now: i64, days: &dyn Days) -> Option<Timer> {
+        self.tick_timer(now, days);
+        let t = self.timer.take()?;
+        if let Some(s) = self.sessions.get_mut(&t.session_id) {
+            s.ended = true;
+        }
+        Some(t)
+    }
+
     pub fn untrack_session(&mut self, session_id: &str) -> bool {
         match self.sessions.get_mut(session_id) {
             Some(s) => {
@@ -705,6 +806,31 @@ mod tests {
         let archived = st.prune(D0 + 8 * DAY);
         assert_eq!(archived.len(), 1);
         assert!(st.tiles.is_empty());
+    }
+
+    #[test]
+    fn a_timer_counts_until_stopped_and_one_runs_at_a_time() {
+        let mut st = State::default();
+        let a = st.create_item("Bench rework", None, D0);
+        let b = st.create_item("Client call", None, D0);
+        assert!(st.start_timer(&a, D0 + 9 * H, &UtcDays));
+        st.tick_timer(D0 + 10 * H, &UtcDays);
+        assert_eq!(st.tile_seconds(&a, "2026-10-22"), 3600);
+        assert!(st.start_timer(&b, D0 + 11 * H, &UtcDays));
+        assert_eq!(st.tile_seconds(&a, "2026-10-22"), 2 * 3600, "starting b stopped a at 11:00");
+        st.stop_timer(D0 + 11 * H + 1_800_000, &UtcDays);
+        assert_eq!(st.tile_seconds(&b, "2026-10-22"), 1800);
+        assert!(st.timer.is_none());
+        assert!(!st.start_timer("nope", D0, &UtcDays));
+    }
+
+    #[test]
+    fn a_timer_left_running_past_the_gap_cap_still_counts_in_full() {
+        let mut st = State::default();
+        let a = st.create_item("Long bench day", None, D0);
+        st.start_timer(&a, D0 + H, &UtcDays);
+        st.stop_timer(D0 + 11 * H, &UtcDays);
+        assert_eq!(st.tile_seconds(&a, "2026-10-22"), 10 * 3600);
     }
 
     #[test]

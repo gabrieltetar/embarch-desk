@@ -100,6 +100,17 @@ pub fn router(app: Shared) -> Router {
         .route("/connectors", get(list_connectors).post(add_connector))
         .route("/connectors/{kind}/{label}", delete(remove_connector))
         .route("/ignore", get(get_ignore).put(put_ignore))
+        .route("/linear/issue/{key}", get(linear_issue))
+        .route("/linear/mine", get(linear_mine))
+        .route("/linear/search", post(linear_search))
+        .route("/linear/status", post(linear_status))
+        .route("/drafts", post(create_draft))
+        .route("/drafts/{id}", axum::routing::patch(patch_draft))
+        .route("/drafts/{id}/send", post(send_draft))
+        .route("/drafts/{id}/discard", post(discard_draft))
+        .route("/harvest/entries", post(harvest_entries))
+        .route("/timer/start", post(timer_start))
+        .route("/timer/stop", post(timer_stop))
         .route("/sync", post(sync_now))
         .route_layer(axum::middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
@@ -174,8 +185,11 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, days: &d
                 .map(|(i, d)| tile_json(st, i, d))
                 .collect();
             tiles.sort_by(|a, b| b["date"].as_str().cmp(&a["date"].as_str()));
-            let sessions: Vec<&store::Session> =
-                st.sessions.values().filter(|s| !s.ignored && s.item_id.as_deref() == Some(&item.id)).collect();
+            let sessions: Vec<&store::Session> = st
+                .sessions
+                .values()
+                .filter(|s| !s.ignored && !State::is_timer_session(&s.id) && s.item_id.as_deref() == Some(&item.id))
+                .collect();
             let live = sessions.iter().filter(|s| !s.ended && now - s.last_ms < 30 * 60_000).count();
             let today_sessions = sessions.iter().filter(|s| days.date(s.last_ms) == today).count();
             let mut bench: std::collections::BTreeMap<String, (u32, u32)> = Default::default();
@@ -204,7 +218,7 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, days: &d
     let waiting = st
         .sessions
         .values()
-        .filter(|s| !s.ignored && !s.ended && s.item_id.is_none() && now - s.last_ms < 30 * 60_000)
+        .filter(|s| !s.ignored && !s.ended && s.item_id.is_none() && !State::is_timer_session(&s.id) && now - s.last_ms < 30 * 60_000)
         .count();
     json!({
         "now_ms": now,
@@ -221,11 +235,19 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, days: &d
         },
         "connectors": cache.connectors,
         "ignore": st.ignore,
+        "drafts": st.drafts.values().filter(|d| d.status == "open").collect::<Vec<_>>(),
+        "timer": st.timer.as_ref().map(|t| json!({
+            "item_id": t.item_id,
+            "title": st.items.get(&t.item_id).map(|i| i.issue.as_ref().map(|r| format!("{} {}", r.key, r.title)).unwrap_or(i.title.clone())),
+            "started_ms": t.started_ms,
+            "seconds": (now - t.started_ms) / 1000,
+        })),
     })
 }
 
 async fn view(Ax(app): Ax<Shared>) -> ApiResult {
     let now = now_ms();
+    app.db.write(|st| st.tick_timer(now, &LocalDays));
     let cache = app.cache.lock().expect("cache");
     Ok(Json(app.db.read(|st| view_json(st, &cache, now, app.window_days, &LocalDays))))
 }
@@ -850,6 +872,254 @@ async fn put_ignore(Ax(app): Ax<Shared>, Json(b): Json<IgnoreBody>) -> ApiResult
     Ok(Json(json!({ "paths": paths })))
 }
 
+// ---------------------------------------------------------------- Linear and Harvest for agents
+//
+// The one access point (decisions 29-32): agents read Linear and Harvest
+// through these routes instead of the hosted MCP servers, on the desk's own
+// tokens, and write under the tab's rules — a status move goes through, prose
+// becomes a draft, time becomes a tile line and never an entry.
+
+fn linear_accounts() -> Result<Vec<crate::connectors::Account>, ApiError> {
+    let c = Connectors::load()?;
+    if c.linear.is_empty() {
+        return Err(bad("no Linear workspace is connected; add a Linear API key on the Desk tab"));
+    }
+    Ok(c.linear)
+}
+
+async fn linear_issue(Path(key): Path<String>) -> ApiResult {
+    Ok(Json(linear::read_issue(&linear_accounts()?, key.trim()).await?))
+}
+
+async fn linear_mine() -> ApiResult {
+    Ok(Json(json!({ "issues": linear::my_issues(&linear_accounts()?).await? })))
+}
+
+#[derive(Deserialize)]
+struct SearchBody {
+    query: String,
+}
+
+async fn linear_search(Json(b): Json<SearchBody>) -> ApiResult {
+    if b.query.trim().is_empty() {
+        return Err(bad("an empty search"));
+    }
+    Ok(Json(json!({ "issues": linear::search(&linear_accounts()?, &b.query).await? })))
+}
+
+#[derive(Deserialize)]
+struct StatusBody {
+    key: String,
+    status: String,
+}
+
+/// A status move by state name: straight through, like the card's dropdown.
+async fn linear_status(Ax(app): Ax<Shared>, Json(b): Json<StatusBody>) -> ApiResult {
+    let now = now_ms();
+    let updated = linear::set_state_by_name(&linear_accounts()?, b.key.trim(), &b.status, now).await?;
+    app.db.write(|st| {
+        if let Some(id) = st.item_by_key(&updated.key).map(|i| i.id.clone()) {
+            if let Some(i) = st.items.get_mut(&id) {
+                i.issue = Some(updated.clone());
+                i.last_activity_ms = now;
+            }
+        }
+    });
+    Ok(Json(json!({ "key": updated.key, "state": updated.state_name })))
+}
+
+#[derive(Deserialize)]
+struct NewDraft {
+    kind: String,
+    #[serde(default)]
+    issue_key: Option<String>,
+    #[serde(default)]
+    team_key: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    body: String,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+fn clean(s: &Option<String>) -> Option<String> {
+    s.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
+}
+
+/// An agent's proposed comment or issue. Nothing is sent: it waits on the
+/// Desk tab for the user's Send, as they leave it.
+async fn create_draft(Ax(app): Ax<Shared>, Json(b): Json<NewDraft>) -> ApiResult {
+    let now = now_ms();
+    let issue_key = clean(&b.issue_key).map(|k| k.to_ascii_uppercase());
+    let team_key = clean(&b.team_key).map(|k| k.to_ascii_uppercase());
+    let title = clean(&b.title);
+    match b.kind.as_str() {
+        "linear_comment" if issue_key.is_none() => return Err(bad("a comment draft needs issue_key")),
+        "linear_issue" if team_key.is_none() || title.is_none() => return Err(bad("an issue draft needs team_key and title")),
+        "linear_comment" | "linear_issue" => {}
+        k => return Err(bad(format!("unknown draft kind {k:?}; linear_comment or linear_issue"))),
+    }
+    if b.body.trim().is_empty() && b.kind == "linear_comment" {
+        return Err(bad("an empty comment"));
+    }
+    let id = app.db.write(|st| {
+        let item_id = issue_key
+            .as_deref()
+            .and_then(|k| st.item_by_key(k).map(|i| i.id.clone()))
+            .or_else(|| b.session_id.as_deref().and_then(|s| st.sessions.get(s)).and_then(|s| s.item_id.clone()));
+        let id = st.new_id("d");
+        st.drafts.insert(
+            id.clone(),
+            store::Draft {
+                id: id.clone(),
+                kind: b.kind.clone(),
+                issue_key,
+                team_key,
+                title,
+                body: b.body.trim().to_string(),
+                item_id,
+                created_ms: now,
+                status: "open".into(),
+                url: None,
+            },
+        );
+        id
+    });
+    Ok(Json(json!({ "draft_id": id, "status": "waiting for the user's Send on the Desk tab; nothing was posted" })))
+}
+
+#[derive(Deserialize)]
+struct DraftPatch {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+async fn patch_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<DraftPatch>) -> ApiResult {
+    app.db.write(|st| {
+        let d = st.drafts.get_mut(&id).filter(|d| d.status == "open").ok_or_else(|| missing("no open draft with that id"))?;
+        if let Some(t) = b.title {
+            d.title = Some(t);
+        }
+        if let Some(body) = b.body {
+            d.body = body;
+        }
+        Ok::<_, ApiError>(())
+    })?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// The user's Send. The text sent is the draft as it stands now — edited on
+/// the tab, or as the agent left it if the user left it alone.
+async fn send_draft(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
+    let d = app
+        .db
+        .read(|st| st.drafts.get(&id).filter(|d| d.status == "open").cloned())
+        .ok_or_else(|| missing("no open draft with that id"))?;
+    let accounts = linear_accounts()?;
+    let url = match d.kind.as_str() {
+        "linear_comment" => linear::post_comment(&accounts, d.issue_key.as_deref().unwrap_or_default(), &d.body).await?,
+        _ => {
+            let (key, url) = linear::create_issue(
+                &accounts,
+                d.team_key.as_deref().unwrap_or_default(),
+                d.title.as_deref().unwrap_or_default(),
+                &d.body,
+            )
+            .await?;
+            // A standalone card the agent was on gains the issue it filed.
+            if let Some(item) = d.item_id.clone() {
+                if let Ok(Some(issue)) = linear::find_issue(&accounts, &key, now_ms()).await {
+                    app.db.write(|st| {
+                        if let Some(i) = st.items.get_mut(&item).filter(|i| i.issue.is_none()) {
+                            i.title = issue.title.clone();
+                            i.issue = Some(issue);
+                        }
+                    });
+                }
+            }
+            url
+        }
+    };
+    app.db.write(|st| {
+        if let Some(x) = st.drafts.get_mut(&id) {
+            x.status = "sent".into();
+            x.url = Some(url.clone());
+        }
+    });
+    Ok(Json(json!({ "url": url })))
+}
+
+async fn discard_draft(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
+    app.db
+        .write(|st| st.drafts.get_mut(&id).filter(|d| d.status == "open").map(|d| d.status = "discarded".into()))
+        .ok_or_else(|| missing("no open draft with that id"))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct EntriesBody {
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+}
+
+/// Harvest, read-only for agents: entries already logged. Time goes in as
+/// tile lines and leaves on the user's ✓ (decision 10).
+async fn harvest_entries(Json(b): Json<EntriesBody>) -> ApiResult {
+    let conns = Connectors::load()?;
+    if conns.harvest.is_empty() {
+        return Err(bad("no Harvest account is connected"));
+    }
+    let today = chrono::Local::now().date_naive();
+    let monday = today - chrono::Duration::days(chrono::Datelike::weekday(&today).num_days_from_monday() as i64);
+    let from = b.from.unwrap_or_else(|| monday.to_string());
+    let to = b.to.unwrap_or_else(|| today.to_string());
+    for d in [&from, &to] {
+        if chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_err() {
+            return Err(bad(format!("{d} is not a YYYY-MM-DD date")));
+        }
+    }
+    let entries = harvest::entries_between(&conns.harvest, &from, &to).await?;
+    let total: f64 = entries.iter().filter_map(|e| e["hours"].as_f64()).sum();
+    Ok(Json(json!({ "from": from, "to": to, "total_hours": (total * 100.0).round() / 100.0, "entries": entries })))
+}
+
+#[derive(Deserialize)]
+struct TimerBody {
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
+    issue_key: Option<String>,
+    #[serde(default)]
+    new_title: Option<String>,
+}
+
+/// The manual timer, for work away from Claude Code — what harvest:track
+/// covered (decision 31).
+async fn timer_start(Ax(app): Ax<Shared>, Json(b): Json<TimerBody>) -> ApiResult {
+    let item_id = match clean(&b.item_id) {
+        Some(i) => i,
+        None => ensure_item(&app, b.new_title.as_deref(), b.issue_key.as_deref()).await?,
+    };
+    let now = now_ms();
+    if !app.db.write(|st| st.start_timer(&item_id, now, &LocalDays)) {
+        return Err(missing(format!("no work item {item_id}")));
+    }
+    let title = app.db.read(|st| st.items.get(&item_id).map(|i| i.title.clone()).unwrap_or_default());
+    Ok(Json(json!({ "item_id": item_id, "title": title, "started_ms": now })))
+}
+
+async fn timer_stop(Ax(app): Ax<Shared>) -> ApiResult {
+    let now = now_ms();
+    match app.db.write(|st| st.stop_timer(now, &LocalDays)) {
+        Some(t) => Ok(Json(json!({ "item_id": t.item_id, "minutes": (now - t.started_ms) / 60_000 }))),
+        None => Ok(Json(json!({ "stopped": false, "note": "no timer was running" }))),
+    }
+}
+
 // ---------------------------------------------------------------- sync
 
 async fn sync_now(Ax(app): Ax<Shared>) -> ApiResult {
@@ -936,6 +1206,7 @@ pub async fn sync_once(app: &App, force_issues: bool) {
         c.last_slack_ms = now;
     }
 
+    app.db.write(|st| st.tick_timer(now, &LocalDays));
     let archived = app.db.write(|st| st.prune(now));
     if let Err(e) = app.db.archive(&archived) {
         tracing::warn!("archiving tiles failed: {e:#}");
@@ -1010,6 +1281,25 @@ mod tests {
         t.final_seconds = Some(3600);
         let v = view_json(&st, &Cache::default(), D0 + H, 7, &UtcDays);
         assert_eq!(v["cards"][0]["tiles"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn open_drafts_and_a_running_timer_reach_the_view_and_sent_drafts_do_not() {
+        let mut st = State::default();
+        let a = st.create_item("Bench rework", None, D0);
+        for (id, status) in [("d1", "open"), ("d2", "sent")] {
+            st.drafts.insert(id.into(), store::Draft {
+                id: id.into(), kind: "linear_comment".into(), issue_key: Some("ABC-1".into()), team_key: None,
+                title: None, body: "x".into(), item_id: None, created_ms: D0, status: status.into(), url: None,
+            });
+        }
+        st.start_timer(&a, D0 + H, &UtcDays);
+        let v = view_json(&st, &Cache::default(), D0 + 2 * H, 7, &UtcDays);
+        assert_eq!(v["drafts"].as_array().unwrap().len(), 1);
+        assert_eq!(v["timer"]["item_id"], a.as_str());
+        assert_eq!(v["timer"]["seconds"], 3600);
+        assert_eq!(v["cards"][0]["sessions"]["total"], 0, "the timer is not counted as a Claude session");
+        assert_eq!(v["sessions_waiting"], 0);
     }
 
     #[test]
