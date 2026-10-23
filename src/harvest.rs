@@ -119,6 +119,7 @@ pub async fn entries_between(conns: &[Account], from: &str, to: &str) -> Result<
         .await?;
         for e in v["time_entries"].as_array().into_iter().flatten() {
             out.push(json!({
+                "id": e["id"], "is_running": e["is_running"],
                 "account_id": a.account_id, "account": a.name,
                 "project_id": e["project"]["id"], "project": e["project"]["name"], "client": e["client"]["name"],
                 "task_id": e["task"]["id"], "task": e["task"]["name"],
@@ -133,6 +134,56 @@ pub async fn recent_entries(conns: &[Account], days: i64) -> Result<Vec<Value>> 
     let today = chrono::Local::now().date_naive();
     let from = today - chrono::Duration::days(days);
     entries_between(conns, &from.to_string(), &today.to_string()).await
+}
+
+/// The connector token that reaches a Harvest account.
+async fn token_for(conns: &[Account], account_id: u64) -> Result<String> {
+    for (c, a) in accounts(conns).await? {
+        if a.account_id == account_id {
+            return Ok(c.token);
+        }
+    }
+    bail!("no connected Harvest account has id {account_id}")
+}
+
+/// Change an entry's hours and/or note — the user's edit from the day
+/// list, sent as they left it.
+pub async fn update_entry(conns: &[Account], account_id: u64, entry_id: u64, hours: Option<f64>, notes: Option<&str>) -> Result<()> {
+    let token = token_for(conns, account_id).await?;
+    let mut body = serde_json::Map::new();
+    if let Some(h) = hours {
+        body.insert("hours".into(), json!((h * 100.0).round() / 100.0));
+    }
+    if let Some(n) = notes {
+        body.insert("notes".into(), json!(n));
+    }
+    let resp = http()
+        .patch(format!("{API}/time_entries/{entry_id}"))
+        .bearer_auth(&token)
+        .header("Harvest-Account-Id", account_id.to_string())
+        .json(&Value::Object(body))
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("harvest refused the edit: HTTP {status}: {}", resp.text().await.unwrap_or_default());
+    }
+    Ok(())
+}
+
+pub async fn delete_entry(conns: &[Account], account_id: u64, entry_id: u64) -> Result<()> {
+    let token = token_for(conns, account_id).await?;
+    let resp = http()
+        .delete(format!("{API}/time_entries/{entry_id}"))
+        .bearer_auth(&token)
+        .header("Harvest-Account-Id", account_id.to_string())
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("harvest refused the delete: HTTP {status}: {}", resp.text().await.unwrap_or_default());
+    }
+    Ok(())
 }
 
 pub async fn create_entry(

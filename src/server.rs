@@ -44,6 +44,7 @@ pub struct Cache {
     pub pr_checked: HashMap<String, i64>,
     pub last_status_ms: i64,
     pub last_slack_ms: i64,
+    pub logged_fetched: HashMap<String, i64>,
 }
 
 pub fn now_ms() -> i64 {
@@ -117,6 +118,7 @@ pub fn router(app: Shared) -> Router {
         .route("/day/{date}", get(day))
         .route("/linear/projects", get(linear_projects))
         .route("/github/repos", get(github_repos))
+        .route("/harvest/entry/{account}/{id}", axum::routing::patch(edit_entry).delete(remove_entry))
         .route("/sync", post(sync_now))
         .route_layer(axum::middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
@@ -155,13 +157,19 @@ fn tile_json(st: &State, item_id: &str, date: &str) -> Value {
     let id = format!("{item_id}@{date}");
     let seconds = st.tile_seconds(item_id, date);
     let t = st.tiles.get(&id);
-    let computed = (seconds as f64 / 3600.0 * 100.0).round() / 100.0;
+    let captured = seconds as f64 / 3600.0;
+    let logged = st.logged_hours(item_id, date);
+    // The tile proposes only what Harvest doesn't already hold for this item
+    // that day (decision 41).
+    let computed = ((captured - logged).max(0.0) * 100.0).round() / 100.0;
     json!({
         "id": id,
         "date": date,
         "seconds": seconds,
         "hours": t.and_then(|t| t.hours_override).unwrap_or(computed),
         "computed_hours": computed,
+        "captured_hours": (captured * 100.0).round() / 100.0,
+        "logged_hours": (logged * 100.0).round() / 100.0,
         "lines": t.map(|t| t.lines.clone()).unwrap_or_default(),
         "note": t.and_then(|t| t.note.clone()),
         "harvest": st.tile_target(item_id, date).0,
@@ -225,11 +233,14 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, days: &d
                 "id": item.id,
                 "title": item.title,
                 "issue": item.issue,
-                "repo_path": item.repo_path,
+                "repo_path": item.repo_path.clone().or_else(|| {
+                    item.desk_id.as_ref().and_then(|k| st.desks.get(k)).and_then(|d| d.firmware_repos.first().cloned())
+                }),
                 "prs": item.prs,
                 "pinned": item.pinned,
                 "last_activity_ms": item.last_activity_ms,
                 "sessions": { "live": live, "today": today_sessions, "total": sessions.len() },
+                "logged_today": (st.logged_hours(&item.id, &today) * 100.0).round() / 100.0,
                 "bench": bench.iter().map(|(t, (n, f))| json!({ "tool": t, "count": n, "failed": f })).collect::<Vec<_>>(),
                 "tiles": tiles,
             })
@@ -442,13 +453,19 @@ async fn launch_item(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
         .db
         .read(|st| {
             st.items.get(&id).map(|i| {
+                // Its own repo first (decision 8), else its desk's.
+                let desk_repo = i
+                    .desk_id
+                    .as_ref()
+                    .and_then(|k| st.desks.get(k))
+                    .and_then(|d| d.firmware_repos.first().cloned());
                 let what = match &i.issue {
                     Some(r) => format!("{}: {} ({})", r.key, r.title, r.url),
                     None => i.title.clone(),
                 };
                 let prs: Vec<String> = i.prs.iter().filter(|p| p.state == "open").map(|p| p.url.clone()).collect();
                 let prs = if prs.is_empty() { String::new() } else { format!(" Open PR: {}.", prs.join(", ")) };
-                (i.repo_path.clone(), format!("Work on {what}.{prs} (EmbArch desk work item {}.)", i.id))
+                (i.repo_path.clone().or(desk_repo), format!("Work on {what}.{prs} (EmbArch desk work item {}.)", i.id))
             })
         })
         .ok_or_else(|| missing("no such work item"))?;
@@ -778,6 +795,9 @@ async fn approve_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult 
         t.note = Some(note);
         t.hours_override = Some(hours);
     });
+    if let Err(e) = refresh_logged(&app, &date).await {
+        tracing::warn!("re-reading Harvest after the entry: {e:#}");
+    }
     Ok(Json(json!({ "harvest_entry_id": entry, "hours": hours })))
 }
 
@@ -1383,7 +1403,14 @@ pub fn day_json(st: &State, date: &str, now: i64) -> Value {
             .collect();
         let bench: Vec<&store::BenchEvent> = item.bench.iter().filter(|b| days.date(b.ms) == date).collect();
         let lines = tile.map(|t| t.lines.clone()).unwrap_or_default();
-        if seconds == 0 && lines.is_empty() && bench.is_empty() && sessions.is_empty() {
+        let entries: Vec<&store::LoggedEntry> = st
+            .harvest_logged
+            .get(date)
+            .into_iter()
+            .flatten()
+            .filter(|e| st.item_for_entry(e).as_deref() == Some(item.id.as_str()))
+            .collect();
+        if seconds == 0 && lines.is_empty() && bench.is_empty() && sessions.is_empty() && entries.is_empty() {
             continue;
         }
         let t = tile_json(st, &item.id, date);
@@ -1395,6 +1422,9 @@ pub fn day_json(st: &State, date: &str, now: i64) -> Value {
                 "issue": item.issue,
                 "prs": item.prs,
                 "hours": t["hours"],
+                "captured_hours": t["captured_hours"],
+                "logged_hours": entries.iter().map(|e| e.hours).sum::<f64>(),
+                "harvest_entries": entries,
                 "status": t["status"],
                 "harvest": t["harvest"],
                 "lines": lines,
@@ -1403,6 +1433,20 @@ pub fn day_json(st: &State, date: &str, now: i64) -> Value {
                 "live": sessions.iter().filter(|s| !s.ended && now - s.last_ms < 30 * 60_000).count(),
                 "bench": bench.len(),
                 "bench_failed": bench.iter().filter(|b| !b.ok).count(),
+            }),
+        ));
+    }
+    // Entries no card claims — a call, an internal task, a key with no card
+    // yet — are rows of their own, under the desk billing their project.
+    for e in st.harvest_logged.get(date).into_iter().flatten().filter(|e| st.item_for_entry(e).is_none()) {
+        let title = e.notes.lines().next().filter(|l| !l.trim().is_empty()).map(str::to_string)
+            .unwrap_or_else(|| format!("{} / {}", e.project, e.task));
+        rows.push((
+            st.desk_for_entry(e),
+            json!({
+                "id": null, "title": title, "issue": null, "prs": [], "hours": 0.0, "captured_hours": 0.0,
+                "logged_hours": e.hours, "harvest_entries": [e], "status": "harvest_only", "harvest": null,
+                "lines": [], "note": null, "sessions": 0, "live": 0, "bench": 0, "bench_failed": 0,
             }),
         ));
     }
@@ -1419,10 +1463,19 @@ pub fn day_json(st: &State, date: &str, now: i64) -> Value {
         }
     }
     groups.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
-    let total: f64 = groups.iter().flat_map(|g| g.3.iter()).filter_map(|r| r["hours"].as_f64()).sum();
+    let unsent: f64 = groups
+        .iter()
+        .flat_map(|g| g.3.iter())
+        .filter(|r| r["status"] == "open")
+        .filter_map(|r| r["hours"].as_f64())
+        .sum();
+    let logged: f64 = st.harvest_logged.get(date).into_iter().flatten().map(|e| e.hours).sum();
+    let total = unsent + logged;
     json!({
         "date": date,
         "total_hours": (total * 100.0).round() / 100.0,
+        "logged_hours": (logged * 100.0).round() / 100.0,
+        "unsent_hours": (unsent * 100.0).round() / 100.0,
         "groups": groups.into_iter().map(|(_, name, desk, items)| json!({ "desk": desk, "name": name, "items": items })).collect::<Vec<_>>(),
     })
 }
@@ -1432,7 +1485,130 @@ async fn day(Ax(app): Ax<Shared>, Path(date): Path<String>) -> ApiResult {
         return Err(bad(format!("{date} is not a YYYY-MM-DD date")));
     }
     let now = now_ms();
+    let fetched = app.cache.lock().expect("cache").logged_fetched.get(&date).copied().unwrap_or(0);
+    if now - fetched > 2 * 60_000 {
+        if let Err(e) = refresh_logged(&app, &date).await {
+            tracing::warn!("reading Harvest for {date}: {e:#}");
+        }
+    }
     Ok(Json(app.db.read(|st| day_json(st, &date, now))))
+}
+
+// ---------------------------------------------------------------- what Harvest already holds
+//
+// The day list merges the entries Harvest already has — logged by hand, by
+// the Harvest app, or by a tile's ✓ — into the work items whose issue their
+// note names (decision 41). An entry naming an issue with no card makes the
+// card. The user can edit or delete an entry from the list.
+
+fn noon_ms(date: &str) -> Option<i64> {
+    use chrono::TimeZone;
+    let d = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    chrono::Local.from_local_datetime(&d.and_hms_opt(12, 0, 0)?).earliest().map(|t| t.timestamp_millis())
+}
+
+pub async fn refresh_logged(app: &App, date: &str) -> anyhow::Result<()> {
+    let conns = Connectors::load()?;
+    if conns.harvest.is_empty() {
+        return Ok(());
+    }
+    let raw = harvest::entries_between(&conns.harvest, date, date).await?;
+    let entries: Vec<store::LoggedEntry> = raw
+        .iter()
+        .map(|e| {
+            let notes = e["notes"].as_str().unwrap_or_default().to_string();
+            store::LoggedEntry {
+                id: e["id"].as_u64().unwrap_or(0),
+                account_id: e["account_id"].as_u64().unwrap_or(0),
+                project_id: e["project_id"].as_u64().unwrap_or(0),
+                task_id: e["task_id"].as_u64().unwrap_or(0),
+                client: e["client"].as_str().unwrap_or_default().to_string(),
+                project: e["project"].as_str().unwrap_or_default().to_string(),
+                task: e["task"].as_str().unwrap_or_default().to_string(),
+                hours: e["hours"].as_f64().unwrap_or(0.0),
+                running: e["is_running"].as_bool().unwrap_or(false),
+                issue_key: store::issue_key_in(&notes),
+                notes,
+            }
+        })
+        .collect();
+    let missing: Vec<String> = app.db.write(|st| {
+        st.harvest_logged.insert(date.to_string(), entries.clone());
+        let mut keys: Vec<String> = entries
+            .iter()
+            .filter_map(|e| e.issue_key.clone())
+            .filter(|k| st.item_by_key(k).is_none())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    });
+    // An entry naming an issue makes that issue's card, dated by the entry
+    // so an old day read back does not look like today's work.
+    if !missing.is_empty() && !conns.linear.is_empty() {
+        let now = now_ms();
+        let at = noon_ms(date).unwrap_or(now).min(now);
+        for key in missing {
+            if let Ok(Some(issue)) = linear::find_issue(&conns.linear, &key, now).await {
+                app.db.write(|st| {
+                    if st.item_by_key(&key).is_none() {
+                        let title = issue.title.clone();
+                        let id = st.create_item(&title, Some(issue), at);
+                        if let Some(i) = st.items.get_mut(&id) {
+                            i.created_ms = at;
+                            i.last_activity_ms = at;
+                        }
+                    }
+                });
+            }
+        }
+    }
+    app.cache.lock().expect("cache").logged_fetched.insert(date.to_string(), now_ms());
+    Ok(())
+}
+
+fn entry_date(app: &App, id: u64) -> Option<String> {
+    app.db.read(|st| st.harvest_logged.iter().find(|(_, es)| es.iter().any(|e| e.id == id)).map(|(d, _)| d.clone()))
+}
+
+#[derive(Deserialize)]
+struct EntryEdit {
+    #[serde(default)]
+    hours: Option<f64>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+/// The user's edit of an entry already in Harvest, sent as they left it.
+async fn edit_entry(Ax(app): Ax<Shared>, Path((account, id)): Path<(u64, u64)>, Json(b): Json<EntryEdit>) -> ApiResult {
+    if b.hours.is_some_and(|h| !(0.0..=24.0).contains(&h)) {
+        return Err(bad("hours must be between 0 and 24"));
+    }
+    let conns = Connectors::load()?;
+    harvest::update_entry(&conns.harvest, account, id, b.hours, b.notes.as_deref()).await?;
+    if let Some(date) = entry_date(&app, id) {
+        refresh_logged(&app, &date).await?;
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Delete an entry from Harvest. A tile whose ✓ made it opens again, so its
+/// time is not lost with the entry.
+async fn remove_entry(Ax(app): Ax<Shared>, Path((account, id)): Path<(u64, u64)>) -> ApiResult {
+    let conns = Connectors::load()?;
+    harvest::delete_entry(&conns.harvest, account, id).await?;
+    app.db.write(|st| {
+        for t in st.tiles.values_mut().filter(|t| t.harvest_entry_id == Some(id)) {
+            t.status = TileStatus::Open;
+            t.harvest_entry_id = None;
+            t.acted_ms = None;
+            t.final_seconds = None;
+        }
+    });
+    if let Some(date) = entry_date(&app, id) {
+        refresh_logged(&app, &date).await?;
+    }
+    Ok(Json(json!({ "ok": true })))
 }
 
 // ---------------------------------------------------------------- sync
@@ -1533,6 +1709,13 @@ pub async fn sync_once(app: &App, force_issues: bool) {
         c.last_slack_ms = now;
     }
 
+    let today = LocalDays.date(now);
+    let fetched = app.cache.lock().expect("cache").logged_fetched.get(&today).copied().unwrap_or(0);
+    if force_issues || now - fetched > 2 * 60_000 {
+        if let Err(e) = refresh_logged(app, &today).await {
+            tracing::warn!("reading Harvest for {today}: {e:#}");
+        }
+    }
     app.db.write(|st| st.tick_timer(now, &LocalDays));
     let archived = app.db.write(|st| st.prune(now));
     if let Err(e) = app.db.archive(&archived) {
@@ -1672,6 +1855,34 @@ mod tests {
         assert_eq!(names, ["Beta", "Alpha"]);
         assert_eq!(d["groups"][0]["items"][0]["lines"][0]["text"], "did a thing");
         assert_eq!(day_json(&st, "2026-10-21", D0)["groups"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_tile_proposes_only_the_gap_and_the_day_merges_harvest_entries() {
+        let mut st = State::default();
+        let issue = store::IssueRef { key: "ABC-1".into(), ..Default::default() };
+        let w = st.create_item("Bootload", Some(issue), D0);
+        let mut s1 = crate::store::testing::session("s");
+        s1.item_id = Some(w.clone());
+        crate::store::record_activity(&mut s1, D0 + 9 * H, &UtcDays);
+        crate::store::record_activity(&mut s1, D0 + 12 * H, &UtcDays);
+        st.sessions.insert("s".into(), s1);
+        let entry = |id, key: Option<&str>, hours, notes: &str| store::LoggedEntry {
+            id, issue_key: key.map(str::to_string), hours, notes: notes.into(), project: "P".into(), task: "T".into(), ..Default::default()
+        };
+        st.harvest_logged.insert("2026-10-22".into(), vec![
+            entry(1, Some("ABC-1"), 2.0, "ABC-1: bring-up"),
+            entry(2, None, 0.5, "Weekly sync"),
+        ]);
+        let t = tile_json(&st, &w, "2026-10-22");
+        assert_eq!((t["captured_hours"].as_f64(), t["logged_hours"].as_f64(), t["hours"].as_f64()), (Some(3.0), Some(2.0), Some(1.0)));
+        let d = day_json(&st, "2026-10-22", D0 + 13 * H);
+        let rows: Vec<&Value> = d["groups"].as_array().unwrap().iter().flat_map(|g| g["items"].as_array().unwrap()).collect();
+        let item = rows.iter().find(|r| r["title"] == "Bootload").unwrap();
+        assert_eq!(item["logged_hours"], 2.0);
+        assert_eq!(item["harvest_entries"][0]["id"], 1);
+        assert!(rows.iter().any(|r| r["title"] == "Weekly sync" && r["status"] == "harvest_only"));
+        assert_eq!(d["total_hours"], 3.5, "1h unsent + 2.5h already in Harvest");
     }
 
     #[test]

@@ -57,6 +57,28 @@ pub struct State {
     /// scoped.
     #[serde(default)]
     pub open_desk: Option<String>,
+    /// What Harvest already holds, per day: entries logged by hand, by the
+    /// Harvest app, or by a tile's ✓. A tile proposes only the gap.
+    #[serde(default)]
+    pub harvest_logged: BTreeMap<String, Vec<LoggedEntry>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LoggedEntry {
+    pub id: u64,
+    pub account_id: u64,
+    pub project_id: u64,
+    pub task_id: u64,
+    pub client: String,
+    pub project: String,
+    pub task: String,
+    pub notes: String,
+    pub hours: f64,
+    #[serde(default)]
+    pub running: bool,
+    /// The issue key the note names, if any.
+    #[serde(default)]
+    pub issue_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -615,6 +637,34 @@ impl State {
         id
     }
 
+    /// The work item an entry belongs to: the card carrying the issue its
+    /// note names.
+    pub fn item_for_entry(&self, e: &LoggedEntry) -> Option<String> {
+        e.issue_key.as_deref().and_then(|k| self.item_by_key(k)).map(|i| i.id.clone())
+    }
+
+    /// The desk an entry with no issue belongs to: the one billing its
+    /// Harvest project.
+    pub fn desk_for_entry(&self, e: &LoggedEntry) -> Option<String> {
+        self.desks
+            .values()
+            .find(|d| d.harvest.as_ref().is_some_and(|h| h.project_id == e.project_id))
+            .map(|d| d.id.clone())
+    }
+
+    /// Hours Harvest already holds for an item on a day — leaving out the
+    /// entry this item's own tile created, which is the tile, not a gap.
+    pub fn logged_hours(&self, item_id: &str, date: &str) -> f64 {
+        let own = self.tiles.get(&format!("{item_id}@{date}")).and_then(|t| t.harvest_entry_id);
+        self.harvest_logged
+            .get(date)
+            .into_iter()
+            .flatten()
+            .filter(|e| Some(e.id) != own && self.item_for_entry(e).as_deref() == Some(item_id))
+            .map(|e| e.hours)
+            .sum()
+    }
+
     /// The effective Harvest target of a tile: its own, else its desk's.
     pub fn tile_target(&self, item_id: &str, date: &str) -> (Option<HarvestTarget>, bool) {
         if let Some(h) = self.tiles.get(&format!("{item_id}@{date}")).and_then(|t| t.harvest.clone()) {
@@ -728,6 +778,10 @@ impl State {
                 })
         });
         self.pending_launches.retain(|p| p.expires_ms > now);
+        if let Some(cutoff) = chrono::DateTime::from_timestamp_millis(now - 14 * 86_400_000) {
+            let cutoff = cutoff.date_naive().to_string();
+            self.harvest_logged.retain(|d, _| d.as_str() >= cutoff.as_str());
+        }
         archived
     }
 }
@@ -987,6 +1041,19 @@ mod tests {
         let own = HarvestTarget { account_id: 1, project_id: 9, task_id: 3, label: "other".into() };
         st.tile_mut(&w, "2026-10-22").harvest = Some(own.clone());
         assert_eq!(st.tile_target(&w, "2026-10-22"), (Some(own), false));
+    }
+
+    #[test]
+    fn logged_hours_count_entries_naming_the_items_issue_but_not_its_own_tiles_entry() {
+        let mut st = State::default();
+        let issue = IssueRef { key: "ABC-1".into(), ..Default::default() };
+        let w = st.create_item("x", Some(issue), D0);
+        let entry = |id, key: Option<&str>, hours| LoggedEntry { id, issue_key: key.map(str::to_string), hours, ..Default::default() };
+        st.harvest_logged.insert("2026-10-22".into(), vec![entry(1, Some("ABC-1"), 1.5), entry(2, Some("ABC-1"), 0.5), entry(3, None, 2.0), entry(4, Some("ZZ-9"), 3.0)]);
+        assert_eq!(st.logged_hours(&w, "2026-10-22"), 2.0);
+        st.tile_mut(&w, "2026-10-22").harvest_entry_id = Some(2);
+        assert_eq!(st.logged_hours(&w, "2026-10-22"), 1.5, "the tile's own entry is not a gap");
+        assert_eq!(st.logged_hours(&w, "2026-10-21"), 0.0);
     }
 
     #[test]
