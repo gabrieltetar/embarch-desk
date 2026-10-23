@@ -62,6 +62,10 @@ enum Cmd {
     },
     /// Is the desk up, and what does it see?
     Status,
+    /// List the desks and which one is open.
+    Desks,
+    /// Open a desk suite-wide by name or id, or `none`.
+    Open { desk: String },
 }
 
 #[derive(Subcommand)]
@@ -132,6 +136,34 @@ fn main() -> Result<()> {
             }
             Ok(())
         }),
+        Cmd::Desks => runtime()?.block_on(async {
+            let c = client::DeskClient::new(Duration::from_secs(10))?;
+            let v = c.get("/desks").await?;
+            let open = v["open"].as_str().unwrap_or("");
+            for d in v["desks"].as_array().into_iter().flatten() {
+                let mark = if d["id"].as_str() == Some(open) { "*" } else { " " };
+                println!(
+                    "{mark} {}  {}  linear: {}  repos: {}",
+                    d["id"].as_str().unwrap_or(""),
+                    d["name"].as_str().unwrap_or(""),
+                    d["linear"]["project_name"].as_str().unwrap_or("-"),
+                    d["firmware_repos"].as_array().map(|r| r.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default()
+                );
+            }
+            if open.is_empty() {
+                println!("no desk open");
+            }
+            Ok(())
+        }),
+        Cmd::Open { desk } => runtime()?.block_on(async {
+            let c = client::DeskClient::new(Duration::from_secs(10))?;
+            let v = c.post("/open", serde_json::json!({ "desk": desk })).await?;
+            match v["desk"]["name"].as_str() {
+                Some(n) => println!("open: {n}"),
+                None => println!("no desk open"),
+            }
+            Ok(())
+        }),
         Cmd::Status => runtime()?.block_on(async {
             let c = client::DeskClient::new(Duration::from_secs(10))?;
             let v = c.get("/view").await?;
@@ -166,6 +198,7 @@ async fn serve() -> Result<()> {
         .await
         .with_context(|| format!("binding {addr} — is another desk already running?"))?;
     tracing::info!("embarch-desk listening on http://{addr}");
+    server::publish_open(&app);
     tokio::spawn(server::flush_loop(app.clone()));
     tokio::spawn(server::sync_loop(app.clone()));
     let shutdown_app = app.clone();

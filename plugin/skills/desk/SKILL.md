@@ -7,6 +7,14 @@ description: How a session works with the EmbArch desk — the one access point 
 
 The desk is **the one access point to Linear and Harvest**, and it tracks this session's time on a **work item** — usually one Linear issue — shown to the user as a day tile they send to Harvest (✓) or discard (✕).
 
+## Desks
+
+One desk per project — a Linear project (or a whole team), a Harvest project and task, its GitHub repos, firmware repo and saved bench. **One desk is open suite-wide**, and your Linear and GitHub tools are scoped to it; with no desk open they search everything. `desk_list_desks` says which exist and which is open.
+
+- **Switch only when the user says so**, with `desk_open` ("none" closes it). If the context says this session started in another desk's repo, ask the user once whether to switch; either way the session's time goes to its own desk.
+- **A new standalone work item needs its desk** — ask which (`desk` on `desk_set_work_item`, `desk_create_item`, `desk_timer_start`).
+- `embarch-api` tools build the open desk's firmware repo when no project is named.
+
 ## Linear
 
 - Read with `linear_get_issue` (description and latest comments), `linear_my_issues`, `linear_search`.

@@ -1,6 +1,6 @@
 {
   "name": "embarch-desk",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "EmbArch Desk: every Claude Code session's time lands on a work item's tile; commits and milestones become its Harvest note. Needs the embarch-desk service running.",
   "author": { "name": "Gabriel Tetar" },
   "homepage": "https://github.com/gabrieltetar/embarch-desk",

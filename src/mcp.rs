@@ -42,6 +42,9 @@ pub struct SetWorkItemParams {
     /// A title for a new standalone work item with no Linear issue (a call, a meeting, support).
     #[serde(default)]
     pub new_title: Option<String>,
+    /// The desk a new standalone item belongs to (name or id, or "none"). Ask the user; it is required once desks exist.
+    #[serde(default)]
+    pub desk: Option<String>,
     /// True when the user says this session is not tracked work: it stops counting and stops being asked.
     #[serde(default)]
     pub untracked: bool,
@@ -63,6 +66,9 @@ pub struct CreateParams {
     /// A title for a standalone work item.
     #[serde(default)]
     pub title: Option<String>,
+    /// The desk a standalone item belongs to (name or id, or "none") — ask the user.
+    #[serde(default)]
+    pub desk: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -109,8 +115,9 @@ pub struct CommentDraftParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct IssueDraftParams {
-    /// The Linear team key the issue goes to, e.g. ABC.
-    pub team_key: String,
+    /// The Linear team key the issue goes to, e.g. ABC. Omit it to file into the open desk's Linear project.
+    #[serde(default)]
+    pub team_key: Option<String>,
     pub title: String,
     /// The description, in Markdown.
     #[serde(default)]
@@ -141,6 +148,15 @@ pub struct TimerParams {
     /// A title for a new standalone work item (a call, a meeting, bench work).
     #[serde(default)]
     pub new_title: Option<String>,
+    /// The desk a new standalone item belongs to (name or id, or "none") — ask the user.
+    #[serde(default)]
+    pub desk: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct OpenParams {
+    /// The desk's name or id; "none" opens no desk (a bare firmware repo, nothing scoped).
+    pub desk: String,
 }
 
 fn ok(v: Value) -> Result<CallToolResult, McpError> {
@@ -168,7 +184,7 @@ impl DeskMcp {
 
     #[tool(description = "Put this session on a work item, after the user said which one: an existing item_id, a Linear issue_key (its card is found or created), or new_title for a standalone item. untracked: true when the user says this is not tracked work. Time the session already ran up moves onto the item.")]
     async fn desk_set_work_item(&self, Parameters(p): Parameters<SetWorkItemParams>) -> Result<CallToolResult, McpError> {
-        let body = json!({ "item_id": p.item_id, "issue_key": p.issue_key, "new_title": p.new_title, "untracked": p.untracked });
+        let body = json!({ "item_id": p.item_id, "issue_key": p.issue_key, "new_title": p.new_title, "desk": p.desk, "untracked": p.untracked });
         match self.client.post(&format!("/sessions/{}/assign", p.session_id), body).await {
             Ok(v) => ok(v),
             Err(e) => err(e),
@@ -208,7 +224,7 @@ impl DeskMcp {
 
     #[tool(description = "Create a work item: from a Linear issue_key, or a standalone one from a title. Returns its id; an issue that already has a card returns that card.")]
     async fn desk_create_item(&self, Parameters(p): Parameters<CreateParams>) -> Result<CallToolResult, McpError> {
-        match self.client.post("/items", json!({ "issue_key": p.issue_key, "title": p.title })).await {
+        match self.client.post("/items", json!({ "issue_key": p.issue_key, "title": p.title, "desk": p.desk })).await {
             Ok(v) => ok(v),
             Err(e) => err(e),
         }
@@ -294,7 +310,23 @@ impl DeskMcp {
 
     #[tool(description = "Start the desk's manual timer on a work item, for work away from Claude Code — the bench, a call, a meeting (\"start tracking X\"). Starting one stops the running one. Its time lands on the item's tile like a session's.")]
     async fn desk_timer_start(&self, Parameters(p): Parameters<TimerParams>) -> Result<CallToolResult, McpError> {
-        match self.client.post("/timer/start", json!({ "item_id": p.item_id, "issue_key": p.issue_key, "new_title": p.new_title })).await {
+        match self.client.post("/timer/start", json!({ "item_id": p.item_id, "issue_key": p.issue_key, "new_title": p.new_title, "desk": p.desk })).await {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "The desks — one per project: its Linear project, Harvest project and task, GitHub repos, firmware repos and saved bench — and which one is open.")]
+    async fn desk_list_desks(&self) -> Result<CallToolResult, McpError> {
+        match self.client.get("/desks").await {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "Open a desk suite-wide, only when the user says to (\"switch to the X desk\", or yes to the desk's switch question): the UI, the agents' Linear and GitHub scope and embarch-api's default build target follow it; its saved bench is proposed in the UI, never applied by this tool. desk \"none\" opens no desk.")]
+    async fn desk_open(&self, Parameters(p): Parameters<OpenParams>) -> Result<CallToolResult, McpError> {
+        match self.client.post("/open", json!({ "desk": p.desk })).await {
             Ok(v) => ok(v),
             Err(e) => err(e),
         }

@@ -68,11 +68,34 @@ fn summarize_checks(runs: &Value, combined: &Value) -> String {
     }
 }
 
-/// PRs involving the user that name `key`, newest first.
-pub async fn prs_for(accounts: &[Account], key: &str) -> Result<Vec<PrRef>> {
+/// The repos the user can see, most recently pushed first — the desk
+/// form's suggestions.
+pub async fn user_repos(accounts: &[Account]) -> Result<Vec<String>> {
     let mut out = vec![];
     for acct in accounts {
-        let q = format!("{key} type:pr involves:@me");
+        let v = get(acct, &format!("{API}/user/repos?per_page=100&sort=pushed&affiliation=owner,collaborator,organization_member")).await?;
+        out.extend(v.as_array().into_iter().flatten().filter_map(|r| r["full_name"].as_str().map(str::to_string)));
+    }
+    out.dedup();
+    Ok(out)
+}
+
+/// The search query for a key's PRs: within the desk's repos when it names
+/// some, else anything the user is involved in.
+pub fn pr_query(key: &str, repos: &[String]) -> String {
+    if repos.is_empty() {
+        format!("{key} type:pr involves:@me")
+    } else {
+        let scope: Vec<String> = repos.iter().map(|r| format!("repo:{r}")).collect();
+        format!("{key} type:pr {}", scope.join(" "))
+    }
+}
+
+/// PRs that name `key`, newest first.
+pub async fn prs_for(accounts: &[Account], key: &str, repos: &[String]) -> Result<Vec<PrRef>> {
+    let mut out = vec![];
+    for acct in accounts {
+        let q = pr_query(key, repos);
         let url = format!("{API}/search/issues?per_page=10&sort=updated&q={}", crate::uri::encode(&q));
         let found = get(acct, &url).await?;
         for it in found["items"].as_array().into_iter().flatten() {
@@ -120,6 +143,12 @@ pub async fn prs_for(accounts: &[Account], key: &str) -> Result<Vec<PrRef>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_desks_repos_scope_the_pr_search() {
+        assert_eq!(pr_query("ABC-1", &[]), "ABC-1 type:pr involves:@me");
+        assert_eq!(pr_query("ABC-1", &["o/a".into(), "o/b".into()]), "ABC-1 type:pr repo:o/a repo:o/b");
+    }
 
     #[test]
     fn a_neighbouring_key_is_not_a_match() {

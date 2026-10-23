@@ -3,7 +3,7 @@
 //! that answers is remembered on the issue.
 
 use crate::connectors::{http, Account};
-use crate::store::IssueRef;
+use crate::store::{IssueRef, LinearBinding};
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
@@ -50,11 +50,13 @@ fn issue_from(acct: &Account, v: &Value, now: i64) -> Option<IssueRef> {
         state_name: v["state"]["name"].as_str().unwrap_or_default().to_string(),
         state_type: v["state"]["type"].as_str().unwrap_or_default().to_string(),
         team_id: v["team"]["id"].as_str().unwrap_or_default().to_string(),
+        project_id: v["project"]["id"].as_str().unwrap_or_default().to_string(),
+        project_name: v["project"]["name"].as_str().unwrap_or_default().to_string(),
         refreshed_ms: now,
     })
 }
 
-const ISSUE_FIELDS: &str = "id identifier title url state { id name type } team { id key }";
+const ISSUE_FIELDS: &str = "id identifier title url state { id name type } team { id key } project { id name }";
 
 /// Find an issue by key (`ABC-123`) in whichever connected workspace has it.
 pub async fn find_issue(accounts: &[Account], key: &str, now: i64) -> Result<Option<IssueRef>> {
@@ -179,33 +181,97 @@ fn issue_rows(acct: &Account, nodes: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// Open issues assigned to the user, in every connected workspace.
-pub async fn my_issues(accounts: &[Account]) -> Result<Vec<Value>> {
-    let q = "{ viewer { assignedIssues(first: 50, orderBy: updatedAt, \
-             filter: { state: { type: { nin: [\"completed\", \"canceled\"] } } }) \
-             { nodes { identifier title url updatedAt state { name } } } } }";
+/// The accounts a scoped call asks: the open desk's one, or every one.
+fn in_scope<'a>(accounts: &'a [Account], scope: Option<&LinearBinding>) -> Vec<&'a Account> {
+    match scope {
+        Some(b) => accounts.iter().filter(|a| a.label == b.account).collect(),
+        None => accounts.iter().collect(),
+    }
+}
+
+/// A desk bound to a project filters on it; one bound to a whole team, on the team.
+fn scope_filter(b: &LinearBinding) -> (&'static str, &str) {
+    if b.project_id.is_empty() {
+        ("team", b.team_id.as_str())
+    } else {
+        ("project", b.project_id.as_str())
+    }
+}
+
+const OPEN_STATES: &str = "state: { type: { nin: [\"completed\", \"canceled\"] } }";
+const ROW_FIELDS: &str = "nodes { identifier title url updatedAt state { name } }";
+
+/// Open issues assigned to the user — in the open desk's Linear project when
+/// one is open, else in every connected workspace.
+pub async fn my_issues(accounts: &[Account], scope: Option<&LinearBinding>) -> Result<Vec<Value>> {
     let mut out = vec![];
-    for acct in accounts {
-        let d = gql(acct, q, json!({})).await?;
+    for acct in in_scope(accounts, scope) {
+        let d = match scope {
+            Some(b) => {
+                let (field, id) = scope_filter(b);
+                let q = format!(
+                    "query($p: ID) {{ viewer {{ assignedIssues(first: 50, orderBy: updatedAt, \
+                     filter: {{ {OPEN_STATES}, {field}: {{ id: {{ eq: $p }} }} }}) {{ {ROW_FIELDS} }} }} }}"
+                );
+                gql(acct, &q, json!({ "p": id })).await?
+            }
+            None => {
+                let q = format!(
+                    "{{ viewer {{ assignedIssues(first: 50, orderBy: updatedAt, filter: {{ {OPEN_STATES} }}) {{ {ROW_FIELDS} }} }} }}"
+                );
+                gql(acct, &q, json!({})).await?
+            }
+        };
         out.extend(issue_rows(acct, &d["viewer"]["assignedIssues"]["nodes"]));
     }
     Ok(out)
 }
 
-/// Issues whose title contains the words, or the one a key names.
-pub async fn search(accounts: &[Account], query: &str) -> Result<Vec<Value>> {
+/// Every Linear project in every connected workspace, with its teams — what
+/// the desk form picks from.
+pub async fn projects(accounts: &[Account]) -> Result<Vec<Value>> {
+    let q = "{ projects(first: 150, orderBy: updatedAt) { nodes { id name state teams { nodes { id key name } } } } }";
+    let mut out = vec![];
+    for acct in accounts {
+        let d = gql(acct, q, json!({})).await?;
+        for p in d["projects"]["nodes"].as_array().into_iter().flatten() {
+            out.push(json!({
+                "account": acct.label, "id": p["id"], "name": p["name"], "state": p["state"],
+                "teams": p["teams"]["nodes"],
+            }));
+        }
+    }
+    Ok(out)
+}
+
+/// Issues whose title contains the words — within the open desk's project
+/// when one is open — or the one a key names, wherever it is.
+pub async fn search(accounts: &[Account], query: &str, scope: Option<&LinearBinding>) -> Result<Vec<Value>> {
     if let Some(key) = crate::store::issue_key_in(query).filter(|k| k.eq_ignore_ascii_case(query.trim())) {
         return Ok(match read_issue(accounts, &key).await {
             Ok(v) => vec![v],
             Err(_) => vec![],
         });
     }
-    let q = "query($q: String!) { issues(first: 20, orderBy: updatedAt, \
-             filter: { title: { containsIgnoreCase: $q } }) \
-             { nodes { identifier title url updatedAt state { name } } } }";
     let mut out = vec![];
-    for acct in accounts {
-        let d = gql(acct, q, json!({ "q": query.trim() })).await?;
+    for acct in in_scope(accounts, scope) {
+        let d = match scope {
+            Some(b) => {
+                let (field, id) = scope_filter(b);
+                let q = format!(
+                    "query($q: String!, $p: ID) {{ issues(first: 20, orderBy: updatedAt, \
+                     filter: {{ title: {{ containsIgnoreCase: $q }}, {field}: {{ id: {{ eq: $p }} }} }}) {{ {ROW_FIELDS} }} }}"
+                );
+                gql(acct, &q, json!({ "q": query.trim(), "p": id })).await?
+            }
+            None => {
+                let q = format!(
+                    "query($q: String!) {{ issues(first: 20, orderBy: updatedAt, \
+                     filter: {{ title: {{ containsIgnoreCase: $q }} }}) {{ {ROW_FIELDS} }} }}"
+                );
+                gql(acct, &q, json!({ "q": query.trim() })).await?
+            }
+        };
         out.extend(issue_rows(acct, &d["issues"]["nodes"]));
     }
     Ok(out)
@@ -243,7 +309,13 @@ pub async fn post_comment(accounts: &[Account], key: &str, body: &str) -> Result
 
 /// Create an approved issue in the team with this key, in whichever
 /// workspace has that team.
-pub async fn create_issue(accounts: &[Account], team_key: &str, title: &str, description: &str) -> Result<(String, String)> {
+pub async fn create_issue(
+    accounts: &[Account],
+    team_key: &str,
+    title: &str,
+    description: &str,
+    project_id: Option<&str>,
+) -> Result<(String, String)> {
     for acct in accounts {
         let d = gql(
             acct,
@@ -254,9 +326,9 @@ pub async fn create_issue(accounts: &[Account], team_key: &str, title: &str, des
         let Some(team) = d["teams"]["nodes"].as_array().and_then(|n| n.first().cloned()) else { continue };
         let d = gql(
             acct,
-            "mutation($t: String!, $title: String!, $d: String) { issueCreate(input: { teamId: $t, title: $title, description: $d }) \
+            "mutation($t: String!, $title: String!, $d: String, $p: String) { issueCreate(input: { teamId: $t, title: $title, description: $d, projectId: $p }) \
              { success issue { identifier url } } }",
-            json!({ "t": team["id"], "title": title, "d": description }),
+            json!({ "t": team["id"], "title": title, "d": description, "p": project_id }),
         )
         .await?;
         if d["issueCreate"]["success"].as_bool() != Some(true) {

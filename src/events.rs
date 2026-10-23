@@ -69,10 +69,18 @@ fn is_git_commit(input: &Option<Value>) -> bool {
 
 /// The line a session is shown when it has no work item.
 pub fn ask_text(state: &State, session_id: &str, now: i64, window_days: i64) -> String {
+    // The session's own desk first, else the open one: the cards it is most
+    // likely to be.
+    let scope = state
+        .sessions
+        .get(session_id)
+        .and_then(|s| s.desk_id.clone())
+        .or_else(|| state.open_desk.clone());
     let mut items: Vec<_> = state
         .items
         .values()
         .filter(|i| !i.archived && (i.pinned || now - i.last_activity_ms < window_days * 86_400_000))
+        .filter(|i| scope.is_none() || i.desk_id == scope)
         .collect();
     items.sort_by_key(|i| std::cmp::Reverse(i.last_activity_ms));
     let list: Vec<String> = items
@@ -92,9 +100,9 @@ pub fn ask_text(state: &State, session_id: &str, now: i64, window_days: i64) -> 
         "EmbArch Desk: this session (desk session id `{session_id}`) is not on a work item, so \
          its time has nowhere to land. Before anything else, ask the user in one line which work \
          item it is — {choices} — or a Linear issue key, or a title for a new standalone item. \
-         Then call the `desk_set_work_item` tool with session_id `{session_id}` and the answer. \
-         If the user says this is not tracked work, call it with untracked: true. Ask again on \
-         every prompt until it is answered."
+         Then call the `desk_set_work_item` tool with session_id `{session_id}` and the answer \
+         (a new standalone item also needs its desk — ask which). If the user says this is not \
+         tracked work, call it with untracked: true. Ask again on every prompt until it is answered."
     )
 }
 
@@ -115,6 +123,25 @@ fn assigned_text(state: &State, session_id: &str, item_id: &str) -> String {
     )
 }
 
+/// When a session starts in one desk's repo while another (or none) is open:
+/// the one-time question, and the rule that its time is its own desk's.
+fn switch_text(state: &State, session_id: &str) -> Option<String> {
+    let sess = state.sessions.get(session_id)?;
+    let own = sess.desk_id.as_ref()?;
+    if state.open_desk.as_ref() == Some(own) {
+        return None;
+    }
+    let name = |id: &String| state.desks.get(id).map(|d| d.name.clone()).unwrap_or_else(|| id.clone());
+    let open = state.open_desk.as_ref().map(name).unwrap_or_else(|| "no desk".to_string());
+    Some(format!(
+        "EmbArch Desk: this repo belongs to the desk \"{}\", but \"{open}\" is open. Ask the user \
+         once whether to switch the open desk to \"{}\" (the `desk_open` tool) — that also moves \
+         the UI, the agents' Linear and GitHub scope and the default build target, and proposes \
+         its bench. Either way, this session's time goes to \"{}\".",
+        name(own), name(own), name(own)
+    ))
+}
+
 /// Apply one hook event. Returns the context to inject into the session, if any.
 pub fn apply(
     state: &mut State,
@@ -128,9 +155,11 @@ pub fn apply(
         return None;
     }
     let ignore = state.ignore.clone();
+    let desk_here = state.desk_for_path(&ev.cwd);
     let sess = state.sessions.entry(ev.session_id.clone()).or_insert_with(|| Session {
         id: ev.session_id.clone(),
         cwd: ev.cwd.clone(),
+        desk_id: desk_here,
         item_id: None,
         ignored: store::is_ignored(&ev.cwd, &ignore),
         started_ms: now,
@@ -164,10 +193,15 @@ pub fn apply(
             w.last_activity_ms = w.last_activity_ms.max(now);
         }
     }
-    match (ev.hook_event_name.as_str(), item) {
+    let main = match (ev.hook_event_name.as_str(), item) {
         ("SessionStart", Some(i)) => Some(assigned_text(state, &ev.session_id, &i)),
         ("SessionStart" | "UserPromptSubmit", None) => Some(ask_text(state, &ev.session_id, now, window_days)),
         _ => None,
+    };
+    let switch = (ev.hook_event_name == "SessionStart").then(|| switch_text(state, &ev.session_id)).flatten();
+    match (main, switch) {
+        (Some(m), Some(s)) => Some(format!("{m}\n\n{s}")),
+        (m, s) => m.or(s),
     }
 }
 
@@ -303,6 +337,23 @@ mod tests {
         let lines = &st.tiles[&format!("{w}@2026-10-22")].lines;
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].source, "commit");
+    }
+
+    #[test]
+    fn a_session_in_another_desks_repo_is_asked_once_to_switch_and_keeps_its_desk() {
+        let mut st = State::default();
+        let a = st.put_desk(crate::store::Desk { name: "Alpha".into(), firmware_repos: vec!["/w/a".into()], ..Default::default() }, D0);
+        let b = st.put_desk(crate::store::Desk { name: "Beta".into(), firmware_repos: vec!["/w/b".into()], ..Default::default() }, D0);
+        st.open_desk = Some(a);
+        let git = FakeGit::default();
+        let out = apply(&mut st, &ev("SessionStart", "s", "/w/b/app"), D0, &UtcDays, &git, 7).unwrap();
+        assert!(out.contains("\"Beta\"") && out.contains("desk_open"), "{out}");
+        assert_eq!(st.sessions["s"].desk_id.as_deref(), Some(b.as_str()));
+        let again = apply(&mut st, &ev("UserPromptSubmit", "s", "/w/b/app"), D0 + 1, &UtcDays, &git, 7).unwrap();
+        assert!(!again.contains("desk_open"), "the switch question is asked once, at start");
+        st.open_desk = Some(b);
+        let in_open = apply(&mut st, &ev("SessionStart", "t", "/w/b"), D0 + 2, &UtcDays, &git, 7).unwrap();
+        assert!(!in_open.contains("desk_open"));
     }
 
     #[test]

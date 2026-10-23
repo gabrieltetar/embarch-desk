@@ -49,12 +49,68 @@ pub struct State {
     /// any other and lands on the same tile.
     #[serde(default)]
     pub timer: Option<Timer>,
+    /// One desk per project: a Linear project, a Harvest project, its GitHub
+    /// repos, firmware repos and saved bench (`embarch-open-desk-proposal.md`).
+    #[serde(default)]
+    pub desks: BTreeMap<String, Desk>,
+    /// The one desk the whole suite has open, or none — a bare repo, nothing
+    /// scoped.
+    #[serde(default)]
+    pub open_desk: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LinearBinding {
+    /// The Linear connector account label the project lives under.
+    pub account: String,
+    pub project_id: String,
+    pub project_name: String,
+    #[serde(default)]
+    pub team_id: String,
+    #[serde(default)]
+    pub team_key: String,
+}
+
+impl LinearBinding {
+    pub fn holds(&self, issue: &IssueRef) -> bool {
+        if !self.project_id.is_empty() {
+            !issue.project_id.is_empty() && issue.project_id == self.project_id
+        } else {
+            !self.team_id.is_empty() && issue.team_id == self.team_id
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Desk {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub linear: Option<LinearBinding>,
+    /// Every tile's default Harvest project and task (Intercreate's account).
+    #[serde(default)]
+    pub harvest: Option<HarvestTarget>,
+    /// `owner/repo`, where its PRs are looked for.
+    #[serde(default)]
+    pub github_repos: Vec<String>,
+    /// Absolute paths; the first is what the suite opens.
+    #[serde(default)]
+    pub firmware_repos: Vec<String>,
+    /// A saved bench in the firmware repo, proposed when the desk opens.
+    #[serde(default)]
+    pub bench: Option<String>,
+    #[serde(default)]
+    pub created_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItem {
     pub id: String,
     pub title: String,
+    /// The desk it belongs to: an issue's is the desk holding its Linear
+    /// project, a standalone item's is chosen when it is made.
+    #[serde(default)]
+    pub desk_id: Option<String>,
     #[serde(default)]
     pub issue: Option<IssueRef>,
     #[serde(default)]
@@ -83,6 +139,10 @@ pub struct IssueRef {
     pub state_name: String,
     pub state_type: String,
     pub team_id: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub project_name: String,
     pub refreshed_ms: i64,
 }
 
@@ -110,6 +170,9 @@ pub struct BenchEvent {
 pub struct Session {
     pub id: String,
     pub cwd: String,
+    /// The desk whose firmware repo the session started in.
+    #[serde(default)]
+    pub desk_id: Option<String>,
     #[serde(default)]
     pub item_id: Option<String>,
     #[serde(default)]
@@ -215,6 +278,9 @@ pub struct Draft {
     pub status: String,
     #[serde(default)]
     pub url: Option<String>,
+    /// The Linear project a new issue is filed into (the open desk's).
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -358,12 +424,14 @@ impl State {
     }
 
     pub fn create_item(&mut self, title: &str, issue: Option<IssueRef>, now: i64) -> String {
+        let desk_id = issue.as_ref().and_then(|i| self.desk_for_issue(i));
         let id = self.new_id("w");
         self.items.insert(
             id.clone(),
             WorkItem {
                 id: id.clone(),
                 title: title.to_string(),
+                desk_id,
                 issue,
                 repo_path: None,
                 prs: vec![],
@@ -503,6 +571,59 @@ impl State {
         true
     }
 
+    /// The desk holding this issue's Linear project.
+    /// A desk bound to a project takes that project's issues; one bound to a
+    /// whole team (no project) takes the team's.
+    pub fn desk_for_issue(&self, issue: &IssueRef) -> Option<String> {
+        self.desks
+            .values()
+            .find(|d| d.linear.as_ref().is_some_and(|l| l.holds(issue)))
+            .map(|d| d.id.clone())
+    }
+
+    /// The desk whose firmware repo holds this path.
+    pub fn desk_for_path(&self, path: &str) -> Option<String> {
+        self.desks
+            .values()
+            .find(|d| !path.is_empty() && is_ignored(path, &d.firmware_repos))
+            .map(|d| d.id.clone())
+    }
+
+    pub fn desk_by_name_or_id(&self, s: &str) -> Option<&Desk> {
+        let s = s.trim();
+        self.desks.get(s).or_else(|| self.desks.values().find(|d| d.name.eq_ignore_ascii_case(s)))
+    }
+
+    /// Save a desk; the first desk ever made also takes every work item that
+    /// has none — the cards that existed before desks did. Items whose issue
+    /// sits in the desk's Linear project move onto it.
+    pub fn put_desk(&mut self, mut desk: Desk, now: i64) -> String {
+        if desk.id.is_empty() {
+            desk.id = self.new_id("k");
+            desk.created_ms = now;
+        }
+        let first = self.desks.is_empty();
+        let id = desk.id.clone();
+        let linear = desk.linear.clone();
+        self.desks.insert(id.clone(), desk);
+        for item in self.items.values_mut() {
+            let in_project = linear.as_ref().is_some_and(|l| item.issue.as_ref().is_some_and(|i| l.holds(i)));
+            if in_project || (first && item.desk_id.is_none()) {
+                item.desk_id = Some(id.clone());
+            }
+        }
+        id
+    }
+
+    /// The effective Harvest target of a tile: its own, else its desk's.
+    pub fn tile_target(&self, item_id: &str, date: &str) -> (Option<HarvestTarget>, bool) {
+        if let Some(h) = self.tiles.get(&format!("{item_id}@{date}")).and_then(|t| t.harvest.clone()) {
+            return (Some(h), false);
+        }
+        let desk = self.items.get(item_id).and_then(|i| i.desk_id.as_ref()).and_then(|d| self.desks.get(d));
+        (desk.and_then(|d| d.harvest.clone()), true)
+    }
+
     pub fn is_timer_session(id: &str) -> bool {
         id.starts_with("timer-")
     }
@@ -518,6 +639,7 @@ impl State {
         let mut sess = Session {
             id: sid.clone(),
             cwd: String::new(),
+            desk_id: None,
             item_id: Some(item_id.to_string()),
             ignored: false,
             started_ms: now,
@@ -680,6 +802,7 @@ pub mod testing {
         Session {
             id: id.into(),
             cwd: "/w/repo".into(),
+            desk_id: None,
             item_id: None,
             ignored: false,
             started_ms: 0,
@@ -831,6 +954,39 @@ mod tests {
         st.start_timer(&a, D0 + H, &UtcDays);
         st.stop_timer(D0 + 11 * H, &UtcDays);
         assert_eq!(st.tile_seconds(&a, "2026-10-22"), 10 * 3600);
+    }
+
+    #[test]
+    fn the_first_desk_adopts_the_cards_that_came_before_and_issues_follow_their_project() {
+        let mut st = State::default();
+        let old = st.create_item("Before desks", None, D0);
+        let a = st.put_desk(Desk { name: "A".into(), ..Default::default() }, D0);
+        assert_eq!(st.items[&old].desk_id.as_deref(), Some(a.as_str()));
+        let linear = LinearBinding { project_id: "p-b".into(), ..Default::default() };
+        let b = st.put_desk(Desk { name: "B".into(), linear: Some(linear), firmware_repos: vec!["/w/b".into()], ..Default::default() }, D0);
+        let issue = IssueRef { key: "ABC-1".into(), project_id: "p-b".into(), ..Default::default() };
+        let w = st.create_item("x", Some(issue), D0);
+        assert_eq!(st.items[&w].desk_id.as_deref(), Some(b.as_str()));
+        assert_eq!(st.desk_for_path("/w/b/app/src").as_deref(), Some(b.as_str()));
+        assert_eq!(st.desk_for_path("/w/bb"), None);
+        assert_eq!(st.desk_by_name_or_id("b").map(|d| d.id.clone()), Some(b));
+        let team = LinearBinding { team_id: "t-c".into(), ..Default::default() };
+        let c = st.put_desk(Desk { name: "C".into(), linear: Some(team), ..Default::default() }, D0);
+        let in_team = IssueRef { key: "C-1".into(), team_id: "t-c".into(), project_id: "any".into(), ..Default::default() };
+        assert_eq!(st.desk_for_issue(&in_team), Some(c), "a desk bound to a whole team takes all its projects");
+    }
+
+    #[test]
+    fn a_tile_falls_back_to_its_desks_harvest_target() {
+        let mut st = State::default();
+        let target = HarvestTarget { account_id: 1, project_id: 2, task_id: 3, label: "C / P / T".into() };
+        let k = st.put_desk(Desk { name: "A".into(), harvest: Some(target.clone()), ..Default::default() }, D0);
+        let w = st.create_item("x", None, D0);
+        st.items.get_mut(&w).unwrap().desk_id = Some(k);
+        assert_eq!(st.tile_target(&w, "2026-10-22"), (Some(target), true));
+        let own = HarvestTarget { account_id: 1, project_id: 9, task_id: 3, label: "other".into() };
+        st.tile_mut(&w, "2026-10-22").harvest = Some(own.clone());
+        assert_eq!(st.tile_target(&w, "2026-10-22"), (Some(own), false));
     }
 
     #[test]

@@ -111,6 +111,12 @@ pub fn router(app: Shared) -> Router {
         .route("/harvest/entries", post(harvest_entries))
         .route("/timer/start", post(timer_start))
         .route("/timer/stop", post(timer_stop))
+        .route("/desks", get(list_desks).post(put_desk))
+        .route("/desks/{id}", delete(delete_desk))
+        .route("/open", get(get_open).post(set_open))
+        .route("/day/{date}", get(day))
+        .route("/linear/projects", get(linear_projects))
+        .route("/github/repos", get(github_repos))
         .route("/sync", post(sync_now))
         .route_layer(axum::middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
@@ -158,7 +164,8 @@ fn tile_json(st: &State, item_id: &str, date: &str) -> Value {
         "computed_hours": computed,
         "lines": t.map(|t| t.lines.clone()).unwrap_or_default(),
         "note": t.and_then(|t| t.note.clone()),
-        "harvest": t.and_then(|t| t.harvest.clone()),
+        "harvest": st.tile_target(item_id, date).0,
+        "harvest_from_desk": st.tile_target(item_id, date).1,
         "status": t.map(|t| t.status.clone()).unwrap_or_default(),
     })
 }
@@ -173,8 +180,22 @@ fn open_tile_keys(st: &State) -> Vec<(String, String)> {
 pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, days: &dyn Days) -> Value {
     let today = days.date(now);
     let open = open_tile_keys(st);
+    let in_open = |i: &store::WorkItem| st.open_desk.is_none() || i.desk_id == st.open_desk;
     let mut items: Vec<&store::WorkItem> =
-        st.items.values().filter(|i| visible(st, i, now, window_days, &open)).collect();
+        st.items.values().filter(|i| visible(st, i, now, window_days, &open) && in_open(i)).collect();
+    // Other desks' unsent tiles, so nothing waits unseen behind a switch.
+    let elsewhere: Vec<Value> = open
+        .iter()
+        .filter_map(|(i, d)| {
+            let item = st.items.get(i)?;
+            (!in_open(item) && st.tile_seconds(i, d) > 0).then(|| {
+                let mut t = tile_json(st, i, d);
+                t["item_title"] = json!(item.title);
+                t["desk"] = json!(item.desk_id.as_ref().and_then(|k| st.desks.get(k)).map(|k| k.name.clone()));
+                t
+            })
+        })
+        .collect();
     items.sort_by_key(|i| (!i.pinned, std::cmp::Reverse(i.last_activity_ms)));
     let cards: Vec<Value> = items
         .iter()
@@ -236,6 +257,10 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, days: &d
         "connectors": cache.connectors,
         "ignore": st.ignore,
         "drafts": st.drafts.values().filter(|d| d.status == "open").collect::<Vec<_>>(),
+        "elsewhere": elsewhere,
+        "desks": st.desks.values().collect::<Vec<_>>(),
+        "open_desk": st.open_desk.as_ref().and_then(|k| st.desks.get(k)),
+        "day": day_json(st, &today, now),
         "timer": st.timer.as_ref().map(|t| json!({
             "item_id": t.item_id,
             "title": st.items.get(&t.item_id).map(|i| i.issue.as_ref().map(|r| format!("{} {}", r.key, r.title)).unwrap_or(i.title.clone())),
@@ -268,10 +293,12 @@ struct NewItem {
     title: Option<String>,
     #[serde(default)]
     issue_key: Option<String>,
+    #[serde(default)]
+    desk: Option<String>,
 }
 
 /// Make (or find) the work item for an issue key, or a standalone one.
-async fn ensure_item(app: &App, title: Option<&str>, issue_key: Option<&str>) -> Result<String, ApiError> {
+async fn ensure_item(app: &App, title: Option<&str>, issue_key: Option<&str>, desk: Option<&str>) -> Result<String, ApiError> {
     let now = now_ms();
     if let Some(key) = issue_key.map(str::trim).filter(|k| !k.is_empty()) {
         let key = key.to_ascii_uppercase();
@@ -289,11 +316,34 @@ async fn ensure_item(app: &App, title: Option<&str>, issue_key: Option<&str>) ->
         return Ok(app.db.write(|st| st.create_item(&title, Some(issue), now)));
     }
     let title = title.map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("give an issue key or a title"))?;
-    Ok(app.db.write(|st| st.create_item(title, None, now)))
+    // A standalone item's desk is asked when it is made (decision 11).
+    let desk_id = app.db.read(|st| {
+        if st.desks.is_empty() {
+            return Ok(None);
+        }
+        match desk.map(str::trim).filter(|d| !d.is_empty()) {
+            Some(d) if d.eq_ignore_ascii_case("none") => Ok(None),
+            Some(d) => st.desk_by_name_or_id(d).map(|k| Some(k.id.clone())).ok_or_else(|| missing(format!("no desk {d:?}"))),
+            None => {
+                let names: Vec<String> = st.desks.values().map(|k| format!("{} ({})", k.name, k.id)).collect();
+                Err(bad(format!(
+                    "a standalone work item needs its desk — ask the user which: {}, or none",
+                    names.join(", ")
+                )))
+            }
+        }
+    })?;
+    Ok(app.db.write(|st| {
+        let id = st.create_item(title, None, now);
+        if let Some(i) = st.items.get_mut(&id) {
+            i.desk_id = desk_id;
+        }
+        id
+    }))
 }
 
 async fn create_item(Ax(app): Ax<Shared>, Json(b): Json<NewItem>) -> ApiResult {
-    let id = ensure_item(&app, b.title.as_deref(), b.issue_key.as_deref()).await?;
+    let id = ensure_item(&app, b.title.as_deref(), b.issue_key.as_deref(), b.desk.as_deref()).await?;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -443,6 +493,8 @@ struct Assign {
     #[serde(default)]
     new_title: Option<String>,
     #[serde(default)]
+    desk: Option<String>,
+    #[serde(default)]
     untracked: bool,
 }
 
@@ -452,6 +504,7 @@ async fn assign_session(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): J
         st.sessions.entry(sid.clone()).or_insert_with(|| store::Session {
             id: sid.clone(),
             cwd: String::new(),
+            desk_id: None,
             item_id: None,
             ignored: false,
             started_ms: now,
@@ -469,7 +522,7 @@ async fn assign_session(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): J
     }
     let item_id = match b.item_id.filter(|i| !i.is_empty()) {
         Some(i) => i,
-        None => ensure_item(&app, b.new_title.as_deref(), b.issue_key.as_deref()).await?,
+        None => ensure_item(&app, b.new_title.as_deref(), b.issue_key.as_deref(), b.desk.as_deref()).await?,
     };
     let ok = app.db.write(|st| st.assign_session(&sid, &item_id, now, &LocalDays, &RealGit));
     if !ok {
@@ -605,6 +658,14 @@ pub fn polish_prompt(item_label: &str, date: &str, hours: f64, lines: &[store::L
     for l in lines.iter().take(60) {
         p.push_str(&format!("- [{}] {}\n", l.source, l.text));
     }
+    if targets.is_empty() {
+        p.push_str(
+            "\nWrite `note`: one or two plain sentences in the past tense saying what was done, the way a \
+             consultant writes a timesheet line — concrete, no filler, no hype. Start with the issue key \
+             when there is one. Reply with exactly one JSON object: {\"note\": \"...\"}",
+        );
+        return p;
+    }
     p.push_str("\nHarvest projects and tasks this person can log to (account_id / project_id / task_id: client / project / task):\n");
     for t in targets.iter().take(80) {
         p.push_str(&format!(
@@ -647,8 +708,14 @@ async fn polish_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
         let lines = st.tiles.get(&id).map(|t| t.lines.clone()).unwrap_or_default();
         Ok::<_, ApiError>((label, t["hours"].as_f64().unwrap_or(0.0), lines))
     })?;
-    let targets = cached_targets(&app).await?;
-    let recent = cached_recent(&app).await;
+    let (desk_target, _) = app.db.read(|st| st.tile_target(&item, &date));
+    // A desk names its Harvest project and task (decision 10 of the open-desk
+    // proposal): Claude drafts only the note, and no targets are fetched.
+    let (targets, recent) = if desk_target.is_some() {
+        (vec![], vec![])
+    } else {
+        (cached_targets(&app).await?, cached_recent(&app).await)
+    };
     let prompt = polish_prompt(&label, &date, hours, &lines, &targets, &recent);
     let reply = claude::ask(
         "You write Harvest timesheet notes and choose the Harvest project and task time belongs to. Reply with one JSON object and nothing else.",
@@ -687,7 +754,7 @@ async fn approve_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult 
     let (target, note, hours, seconds) = app.db.read(|st| {
         require_open(st, &id)?;
         let t = st.tiles.get(&id);
-        let target = t.and_then(|t| t.harvest.clone()).ok_or_else(|| bad("pick a Harvest project and task first, or Polish to have Claude guess one"))?;
+        let target = st.tile_target(&item, &date).0.ok_or_else(|| bad("pick a Harvest project and task first, or Polish to have Claude guess one"))?;
         let note = t
             .and_then(|t| t.note.clone())
             .filter(|n| !n.trim().is_empty())
@@ -891,8 +958,16 @@ async fn linear_issue(Path(key): Path<String>) -> ApiResult {
     Ok(Json(linear::read_issue(&linear_accounts()?, key.trim()).await?))
 }
 
-async fn linear_mine() -> ApiResult {
-    Ok(Json(json!({ "issues": linear::my_issues(&linear_accounts()?).await? })))
+fn open_linear(app: &App) -> Option<store::LinearBinding> {
+    app.db.read(|st| st.open_desk.as_ref().and_then(|k| st.desks.get(k)).and_then(|d| d.linear.clone()))
+}
+
+async fn linear_mine(Ax(app): Ax<Shared>) -> ApiResult {
+    let scope = open_linear(&app);
+    Ok(Json(json!({
+        "scope": scope.as_ref().map(|b| b.project_name.clone()),
+        "issues": linear::my_issues(&linear_accounts()?, scope.as_ref()).await?,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -900,11 +975,15 @@ struct SearchBody {
     query: String,
 }
 
-async fn linear_search(Json(b): Json<SearchBody>) -> ApiResult {
+async fn linear_search(Ax(app): Ax<Shared>, Json(b): Json<SearchBody>) -> ApiResult {
     if b.query.trim().is_empty() {
         return Err(bad("an empty search"));
     }
-    Ok(Json(json!({ "issues": linear::search(&linear_accounts()?, &b.query).await? })))
+    let scope = open_linear(&app);
+    Ok(Json(json!({
+        "scope": scope.as_ref().map(|b| b.project_name.clone()),
+        "issues": linear::search(&linear_accounts()?, &b.query, scope.as_ref()).await?,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -951,11 +1030,21 @@ fn clean(s: &Option<String>) -> Option<String> {
 async fn create_draft(Ax(app): Ax<Shared>, Json(b): Json<NewDraft>) -> ApiResult {
     let now = now_ms();
     let issue_key = clean(&b.issue_key).map(|k| k.to_ascii_uppercase());
-    let team_key = clean(&b.team_key).map(|k| k.to_ascii_uppercase());
+    let desk_linear = open_linear(&app);
+    let named_team = clean(&b.team_key).map(|k| k.to_ascii_uppercase());
+    // A new issue with no team named goes into the open desk's project.
+    let project_id = if b.kind == "linear_issue" && named_team.is_none() {
+        desk_linear.as_ref().map(|l| l.project_id.clone()).filter(|p| !p.is_empty())
+    } else {
+        None
+    };
+    let team_key = named_team.or_else(|| desk_linear.as_ref().filter(|_| b.kind == "linear_issue").map(|l| l.team_key.clone()).filter(|k| !k.is_empty()));
     let title = clean(&b.title);
     match b.kind.as_str() {
         "linear_comment" if issue_key.is_none() => return Err(bad("a comment draft needs issue_key")),
-        "linear_issue" if team_key.is_none() || title.is_none() => return Err(bad("an issue draft needs team_key and title")),
+        "linear_issue" if team_key.is_none() || title.is_none() => {
+            return Err(bad("an issue draft needs a title, and a team_key when no desk is open"))
+        }
         "linear_comment" | "linear_issue" => {}
         k => return Err(bad(format!("unknown draft kind {k:?}; linear_comment or linear_issue"))),
     }
@@ -981,6 +1070,7 @@ async fn create_draft(Ax(app): Ax<Shared>, Json(b): Json<NewDraft>) -> ApiResult
                 created_ms: now,
                 status: "open".into(),
                 url: None,
+                project_id,
             },
         );
         id
@@ -1026,6 +1116,7 @@ async fn send_draft(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
                 d.team_key.as_deref().unwrap_or_default(),
                 d.title.as_deref().unwrap_or_default(),
                 &d.body,
+                d.project_id.as_deref(),
             )
             .await?;
             // A standalone card the agent was on gains the issue it filed.
@@ -1095,6 +1186,8 @@ struct TimerBody {
     issue_key: Option<String>,
     #[serde(default)]
     new_title: Option<String>,
+    #[serde(default)]
+    desk: Option<String>,
 }
 
 /// The manual timer, for work away from Claude Code — what harvest:track
@@ -1102,7 +1195,7 @@ struct TimerBody {
 async fn timer_start(Ax(app): Ax<Shared>, Json(b): Json<TimerBody>) -> ApiResult {
     let item_id = match clean(&b.item_id) {
         Some(i) => i,
-        None => ensure_item(&app, b.new_title.as_deref(), b.issue_key.as_deref()).await?,
+        None => ensure_item(&app, b.new_title.as_deref(), b.issue_key.as_deref(), b.desk.as_deref()).await?,
     };
     let now = now_ms();
     if !app.db.write(|st| st.start_timer(&item_id, now, &LocalDays)) {
@@ -1118,6 +1211,228 @@ async fn timer_stop(Ax(app): Ax<Shared>) -> ApiResult {
         Some(t) => Ok(Json(json!({ "item_id": t.item_id, "minutes": (now - t.started_ms) / 60_000 }))),
         None => Ok(Json(json!({ "stopped": false, "note": "no timer was running" }))),
     }
+}
+
+// ---------------------------------------------------------------- desks
+//
+// One desk per project (embarch-open-desk-proposal.md): a Linear project, a
+// Harvest project and task, GitHub repos, firmware repos, a saved bench. One
+// is open suite-wide, or none. Other processes read the open one from
+// `open-desk.json` beside the state file, so neither embarch-api nor
+// embarch-ui has to reach this service to know it.
+
+pub fn publish_open(app: &App) {
+    let body = app.db.read(|st| json!({ "desk": st.open_desk.as_ref().and_then(|k| st.desks.get(k)) }));
+    let path = match crate::paths::data_dir() {
+        Ok(d) => d.join("open-desk.json"),
+        Err(_) => return,
+    };
+    if let Err(e) = crate::paths::write_private(&path, body.to_string().as_bytes()) {
+        tracing::warn!("publishing the open desk failed: {e:#}");
+    }
+}
+
+async fn list_desks(Ax(app): Ax<Shared>) -> ApiResult {
+    Ok(Json(app.db.read(|st| json!({ "desks": st.desks.values().collect::<Vec<_>>(), "open": st.open_desk }))))
+}
+
+#[derive(Deserialize)]
+struct DeskBody {
+    #[serde(default)]
+    id: Option<String>,
+    name: String,
+    #[serde(default)]
+    linear: Option<store::LinearBinding>,
+    #[serde(default)]
+    harvest: Option<HarvestTarget>,
+    #[serde(default)]
+    github_repos: Vec<String>,
+    #[serde(default)]
+    firmware_repos: Vec<String>,
+    #[serde(default)]
+    bench: Option<String>,
+}
+
+/// Make or edit a desk, from the Desk tab's form.
+async fn put_desk(Ax(app): Ax<Shared>, Json(b): Json<DeskBody>) -> ApiResult {
+    let name = b.name.trim().to_string();
+    if name.is_empty() {
+        return Err(bad("a desk needs a name"));
+    }
+    let mut repos = vec![];
+    for r in b.firmware_repos.iter().map(|r| r.trim().trim_end_matches('/')).filter(|r| !r.is_empty()) {
+        let path = std::fs::canonicalize(r).map_err(|_| bad(format!("{r} is not a folder on this machine")))?;
+        if !path.is_dir() {
+            return Err(bad(format!("{r} is not a folder")));
+        }
+        repos.push(path.display().to_string());
+    }
+    let github: Vec<String> = b
+        .github_repos
+        .iter()
+        .map(|r| r.trim().trim_start_matches("https://github.com/").trim_end_matches(".git").to_string())
+        .filter(|r| !r.is_empty())
+        .collect();
+    if let Some(bad_repo) = github.iter().find(|r| r.split('/').count() != 2) {
+        return Err(bad(format!("{bad_repo} is not owner/repo")));
+    }
+    let id = app.db.write(|st| {
+        let id = b.id.clone().filter(|i| st.desks.contains_key(i)).unwrap_or_default();
+        // A firmware repo belongs to at most one desk: two desks naming one
+        // repo could not say whose a session there is.
+        if let Some((other, repo)) = st
+            .desks
+            .values()
+            .filter(|d| d.id != id)
+            .find_map(|d| repos.iter().find(|r| d.firmware_repos.contains(r)).map(|r| (d.name.clone(), r.clone())))
+        {
+            return Err(bad(format!("{repo} is already the desk {other:?}'s")));
+        }
+        let created = st.desks.get(&id).map(|d| d.created_ms).unwrap_or_default();
+        let desk = store::Desk {
+            id,
+            name,
+            linear: b.linear.clone(),
+            harvest: b.harvest.clone(),
+            github_repos: github,
+            firmware_repos: repos,
+            bench: b.bench.clone().filter(|x| !x.trim().is_empty()),
+            created_ms: created,
+        };
+        Ok(st.put_desk(desk, now_ms()))
+    })?;
+    publish_open(&app);
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn delete_desk(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
+    let found = app.db.write(|st| {
+        let found = st.desks.remove(&id).is_some();
+        for i in st.items.values_mut().filter(|i| i.desk_id.as_deref() == Some(id.as_str())) {
+            i.desk_id = None;
+        }
+        if st.open_desk.as_deref() == Some(id.as_str()) {
+            st.open_desk = None;
+        }
+        found
+    });
+    if !found {
+        return Err(missing("no such desk"));
+    }
+    publish_open(&app);
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn get_open(Ax(app): Ax<Shared>) -> ApiResult {
+    Ok(Json(app.db.read(|st| json!({ "desk": st.open_desk.as_ref().and_then(|k| st.desks.get(k)) }))))
+}
+
+#[derive(Deserialize)]
+struct OpenBody {
+    /// A desk's id or name; absent, null or "none" opens no desk.
+    #[serde(default)]
+    desk: Option<String>,
+}
+
+/// Open a desk suite-wide (or none). Touches no hardware: its bench is only
+/// proposed, by the UI, and applied on the user's click.
+async fn set_open(Ax(app): Ax<Shared>, Json(b): Json<OpenBody>) -> ApiResult {
+    let want = b.desk.map(|d| d.trim().to_string()).filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case("none"));
+    let desk = app.db.write(|st| match want {
+        None => {
+            st.open_desk = None;
+            Ok::<_, ApiError>(None)
+        }
+        Some(w) => {
+            let d = st.desk_by_name_or_id(&w).cloned().ok_or_else(|| {
+                let names: Vec<String> = st.desks.values().map(|k| k.name.clone()).collect();
+                missing(format!("no desk {w:?}; there are: {}", names.join(", ")))
+            })?;
+            st.open_desk = Some(d.id.clone());
+            Ok(Some(d))
+        }
+    })?;
+    publish_open(&app);
+    app.cache.lock().expect("cache").pr_checked.clear();
+    Ok(Json(json!({ "desk": desk })))
+}
+
+async fn linear_projects() -> ApiResult {
+    Ok(Json(json!({ "projects": linear::projects(&linear_accounts()?).await? })))
+}
+
+async fn github_repos() -> ApiResult {
+    let conns = Connectors::load()?;
+    Ok(Json(json!({ "repos": github::user_repos(&conns.github_accounts()).await? })))
+}
+
+/// One day's work, grouped by desk — the open one first — for the list under
+/// the cards: every work item with time, a line, bench activity or a session
+/// that day, with its links, what was done, its status and sessions.
+pub fn day_json(st: &State, date: &str, now: i64) -> Value {
+    let days = LocalDays;
+    let mut rows: Vec<(Option<String>, Value)> = vec![];
+    for item in st.items.values() {
+        let seconds = st.tile_seconds(&item.id, date);
+        let tile = st.tiles.get(&format!("{}@{date}", item.id));
+        let sessions: Vec<&store::Session> = st
+            .sessions
+            .values()
+            .filter(|s| !s.ignored && !State::is_timer_session(&s.id))
+            .filter(|s| s.spans.iter().any(|sp| sp.date == date && sp.item_id.as_deref() == Some(item.id.as_str())))
+            .collect();
+        let bench: Vec<&store::BenchEvent> = item.bench.iter().filter(|b| days.date(b.ms) == date).collect();
+        let lines = tile.map(|t| t.lines.clone()).unwrap_or_default();
+        if seconds == 0 && lines.is_empty() && bench.is_empty() && sessions.is_empty() {
+            continue;
+        }
+        let t = tile_json(st, &item.id, date);
+        rows.push((
+            item.desk_id.clone(),
+            json!({
+                "id": item.id,
+                "title": item.title,
+                "issue": item.issue,
+                "prs": item.prs,
+                "hours": t["hours"],
+                "status": t["status"],
+                "harvest": t["harvest"],
+                "lines": lines,
+                "note": tile.and_then(|t| t.note.clone()),
+                "sessions": sessions.len(),
+                "live": sessions.iter().filter(|s| !s.ended && now - s.last_ms < 30 * 60_000).count(),
+                "bench": bench.len(),
+                "bench_failed": bench.iter().filter(|b| !b.ok).count(),
+            }),
+        ));
+    }
+    let mut groups: Vec<(i32, String, Option<String>, Vec<Value>)> = vec![];
+    for (desk, row) in rows {
+        let (rank, name) = match &desk {
+            Some(k) if st.open_desk.as_ref() == Some(k) => (0, st.desks.get(k).map(|d| d.name.clone()).unwrap_or_default()),
+            Some(k) => (1, st.desks.get(k).map(|d| d.name.clone()).unwrap_or_else(|| k.clone())),
+            None => (2, "No desk".to_string()),
+        };
+        match groups.iter_mut().find(|g| g.2 == desk) {
+            Some(g) => g.3.push(row),
+            None => groups.push((rank, name, desk, vec![row])),
+        }
+    }
+    groups.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    let total: f64 = groups.iter().flat_map(|g| g.3.iter()).filter_map(|r| r["hours"].as_f64()).sum();
+    json!({
+        "date": date,
+        "total_hours": (total * 100.0).round() / 100.0,
+        "groups": groups.into_iter().map(|(_, name, desk, items)| json!({ "desk": desk, "name": name, "items": items })).collect::<Vec<_>>(),
+    })
+}
+
+async fn day(Ax(app): Ax<Shared>, Path(date): Path<String>) -> ApiResult {
+    if chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").is_err() {
+        return Err(bad(format!("{date} is not a YYYY-MM-DD date")));
+    }
+    let now = now_ms();
+    Ok(Json(app.db.read(|st| day_json(st, &date, now))))
 }
 
 // ---------------------------------------------------------------- sync
@@ -1155,24 +1470,36 @@ pub async fn sync_once(app: &App, force_issues: bool) {
     }
 
     let open = app.db.read(open_tile_keys);
-    let cards: Vec<(String, Option<store::IssueRef>, bool)> = app.db.read(|st| {
+    type Card = (String, Option<store::IssueRef>, bool, Vec<String>);
+    let cards: Vec<Card> = app.db.read(|st| {
         st.items
             .values()
             .filter(|i| visible(st, i, now, app.window_days, &open))
-            .map(|i| (i.id.clone(), i.issue.clone(), i.repo_path.is_none()))
+            .map(|i| {
+                let repos = i.desk_id.as_ref().and_then(|k| st.desks.get(k)).map(|d| d.github_repos.clone()).unwrap_or_default();
+                (i.id.clone(), i.issue.clone(), i.repo_path.is_none(), repos)
+            })
             .collect()
     });
     let gh = conns.github_accounts();
-    for (id, issue, needs_repo) in cards {
+    for (id, issue, needs_repo, repos) in cards {
         let Some(issue) = issue else { continue };
         if force_issues || now - issue.refreshed_ms > 3 * 60_000 {
             if let Ok(Some(fresh)) = linear::refresh_issue(&conns.linear, &issue, now).await {
-                app.db.write(|st| st.items.get_mut(&id).map(|i| i.issue = Some(fresh)));
+                app.db.write(|st| {
+                    let desk = st.desk_for_issue(&fresh);
+                    if let Some(i) = st.items.get_mut(&id) {
+                        if i.desk_id.is_none() {
+                            i.desk_id = desk;
+                        }
+                        i.issue = Some(fresh);
+                    }
+                });
             }
         }
         let due = now - app.cache.lock().expect("cache").pr_checked.get(&id).copied().unwrap_or(0) > 5 * 60_000;
         if due && !gh.is_empty() {
-            if let Ok(prs) = github::prs_for(&gh, &issue.key).await {
+            if let Ok(prs) = github::prs_for(&gh, &issue.key, &repos).await {
                 let clone = if needs_repo { prs.first().and_then(|p| localrepo::find_clone(&p.repo)) } else { None };
                 app.db.write(|st| {
                     if let Some(i) = st.items.get_mut(&id) {
@@ -1291,6 +1618,7 @@ mod tests {
             st.drafts.insert(id.into(), store::Draft {
                 id: id.into(), kind: "linear_comment".into(), issue_key: Some("ABC-1".into()), team_key: None,
                 title: None, body: "x".into(), item_id: None, created_ms: D0, status: status.into(), url: None,
+                project_id: None,
             });
         }
         st.start_timer(&a, D0 + H, &UtcDays);
@@ -1300,6 +1628,50 @@ mod tests {
         assert_eq!(v["timer"]["seconds"], 3600);
         assert_eq!(v["cards"][0]["sessions"]["total"], 0, "the timer is not counted as a Claude session");
         assert_eq!(v["sessions_waiting"], 0);
+    }
+
+    #[test]
+    fn an_open_desk_scopes_the_cards_and_other_desks_unsent_tiles_wait_in_a_strip() {
+        let mut st = State::default();
+        let a = st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0);
+        let b = st.put_desk(store::Desk { name: "Beta".into(), ..Default::default() }, D0);
+        let wa = st.create_item("on alpha", None, D0);
+        let wb = st.create_item("on beta", None, D0);
+        st.items.get_mut(&wa).unwrap().desk_id = Some(a.clone());
+        st.items.get_mut(&wb).unwrap().desk_id = Some(b.clone());
+        let mut s1 = crate::store::testing::session("s");
+        s1.item_id = Some(wb.clone());
+        crate::store::record_activity(&mut s1, D0 + 9 * H, &UtcDays);
+        crate::store::record_activity(&mut s1, D0 + 10 * H, &UtcDays);
+        st.sessions.insert("s".into(), s1);
+        st.open_desk = Some(a.clone());
+        let v = view_json(&st, &Cache::default(), D0 + 11 * H, 7, &UtcDays);
+        let cards: Vec<&str> = v["cards"].as_array().unwrap().iter().map(|c| c["title"].as_str().unwrap()).collect();
+        assert_eq!(cards, ["on alpha"]);
+        assert_eq!(v["elsewhere"][0]["item_title"], "on beta");
+        assert_eq!(v["elsewhere"][0]["desk"], "Beta");
+        assert_eq!(v["open_desk"]["name"], "Alpha");
+        st.open_desk = None;
+        let all = view_json(&st, &Cache::default(), D0 + 11 * H, 7, &UtcDays);
+        assert_eq!(all["cards"].as_array().unwrap().len(), 2, "no desk open shows every card");
+    }
+
+    #[test]
+    fn the_day_list_groups_by_desk_with_the_open_one_first() {
+        let mut st = State::default();
+        let a = st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0);
+        let b = st.put_desk(store::Desk { name: "Beta".into(), ..Default::default() }, D0);
+        for (title, desk) in [("one", &a), ("two", &b)] {
+            let w = st.create_item(title, None, D0);
+            st.items.get_mut(&w).unwrap().desk_id = Some(desk.clone());
+            st.add_line(&w, "2026-10-22", "did a thing", "agent", D0 + H);
+        }
+        st.open_desk = Some(b.clone());
+        let d = day_json(&st, "2026-10-22", D0 + 2 * H);
+        let names: Vec<&str> = d["groups"].as_array().unwrap().iter().map(|g| g["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["Beta", "Alpha"]);
+        assert_eq!(d["groups"][0]["items"][0]["lines"][0]["text"], "did a thing");
+        assert_eq!(day_json(&st, "2026-10-21", D0)["groups"].as_array().unwrap().len(), 0);
     }
 
     #[test]
