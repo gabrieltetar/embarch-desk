@@ -165,6 +165,20 @@ fn visible(st: &State, item: &store::WorkItem, now: i64, window_days: i64, open_
             || open_tiles.iter().any(|(i, d)| i == &item.id && st.tile_seconds(i, d) > 0))
 }
 
+/// A tile's lines as the routes hand them out: each note under the field
+/// names `/notes` uses (`id`, `ts_ms`), with `ms` kept for the clients
+/// that read it (chat-desk proposal, Interface).
+fn lines_json(lines: &[store::Line]) -> Vec<Value> {
+    lines
+        .iter()
+        .map(|l| {
+            let mut v = json!(l);
+            v["ts_ms"] = json!(l.ms);
+            v
+        })
+        .collect()
+}
+
 fn tile_json(st: &State, item_id: &str, date: &str) -> Value {
     let id = format!("{item_id}@{date}");
     let seconds = st.tile_seconds(item_id, date);
@@ -182,7 +196,7 @@ fn tile_json(st: &State, item_id: &str, date: &str) -> Value {
         "computed_hours": computed,
         "captured_hours": (captured * 100.0).round() / 100.0,
         "logged_hours": (logged * 100.0).round() / 100.0,
-        "lines": t.map(|t| t.lines.clone()).unwrap_or_default(),
+        "lines": lines_json(t.map(|t| t.lines.as_slice()).unwrap_or_default()),
         "note": t.and_then(|t| t.note.clone()),
         "harvest": st.tile_target(item_id, date).0,
         "harvest_from_desk": st.tile_target(item_id, date).1,
@@ -414,8 +428,8 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, desk: Op
     })
 }
 
-/// Only a running timer moves on a read: anything else marked dirty here
-/// would rewrite the whole state file every time a window polls.
+/// A running timer's span moves up to `now`; with none running, the state
+/// stays clean.
 fn tick_timer(app: &App, now: i64) {
     if app.db.read(|st| st.timer.is_some()) {
         app.db.write(|st| st.tick_timer(now, &LocalDays));
@@ -434,7 +448,9 @@ async fn view(Ax(app): Ax<Shared>, Query(q): Query<ViewQuery>) -> ApiResult {
         Some(d) => Some(app.db.read(|st| st.desk_by_name_or_id(&d).map(|k| k.id.clone())).ok_or_else(|| missing(format!("no desk {d}")))?),
         None => None,
     };
-    tick_timer(&app, now);
+    // A read changes nothing, so a polling window never rewrites the state
+    // file. A running timer's tile catches up in the sync loop, within 30
+    // seconds; the view's timer counts from its start.
     let cache = app.cache.lock().expect("cache");
     Ok(Json(app.db.read(|st| view_json(st, &cache, now, app.window_days, desk.as_deref(), &LocalDays))))
 }
@@ -1600,7 +1616,7 @@ pub fn day_json(st: &State, date: &str, now: i64) -> Value {
             .filter(|s| s.spans.iter().any(|sp| sp.date == date && sp.item_id.as_deref() == Some(item.id.as_str())))
             .collect();
         let bench: Vec<&store::BenchEvent> = item.bench.iter().filter(|b| days.date(b.ms) == date).collect();
-        let lines = tile.map(|t| t.lines.clone()).unwrap_or_default();
+        let lines = lines_json(tile.map(|t| t.lines.as_slice()).unwrap_or_default());
         let entries: Vec<&store::LoggedEntry> = st
             .harvest_logged
             .get(date)
@@ -2192,8 +2208,15 @@ pub async fn sync_once(app: &App, force_issues: bool) {
             tracing::warn!("reading Harvest for {today}: {e:#}");
         }
     }
+}
+
+/// The sync loop's other half, every 30 seconds whatever the connectors
+/// do: a running timer moves up to `now`, and stale tiles, sessions, claims
+/// and mail leave the live state. A pass that changes nothing leaves
+/// state.json alone.
+pub fn housekeep(app: &App, now: i64) {
     tick_timer(app, now);
-    let archived = app.db.write(|st| st.prune(now));
+    let archived = app.db.update(|st| st.prune(now));
     if let Err(e) = app.db.archive(&archived) {
         tracing::warn!("archiving tiles failed: {e:#}");
     }
@@ -2227,7 +2250,30 @@ pub async fn sync_loop(app: Shared) {
     loop {
         tick.tick().await;
         sync_once(&app, false).await;
+        housekeep(&app, now_ms());
     }
+}
+
+/// Resolves once the desk is told to stop — Ctrl-C at a terminal, or the
+/// SIGTERM systemd sends on every stop and restart — and saves the state on
+/// the way out, so a deploy drops none of the last two seconds' hooks. The
+/// SIGTERM handler is in place when this returns, not when it is first
+/// polled.
+pub fn save_on_stop(app: Shared) -> std::io::Result<impl std::future::Future<Output = ()>> {
+    #[cfg(unix)]
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    Ok(async move {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+        if let Err(e) = app.db.flush() {
+            tracing::warn!("saving state on the way out failed: {e:#}");
+        }
+    })
 }
 
 pub async fn flush_loop(app: Shared) {
@@ -2521,20 +2567,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reading_the_view_rewrites_the_state_only_while_a_timer_runs() {
+    async fn reading_the_view_never_rewrites_the_state_and_the_sync_loop_ticks_a_timer() {
+        let (app, dir) = scratch_app();
+        let w = app.db.write(|st| st.create_item("x", None, D0));
+        let saved = || {
+            app.db.flush().unwrap();
+            std::fs::remove_file(dir.join("state.json")).is_ok()
+        };
+        assert!(saved());
+        assert!(view(Ax(app.clone()), Query(ViewQuery::default())).await.is_ok());
+        assert!(!saved(), "a poll with nothing running changes nothing");
+        let now = now_ms();
+        app.db.write(|st| st.start_timer(&w, now, &LocalDays));
+        assert!(saved());
+        assert!(view(Ax(app.clone()), Query(ViewQuery::default())).await.is_ok());
+        assert!(!saved(), "a running timer is not ticked by a poll either");
+        housekeep(&app, now + 60_000);
+        assert!(saved(), "the sync loop ticks it");
+        let sid = app.db.read(|st| st.timer.as_ref().unwrap().session_id.clone());
+        assert_eq!(app.db.read(|st| st.sessions[&sid].last_ms), now + 60_000);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_housekeeping_pass_that_removes_nothing_leaves_the_state_file_alone() {
         let (app, dir) = scratch_app();
         let w = app.db.write(|st| st.create_item("x", None, D0));
         app.db.flush().unwrap();
         std::fs::remove_file(dir.join("state.json")).unwrap();
-        assert!(view(Ax(app.clone()), Query(ViewQuery::default())).await.is_ok());
+        let now = now_ms();
+        housekeep(&app, now);
         app.db.flush().unwrap();
-        assert!(!dir.join("state.json").exists(), "a poll with nothing running changes nothing");
-        app.db.write(|st| st.start_timer(&w, now_ms(), &LocalDays));
+        assert!(!dir.join("state.json").exists(), "a prune with nothing to do rewrote state.json");
+        app.db.write(|st| {
+            let t = st.tile_mut(&w, "2026-10-22");
+            t.status = TileStatus::Approved;
+            t.acted_ms = Some(now - 8 * 24 * H);
+        });
         app.db.flush().unwrap();
         std::fs::remove_file(dir.join("state.json")).unwrap();
-        assert!(view(Ax(app.clone()), Query(ViewQuery::default())).await.is_ok());
+        housekeep(&app, now);
         app.db.flush().unwrap();
-        assert!(dir.join("state.json").exists(), "a running timer ticks on a read");
+        assert!(dir.join("state.json").exists(), "archiving a tile is a change");
+        assert!(dir.join("history/2026-10.jsonl").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn sigterm_stops_the_desk_and_saves_the_state() {
+        let (app, dir) = scratch_app();
+        app.db.write(|st| st.create_item("x", None, D0));
+        let stop = save_on_stop(app.clone()).unwrap();
+        // systemd stops and restarts the service with SIGTERM.
+        let kill = std::process::Command::new("kill").args(["-TERM", &std::process::id().to_string()]).status().unwrap();
+        assert!(kill.success());
+        tokio::time::timeout(std::time::Duration::from_secs(5), stop).await.expect("SIGTERM stops the desk");
+        assert!(dir.join("state.json").exists(), "the state is saved on the way out");
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -2590,6 +2678,31 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_session_whose_start_was_lost_stays_live_on_its_card() {
+        let mut st = State::default();
+        let git = crate::store::testing::FakeGit::default();
+        let w = st.create_item("x", None, D0);
+        let hook = |st: &mut State, name: &str, at: i64| {
+            let ev: events::HookEvent = serde_json::from_value(json!({"hook_event_name": name, "session_id": "s", "cwd": "/w/r"})).unwrap();
+            events::apply(st, &ev, at, &UtcDays, &git, 7);
+        };
+        hook(&mut st, "SessionStart", D0);
+        st.assign_session("s", &w, D0, &UtcDays, &git);
+        hook(&mut st, "SessionEnd", D0 + H);
+        // Resumed while the desk restarted: no SessionStart.
+        hook(&mut st, "UserPromptSubmit", D0 + 2 * H);
+        hook(&mut st, "PostToolUse", D0 + 2 * H + 60_000);
+        let v = view_json(&st, &Cache::default(), D0 + 2 * H + 61_000, 7, None, &UtcDays);
+        assert_eq!(v["cards"][0]["sessions"]["live"], 1, "{v}");
+        assert_eq!(v["cards"][0]["live_sessions"][0]["state"], "busy");
+        // A hook newer than the last claude agents read says busy, not ended.
+        let mut cache = Cache { agents_ms: D0 + 2 * H + 30_000, ..Default::default() };
+        cache.agents.insert("s".into(), json!({"sessionId": "s", "status": "busy"}));
+        let v = view_json(&st, &cache, D0 + 2 * H + 61_000, 7, None, &UtcDays);
+        assert_eq!(v["cards"][0]["live_sessions"][0]["state"], "busy");
+    }
+
+    #[test]
     fn a_window_on_another_desk_reads_that_desks_cards() {
         let mut st = State::default();
         let a = st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0);
@@ -2629,6 +2742,20 @@ mod tests {
         st.add_line(&w, "2026-10-21", "older day, added now", "user", D0 + 3 * H);
         let v = view_json(&st, &Cache::default(), D0 + 4 * H, 7, None, &UtcDays);
         assert_eq!(v["cards"][0]["notes_ms"], D0 + 3 * H);
+    }
+
+    #[test]
+    fn a_view_tile_line_names_its_fields_as_notes_does() {
+        let mut st = State::default();
+        let w = st.create_item("x", None, D0);
+        st.add_line(&w, "2026-10-22", "built it", "agent", D0 + H);
+        let v = view_json(&st, &Cache::default(), D0 + 2 * H, 7, None, &UtcDays);
+        let note = brief::note_json(st.item_notes(&w)[0], true, &UtcDays);
+        for line in [&v["cards"][0]["tiles"][0]["lines"][0], &v["day"]["groups"][0]["items"][0]["lines"][0]] {
+            assert_eq!((&line["id"], &line["ts_ms"]), (&note["id"], &note["ts_ms"]), "{line}");
+            assert!(!note["id"].as_str().unwrap().is_empty());
+            assert_eq!(line["ms"], D0 + H, "kept for the clients that read it");
+        }
     }
 
     #[test]

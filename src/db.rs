@@ -44,6 +44,17 @@ impl Db {
         r
     }
 
+    /// A write that may change nothing: `f` says whether it did, and only
+    /// then is the state marked dirty — a periodic pass with nothing to do
+    /// leaves the file alone.
+    pub fn update<R>(&self, f: impl FnOnce(&mut State) -> (R, bool)) -> R {
+        let (r, changed) = f(&mut self.state.lock().expect("state lock"));
+        if changed {
+            self.dirty.store(true, Ordering::Release);
+        }
+        r
+    }
+
     pub fn flush(&self) -> Result<()> {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Ok(());

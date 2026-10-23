@@ -798,14 +798,23 @@ impl State {
     /// A day's notes on an item, every kind, oldest first: what the Harvest
     /// note summarises (proposal 43). The day's tile's lines are its own
     /// whenever they were added — tiles stay open, so a line added to
-    /// yesterday's this morning is yesterday's; the notes kept on the item
-    /// itself count on the day they were taken. A memory file written
-    /// several times that day is one note, as it stood last.
+    /// yesterday's this morning is yesterday's; the memory notes kept on
+    /// the item itself count on the day they were taken. The only other
+    /// notes kept there are archived tiles' lines, whose day was sent or
+    /// discarded a week before, so none of them is any later day's work. A
+    /// memory file written several times that day is one note, as it stood
+    /// last.
     pub fn day_notes(&self, item_id: &str, date: &str, days: &dyn Days) -> Vec<Line> {
-        let mut kept: Vec<&Line> = self.notes.get(item_id).into_iter().flatten().filter(|l| days.date(l.ms) == date).collect();
+        let mut kept: Vec<&Line> = self
+            .notes
+            .get(item_id)
+            .into_iter()
+            .flatten()
+            .filter(|l| l.is_memory() && days.date(l.ms) == date)
+            .collect();
         kept.sort_by_key(|l| std::cmp::Reverse(l.ms));
         let mut seen = std::collections::HashSet::new();
-        kept.retain(|l| !l.is_memory() || seen.insert(&l.source_path));
+        kept.retain(|l| seen.insert(&l.source_path));
         let tile = self.tiles.get(&format!("{item_id}@{date}")).into_iter().flat_map(|t| t.lines.iter());
         let mut out: Vec<Line> = tile.chain(kept).cloned().collect();
         out.sort_by_key(|l| l.ms);
@@ -1074,7 +1083,8 @@ impl State {
     }
 
     /// Bring a running timer's span up to `now`. A timer is never idle, so
-    /// the 8-hour gap rule must not end it: tick it as often as the view is read.
+    /// the 8-hour gap rule must not end it: the sync loop ticks it every 30
+    /// seconds.
     pub fn tick_timer(&mut self, now: i64, days: &dyn Days) {
         let Some(t) = self.timer.clone() else { return };
         if let Some(s) = self.sessions.get_mut(&t.session_id) {
@@ -1115,8 +1125,10 @@ impl State {
 
     /// Move acted-on tiles past [`ARCHIVE_AFTER_MS`] out of the live state
     /// and drop sessions nothing open depends on. Returns the archived tiles
-    /// for the caller to append to history.
-    pub fn prune(&mut self, now: i64) -> Vec<Tile> {
+    /// for the caller to append to history, and whether anything at all was
+    /// removed, so a pass that removed nothing leaves the state file alone.
+    pub fn prune(&mut self, now: i64) -> (Vec<Tile>, bool) {
+        let before = (self.sessions.len(), self.pending_launches.len(), self.mailbox.len(), self.harvest_logged.len());
         let old: Vec<String> = self
             .tiles
             .values()
@@ -1152,7 +1164,9 @@ impl State {
             let cutoff = cutoff.date_naive().to_string();
             self.harvest_logged.retain(|d, _| d.as_str() >= cutoff.as_str());
         }
-        archived
+        let after = (self.sessions.len(), self.pending_launches.len(), self.mailbox.len(), self.harvest_logged.len());
+        let changed = !archived.is_empty() || after != before;
+        (archived, changed)
     }
 }
 
@@ -1340,7 +1354,7 @@ mod tests {
         t.final_seconds = Some(5400);
         t.acted_ms = Some(D0);
         assert_eq!(st.tile_seconds(&w, "2026-10-22"), 5400);
-        let archived = st.prune(D0 + 8 * DAY);
+        let (archived, _) = st.prune(D0 + 8 * DAY);
         assert_eq!(archived.len(), 1);
         assert!(st.tiles.is_empty());
     }
@@ -1489,7 +1503,7 @@ mod tests {
         let t = st.tile_mut(&w, "2026-10-22");
         t.status = TileStatus::Approved;
         t.acted_ms = Some(D0);
-        assert_eq!(st.prune(D0 + 8 * DAY).len(), 1);
+        assert_eq!(st.prune(D0 + 8 * DAY).0.len(), 1);
         assert!(st.item_notes(&w).iter().any(|l| l.text == "built the loader"));
     }
 
@@ -1528,6 +1542,24 @@ mod tests {
         let day = |d: &str| st.day_notes(&w, d, &UtcDays).into_iter().map(|l| l.text).collect::<Vec<_>>();
         assert_eq!(day("2026-10-22"), ["agent line", "user line, next morning"]);
         assert_eq!(day("2026-10-23"), ["today's own line", "today's memory"]);
+    }
+
+    #[test]
+    fn an_archived_tiles_next_morning_line_stays_out_of_the_next_days_polish() {
+        let mut st = State::default();
+        let w = st.create_item("x", None, D0);
+        st.add_line(&w, "2026-10-22", "agent line", "agent", D0 + H);
+        st.add_line(&w, "2026-10-22", "user line, next morning", "user", D0 + DAY + 9 * H);
+        st.add_line(&w, "2026-10-23", "today's own line", "agent", D0 + DAY + 10 * H);
+        st.add_note(&w, "", Line::memory(D0 + DAY + 11 * H, "/m/a.md", "today's memory"));
+        let t = st.tile_mut(&w, "2026-10-22");
+        t.status = TileStatus::Approved;
+        t.acted_ms = Some(D0 + DAY + 12 * H);
+        // 10-23's tile is left open past the week 10-22's goes to history in.
+        assert_eq!(st.prune(D0 + 9 * DAY).0.len(), 1);
+        assert!(st.item_notes(&w).iter().any(|l| l.text == "user line, next morning"), "kept on the item");
+        let day: Vec<String> = st.day_notes(&w, "2026-10-23", &UtcDays).into_iter().map(|l| l.text).collect();
+        assert_eq!(day, ["today's own line", "today's memory"], "10-22's line is not 10-23's work");
     }
 
     #[test]
@@ -1575,8 +1607,9 @@ mod tests {
         assert!(st.mail_for("/w/fw-abc-1", D0 + 4).is_empty());
         assert_eq!(st.take_mail(&other, D0 + LAUNCH_CLAIM_MS), Err(TakeError::Expired));
         assert_eq!(st.take_mail("m404", D0), Err(TakeError::Unknown));
-        st.prune(D0 + LAUNCH_CLAIM_MS + 1);
+        assert!(st.prune(D0 + LAUNCH_CLAIM_MS + 1).1, "dropping expired mail is a change");
         assert!(st.mailbox.is_empty());
+        assert!(!st.prune(D0 + LAUNCH_CLAIM_MS + 2).1, "and once gone, nothing is");
         assert_eq!(norm_folder("/"), "/");
     }
 }

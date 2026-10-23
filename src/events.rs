@@ -219,11 +219,15 @@ pub fn apply(
     }
     // A resumed session lives again: the panel closes an idle chat's process
     // and resumes it on the next message (chat proposal decision 41), and a
-    // resume arrives as SessionStart. Any other event after SessionEnd is a
-    // hook delivered late, and leaves it ended.
+    // resume arrives as SessionStart. That one hook can be lost — the desk
+    // restarting, the hook timing out — so the resume's first prompt counts
+    // too: a prompt runs before its turn, and SessionEnd waits for the turn
+    // to finish, so a prompt cannot trail one. Any other event after
+    // SessionEnd — a Stop, a Notification — is a hook delivered late, and
+    // leaves it ended.
     match ev.hook_event_name.as_str() {
         "SessionEnd" => sess.ended = true,
-        "SessionStart" => sess.ended = false,
+        "SessionStart" | "UserPromptSubmit" => sess.ended = false,
         _ => {}
     }
     if sess.ended {
@@ -549,12 +553,29 @@ mod tests {
         let git = FakeGit::default();
         apply(&mut st, &ev("SessionStart", "s", "/w/r"), D0, &UtcDays, &git, 7);
         apply(&mut st, &ev("SessionEnd", "s", "/w/r"), D0 + 1, &UtcDays, &git, 7);
-        for late in ["Stop", "Notification", "PostToolUse", "UserPromptSubmit"] {
+        for late in ["Stop", "Notification", "PostToolUse"] {
             apply(&mut st, &ev(late, "s", "/w/r"), D0 + 2, &UtcDays, &git, 7);
             assert!(st.sessions["s"].ended, "{late} after SessionEnd");
         }
         apply(&mut st, &ev("SessionStart", "s", "/w/r"), D0 + 3, &UtcDays, &git, 7);
         assert!(!st.sessions["s"].ended, "a resume arrives as SessionStart");
+    }
+
+    #[test]
+    fn a_resume_whose_session_start_was_lost_lives_again_on_its_first_prompt() {
+        let mut st = State::default();
+        let git = FakeGit::default();
+        let w = st.create_item("x", None, D0);
+        apply(&mut st, &ev("SessionStart", "s", "/w/r"), D0, &UtcDays, &git, 7);
+        st.assign_session("s", &w, D0, &UtcDays, &git);
+        apply(&mut st, &ev("SessionEnd", "s", "/w/r"), D0 + H, &UtcDays, &git, 7);
+        // Resumed while the desk restarted: its SessionStart never arrived.
+        apply(&mut st, &ev("UserPromptSubmit", "s", "/w/r"), D0 + 2 * H, &UtcDays, &git, 7);
+        assert!(!st.sessions["s"].ended && st.sessions["s"].busy, "a prompt runs before its turn, so it cannot trail a SessionEnd");
+        apply(&mut st, &ev("Stop", "s", "/w/r"), D0 + 2 * H + 1, &UtcDays, &git, 7);
+        apply(&mut st, &ev("SessionEnd", "s", "/w/r"), D0 + 2 * H + 2, &UtcDays, &git, 7);
+        apply(&mut st, &ev("Stop", "s", "/w/r"), D0 + 2 * H + 3, &UtcDays, &git, 7);
+        assert!(st.sessions["s"].ended, "a late Stop still leaves it ended");
     }
 
     #[test]

@@ -209,12 +209,7 @@ async fn serve() -> Result<()> {
     tokio::spawn(async move { server::import_memories(&import_app).await });
     tokio::spawn(server::flush_loop(app.clone()));
     tokio::spawn(server::sync_loop(app.clone()));
-    let shutdown_app = app.clone();
-    axum::serve(listener, server::router(app))
-        .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            let _ = shutdown_app.db.flush();
-        })
-        .await?;
+    let stop = server::save_on_stop(app.clone())?;
+    axum::serve(listener, server::router(app)).with_graceful_shutdown(stop).await?;
     Ok(())
 }
