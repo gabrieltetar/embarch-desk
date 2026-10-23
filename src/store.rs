@@ -776,6 +776,12 @@ impl State {
             .chain(self.notes.get(item_id).into_iter().flatten())
     }
 
+    /// When the item's newest note was taken: a card re-reads its notes only
+    /// when this moves (chat-desk proposal, Interface).
+    pub fn notes_ms(&self, item_id: &str) -> Option<i64> {
+        self.notes_of(item_id).map(|l| l.ms).max()
+    }
+
     /// Each memory file's newest version on an item, newest first.
     pub fn memory_latest(&self, item_id: &str) -> Vec<&Line> {
         let mut seen: Vec<&Option<String>> = vec![];

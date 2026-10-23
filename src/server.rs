@@ -222,14 +222,29 @@ pub fn session_state(cache: &Cache, s: &store::Session) -> (&'static str, Option
     }
 }
 
+/// A card keeps this many of its ended panel chats.
+const ENDED_CHATS_KEPT: usize = 5;
+
 /// A card's live sessions (`embarch-desk-sessions-proposal.md` 6–8): the
 /// state `claude agents --json` reports, the last reply and what it waits
 /// for from the hooks, an Answer link on claude.ai (Remote Control) and a
-/// Jump into VS Code.
-fn session_rows(cache: &Cache, sessions: &[&store::Session], now: i64) -> Vec<Value> {
+/// Jump into VS Code. Its ended `embarch-chat` sessions stay too, the
+/// newest [`ENDED_CHATS_KEPT`] within the card window, so Open chat can
+/// resume one (chat-desk proposal 32).
+fn session_rows(cache: &Cache, sessions: &[&store::Session], now: i64, window_days: i64) -> Vec<Value> {
+    let live = |s: &store::Session| cache.agents.contains_key(&s.id) || (!s.ended && now - s.last_ms < 30 * 60_000);
+    let mut ended: Vec<&store::Session> = sessions
+        .iter()
+        .copied()
+        .filter(|s| !live(s) && s.ended && s.client.as_deref() == Some("embarch-chat") && now - s.last_ms < window_days * 86_400_000)
+        .collect();
+    ended.sort_by_key(|s| std::cmp::Reverse(s.last_ms));
+    ended.truncate(ENDED_CHATS_KEPT);
     let mut rows: Vec<(i64, Value)> = sessions
         .iter()
-        .filter(|s| cache.agents.contains_key(&s.id) || (!s.ended && now - s.last_ms < 30 * 60_000))
+        .copied()
+        .filter(|s| live(s))
+        .chain(ended)
         .map(|s| {
             let a = cache.agents.get(&s.id);
             let status = a.and_then(|a| a["status"].as_str()).unwrap_or(if s.ended { "ended" } else { "unknown" });
@@ -296,10 +311,13 @@ fn view_sessions(st: &State, cache: &Cache, now: i64) -> Vec<Value> {
         .collect()
 }
 
-pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, days: &dyn Days) -> Value {
+/// The Desk tab's whole view. `desk` scopes the cards to that desk instead
+/// of the open one, for a window on another desk (chat proposal 9).
+pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, desk: Option<&str>, days: &dyn Days) -> Value {
     let today = days.date(now);
     let open = open_tile_keys(st);
-    let in_open = |i: &store::WorkItem| st.open_desk.is_none() || i.desk_id == st.open_desk;
+    let scope = desk.map(str::to_string).or_else(|| st.open_desk.clone());
+    let in_open = |i: &store::WorkItem| scope.is_none() || i.desk_id == scope;
     let mut items: Vec<&store::WorkItem> =
         st.items.values().filter(|i| visible(st, i, now, window_days, &open) && in_open(i)).collect();
     // Other desks' unsent tiles, so nothing waits unseen behind a switch.
@@ -352,7 +370,8 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, days: &d
                 "last_activity_ms": item.last_activity_ms,
                 "sessions": { "live": live, "today": today_sessions, "total": sessions.len() },
                 "logged_today": (st.logged_hours(&item.id, &today) * 100.0).round() / 100.0,
-                "live_sessions": session_rows(cache, &sessions, now),
+                "live_sessions": session_rows(cache, &sessions, now, window_days),
+                "notes_ms": st.notes_ms(&item.id),
                 "bench": bench.iter().map(|(t, (n, f))| json!({ "tool": t, "count": n, "failed": f })).collect::<Vec<_>>(),
                 "tiles": tiles,
             })
@@ -403,11 +422,21 @@ fn tick_timer(app: &App, now: i64) {
     }
 }
 
-async fn view(Ax(app): Ax<Shared>) -> ApiResult {
+#[derive(Deserialize, Default)]
+struct ViewQuery {
+    #[serde(default)]
+    desk: Option<String>,
+}
+
+async fn view(Ax(app): Ax<Shared>, Query(q): Query<ViewQuery>) -> ApiResult {
     let now = now_ms();
+    let desk = match clean(&q.desk) {
+        Some(d) => Some(app.db.read(|st| st.desk_by_name_or_id(&d).map(|k| k.id.clone())).ok_or_else(|| missing(format!("no desk {d}")))?),
+        None => None,
+    };
     tick_timer(&app, now);
     let cache = app.cache.lock().expect("cache");
-    Ok(Json(app.db.read(|st| view_json(st, &cache, now, app.window_days, &LocalDays))))
+    Ok(Json(app.db.read(|st| view_json(st, &cache, now, app.window_days, desk.as_deref(), &LocalDays))))
 }
 
 // ---------------------------------------------------------------- hooks
@@ -2243,7 +2272,7 @@ mod tests {
         crate::store::record_activity(&mut s, D0 + 9 * H, &UtcDays);
         crate::store::record_activity(&mut s, D0 + 11 * H, &UtcDays);
         st.sessions.insert("s".into(), s);
-        let v = view_json(&st, &Cache::default(), D0 + 12 * H, 7, &UtcDays);
+        let v = view_json(&st, &Cache::default(), D0 + 12 * H, 7, None, &UtcDays);
         let cards = v["cards"].as_array().unwrap();
         assert_eq!(cards.len(), 1, "{v}");
         assert_eq!(cards[0]["id"], a.as_str());
@@ -2259,7 +2288,7 @@ mod tests {
         let t = st.tile_mut(&a, "2026-10-22");
         t.status = TileStatus::Approved;
         t.final_seconds = Some(3600);
-        let v = view_json(&st, &Cache::default(), D0 + H, 7, &UtcDays);
+        let v = view_json(&st, &Cache::default(), D0 + H, 7, None, &UtcDays);
         assert_eq!(v["cards"][0]["tiles"].as_array().unwrap().len(), 0);
     }
 
@@ -2275,7 +2304,7 @@ mod tests {
             });
         }
         st.start_timer(&a, D0 + H, &UtcDays);
-        let v = view_json(&st, &Cache::default(), D0 + 2 * H, 7, &UtcDays);
+        let v = view_json(&st, &Cache::default(), D0 + 2 * H, 7, None, &UtcDays);
         assert_eq!(v["drafts"].as_array().unwrap().len(), 1);
         assert_eq!(v["timer"]["item_id"], a.as_str());
         assert_eq!(v["timer"]["seconds"], 3600);
@@ -2298,14 +2327,14 @@ mod tests {
         crate::store::record_activity(&mut s1, D0 + 10 * H, &UtcDays);
         st.sessions.insert("s".into(), s1);
         st.open_desk = Some(a.clone());
-        let v = view_json(&st, &Cache::default(), D0 + 11 * H, 7, &UtcDays);
+        let v = view_json(&st, &Cache::default(), D0 + 11 * H, 7, None, &UtcDays);
         let cards: Vec<&str> = v["cards"].as_array().unwrap().iter().map(|c| c["title"].as_str().unwrap()).collect();
         assert_eq!(cards, ["on alpha"]);
         assert_eq!(v["elsewhere"][0]["item_title"], "on beta");
         assert_eq!(v["elsewhere"][0]["desk"], "Beta");
         assert_eq!(v["open_desk"]["name"], "Alpha");
         st.open_desk = None;
-        let all = view_json(&st, &Cache::default(), D0 + 11 * H, 7, &UtcDays);
+        let all = view_json(&st, &Cache::default(), D0 + 11 * H, 7, None, &UtcDays);
         assert_eq!(all["cards"].as_array().unwrap().len(), 2, "no desk open shows every card");
     }
 
@@ -2367,7 +2396,7 @@ mod tests {
         st.sessions.insert("abc-123".into(), s1);
         let mut cache = Cache { wsl_distro: Some("Ubuntu".into()), agents_ms: D0 + 2 * H, ..Default::default() };
         cache.agents.insert("abc-123".into(), json!({"sessionId": "abc-123", "status": "waiting", "waitingFor": "permission prompt", "name": "fw-abc-1"}));
-        let v = view_json(&st, &cache, D0 + 2 * H, 7, &UtcDays);
+        let v = view_json(&st, &cache, D0 + 2 * H, 7, None, &UtcDays);
         let row = &v["cards"][0]["live_sessions"][0];
         assert_eq!((row["status"].as_str(), row["waiting_for"].as_str()), (Some("waiting"), Some("permission prompt")));
         assert_eq!(row["answer_url"], "https://claude.ai/code/abc-123");
@@ -2450,7 +2479,7 @@ mod tests {
         for s in [chat, fleet, mine, old] {
             st.sessions.insert(s.id.clone(), s);
         }
-        let v = view_json(&st, &Cache::default(), D0 + H + 1, 7, &UtcDays);
+        let v = view_json(&st, &Cache::default(), D0 + H + 1, 7, None, &UtcDays);
         let ids: Vec<&str> = v["sessions"].as_array().unwrap().iter().map(|s| s["session_id"].as_str().unwrap()).collect();
         assert_eq!(ids.len(), 2, "{ids:?}");
         assert!(ids.contains(&"chat") && ids.contains(&"untracked"));
@@ -2497,13 +2526,13 @@ mod tests {
         let w = app.db.write(|st| st.create_item("x", None, D0));
         app.db.flush().unwrap();
         std::fs::remove_file(dir.join("state.json")).unwrap();
-        assert!(view(Ax(app.clone())).await.is_ok());
+        assert!(view(Ax(app.clone()), Query(ViewQuery::default())).await.is_ok());
         app.db.flush().unwrap();
         assert!(!dir.join("state.json").exists(), "a poll with nothing running changes nothing");
         app.db.write(|st| st.start_timer(&w, now_ms(), &LocalDays));
         app.db.flush().unwrap();
         std::fs::remove_file(dir.join("state.json")).unwrap();
-        assert!(view(Ax(app.clone())).await.is_ok());
+        assert!(view(Ax(app.clone()), Query(ViewQuery::default())).await.is_ok());
         app.db.flush().unwrap();
         assert!(dir.join("state.json").exists(), "a running timer ticks on a read");
         std::fs::remove_dir_all(dir).ok();
@@ -2531,6 +2560,75 @@ mod tests {
         let p = polish_prompt("Loader", "2026-10-22", 3.0, &lines, &[], &[]);
         assert!(p.contains("] note 69\n") && p.contains("] note 10\n"), "{p}");
         assert!(!p.contains("] note 9\n") && p.contains("10 earlier notes left out"), "{p}");
+    }
+
+    #[test]
+    fn a_card_keeps_its_ended_chats_so_open_chat_can_resume_one() {
+        let mut st = State::default();
+        let now = D0 + 10 * 24 * H;
+        let w = st.create_item("x", None, now - H);
+        let mut add = |id: &str, client: Option<&str>, ended: bool, last_ms: i64| {
+            let mut s = crate::store::testing::session(id);
+            s.item_id = Some(w.clone());
+            s.client = client.map(str::to_string);
+            s.ended = ended;
+            s.last_ms = last_ms;
+            st.sessions.insert(id.into(), s);
+        };
+        add("live", None, false, now - 60_000);
+        for i in 0..7 {
+            add(&format!("chat{i}"), Some("embarch-chat"), true, now - (i + 1) * H);
+        }
+        add("past-window", Some("embarch-chat"), true, now - 8 * 24 * H);
+        add("terminal", None, true, now - 30_000);
+        let v = view_json(&st, &Cache::default(), now, 7, None, &UtcDays);
+        let rows = v["cards"][0]["live_sessions"].as_array().unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r["session_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["live", "chat0", "chat1", "chat2", "chat3", "chat4"], "the 5 newest ended chats in the window");
+        assert_eq!((rows[1]["state"].as_str(), rows[1]["client"].as_str()), (Some("ended"), Some("embarch-chat")));
+        assert_eq!(v["cards"][0]["sessions"]["live"], 1, "an ended chat is kept, not live");
+    }
+
+    #[test]
+    fn a_window_on_another_desk_reads_that_desks_cards() {
+        let mut st = State::default();
+        let a = st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0);
+        let b = st.put_desk(store::Desk { name: "Beta".into(), ..Default::default() }, D0);
+        for (title, desk) in [("on alpha", &a), ("on beta", &b)] {
+            let w = st.create_item(title, None, D0);
+            st.items.get_mut(&w).unwrap().desk_id = Some(desk.clone());
+            st.add_line(&w, "2026-10-22", "did a thing", "agent", D0 + H);
+        }
+        st.open_desk = Some(a.clone());
+        let titles = |v: &Value| v["cards"].as_array().unwrap().iter().map(|c| c["title"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(titles(&view_json(&st, &Cache::default(), D0 + 2 * H, 7, None, &UtcDays)), ["on alpha"]);
+        let v = view_json(&st, &Cache::default(), D0 + 2 * H, 7, Some(b.as_str()), &UtcDays);
+        assert_eq!(titles(&v), ["on beta"]);
+        assert_eq!(v["open_desk"]["name"], "Alpha", "the open desk stays what it is");
+    }
+
+    #[tokio::test]
+    async fn the_view_names_its_desk_or_answers_404() {
+        let (app, dir) = scratch_app();
+        let b = app.db.write(|st| st.put_desk(store::Desk { name: "Beta".into(), ..Default::default() }, D0));
+        let q = |desk: &str| Query(ViewQuery { desk: Some(desk.into()) });
+        assert!(view(Ax(app.clone()), q(&b)).await.is_ok());
+        let Err(e) = view(Ax(app.clone()), q("k404")).await else { panic!("an unknown desk is not the open one") };
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_card_carries_its_newest_notes_time() {
+        let mut st = State::default();
+        let w = st.create_item("x", None, D0);
+        let v = view_json(&st, &Cache::default(), D0 + H, 7, None, &UtcDays);
+        assert_eq!(v["cards"][0]["notes_ms"], Value::Null);
+        st.add_line(&w, "2026-10-22", "built it", "agent", D0 + H);
+        st.add_note(&w, "", store::Line::memory(D0 + 2 * H, "/m/a.md", "state"));
+        st.add_line(&w, "2026-10-21", "older day, added now", "user", D0 + 3 * H);
+        let v = view_json(&st, &Cache::default(), D0 + 4 * H, 7, None, &UtcDays);
+        assert_eq!(v["cards"][0]["notes_ms"], D0 + 3 * H);
     }
 
     #[test]
