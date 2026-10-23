@@ -146,7 +146,10 @@ fn main() -> Result<()> {
                     "{mark} {}  {}  linear: {}  repos: {}",
                     d["id"].as_str().unwrap_or(""),
                     d["name"].as_str().unwrap_or(""),
-                    d["linear"]["project_name"].as_str().unwrap_or("-"),
+                    match d["linear"]["project_name"].as_str() {
+                        Some(p) if !p.is_empty() => p.to_string(),
+                        _ => d["linear"]["team_key"].as_str().map(|k| format!("team {k}")).unwrap_or_else(|| "-".into()),
+                    },
                     d["firmware_repos"].as_array().map(|r| r.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default()
                 );
             }
