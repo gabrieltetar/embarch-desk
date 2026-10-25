@@ -14,7 +14,7 @@ use crate::connectors::Connectors;
 use crate::db::Db;
 use crate::events::{self, HookEvent};
 use crate::store::{self, Days, HarvestTarget, LocalDays, MailboxEntry, PendingLaunch, RealGit, State, TakeError, TileStatus};
-use crate::{brief, github, harvest, linear, localrepo, slack, uri};
+use crate::{brief, github, harvest, linear, localrepo, refs, slack, uri};
 use axum::extract::{Path, Query, State as Ax};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -27,6 +27,8 @@ use std::sync::{Arc, Mutex};
 
 pub struct App {
     pub db: Db,
+    /// Every desk's reference index (decision 56).
+    pub refs: refs::Store,
     pub token: String,
     pub cache: Mutex<Cache>,
     pub wsl_distro: Option<String>,
@@ -85,6 +87,7 @@ pub fn router(app: Shared) -> Router {
     let authed = Router::new()
         .route("/hook", post(hook))
         .route("/view", get(view))
+        .route("/refs", get(refs_route))
         .route("/items", post(create_item))
         .route("/items/{id}/pin", post(pin_item))
         .route("/items/{id}/archive", post(archive_item))
@@ -442,17 +445,38 @@ struct ViewQuery {
     desk: Option<String>,
 }
 
+/// The desk a `?desk=` names (by id or name; 404 when there is none), or
+/// none when it names none.
+fn named_desk(app: &App, q: &ViewQuery) -> Result<Option<String>, ApiError> {
+    match clean(&q.desk) {
+        Some(d) => Ok(Some(app.db.read(|st| st.desk_by_name_or_id(&d).map(|k| k.id.clone())).ok_or_else(|| missing(format!("no desk {d}")))?)),
+        None => Ok(None),
+    }
+}
+
 async fn view(Ax(app): Ax<Shared>, Query(q): Query<ViewQuery>) -> ApiResult {
     let now = now_ms();
-    let desk = match clean(&q.desk) {
-        Some(d) => Some(app.db.read(|st| st.desk_by_name_or_id(&d).map(|k| k.id.clone())).ok_or_else(|| missing(format!("no desk {d}")))?),
-        None => None,
-    };
+    let desk = named_desk(&app, &q)?;
     // A read changes nothing, so a polling window never rewrites the state
     // file. A running timer's tile catches up in the sync loop, within 30
     // seconds; the view's timer counts from its start.
-    let cache = app.cache.lock().expect("cache");
-    Ok(Json(app.db.read(|st| view_json(st, &cache, now, app.window_days, desk.as_deref(), &LocalDays))))
+    let (mut v, viewed) = {
+        let cache = app.cache.lock().expect("cache");
+        app.db.read(|st| (view_json(st, &cache, now, app.window_days, desk.as_deref(), &LocalDays), desk.clone().or(st.open_desk.clone())))
+    };
+    // When the viewed desk's reference index last changed: a client
+    // re-reads `/refs` only when it moves (decision 56).
+    v["refs_ms"] = json!(viewed.and_then(|d| app.refs.synced_ms(&d)));
+    Ok(Json(v))
+}
+
+/// The reference index of the named desk, else the open one (decision 56):
+/// every issue in its Linear scope and every PR in its repos, from memory —
+/// the sync loop refreshes it, so a request never waits on Linear or GitHub.
+/// With no desk open and none named, an empty index naming no desk.
+async fn refs_route(Ax(app): Ax<Shared>, Query(q): Query<ViewQuery>) -> ApiResult {
+    let desk = named_desk(&app, &q)?.or_else(|| app.db.read(|st| st.open_desk.clone()));
+    Ok(Json(app.refs.json(desk.as_deref())))
 }
 
 // ---------------------------------------------------------------- hooks
@@ -1535,6 +1559,8 @@ async fn put_desk(Ax(app): Ax<Shared>, Json(b): Json<DeskBody>) -> ApiResult {
         };
         Ok(st.put_desk(desk, now_ms()))
     })?;
+    // Its scope may have moved: its reference index refreshes on the next tick.
+    app.refs.forget_checked(Some(&id));
     publish_open(&app);
     Ok(Json(json!({ "id": id })))
 }
@@ -2107,6 +2133,7 @@ async fn sync_now(Ax(app): Ax<Shared>) -> ApiResult {
         c.last_slack_ms = 0;
         c.pr_checked.clear();
     }
+    app.refs.forget_checked(None);
     sync_once(&app, true).await;
     Ok(Json(json!({ "ok": true })))
 }
@@ -2180,6 +2207,8 @@ pub async fn sync_once(app: &App, force_issues: bool) {
         }
     }
 
+    refresh_refs(app, &conns.linear, &gh).await;
+
     if now - app.cache.lock().expect("cache").last_slack_ms > 2 * 60_000 {
         let mut items = vec![];
         let mut errors = vec![];
@@ -2207,6 +2236,22 @@ pub async fn sync_once(app: &App, force_issues: bool) {
         if let Err(e) = refresh_logged(app, &today).await {
             tracing::warn!("reading Harvest for {today}: {e:#}");
         }
+    }
+}
+
+/// Every desk's reference index whose five minutes are up (decision 56),
+/// one desk at a time; a deleted desk's index goes.
+async fn refresh_refs(app: &App, linear_accounts: &[crate::connectors::Account], gh: &[crate::connectors::Account]) {
+    let desks: Vec<(String, refs::Scope)> = app.db.read(|st| st.desks.values().map(|d| (d.id.clone(), refs::Scope::of(d))).collect());
+    app.refs.retain(&desks.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>());
+    for (id, scope) in desks {
+        if !app.refs.claim(&id, now_ms()) {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        let got = refs::fetch(linear_accounts, gh, &scope).await;
+        let changed = app.refs.apply(&id, &scope, got, now_ms());
+        tracing::debug!("reference index {id}: refreshed in {} ms, changed: {changed}", started.elapsed().as_millis());
     }
 }
 
@@ -2541,6 +2586,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("desk-app-{}", crate::paths::random_hex(4).unwrap()));
         let app = Arc::new(App {
             db: Db::open(dir.clone()).unwrap(),
+            refs: refs::Store::open(&dir),
             token: "t".into(),
             cache: Mutex::new(Cache::default()),
             wsl_distro: None,
@@ -2728,6 +2774,113 @@ mod tests {
         assert!(view(Ax(app.clone()), q(&b)).await.is_ok());
         let Err(e) = view(Ax(app.clone()), q("k404")).await else { panic!("an unknown desk is not the open one") };
         assert_eq!(e.0, StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn refs_index() -> (refs::Scope, refs::Fetched) {
+        let scope = refs::Scope {
+            linear: Some(store::LinearBinding { account: "work".into(), team_id: "t1".into(), team_key: "ABC".into(), ..Default::default() }),
+            repos: vec!["owner/repo".into()],
+        };
+        let got = refs::Fetched {
+            issues: Some(vec![refs::RefIssue {
+                key: "ABC-12".into(),
+                title: "Add the widget".into(),
+                state: "Done".into(),
+                url: "https://linear.app/ws/issue/ABC-12".into(),
+            }]),
+            prs: vec![(
+                "owner/repo".into(),
+                Some(vec![refs::RefPr {
+                    repo: "owner/repo".into(),
+                    number: 7,
+                    title: "Widget".into(),
+                    state: "merged".into(),
+                    draft: false,
+                    url: "https://github.com/owner/repo/pull/7".into(),
+                    branch: "feature/abc-12-widget".into(),
+                    keys: vec![],
+                }]),
+            )],
+        };
+        (scope, got)
+    }
+
+    async fn get_refs(app: &Shared, desk: Option<&str>) -> Result<Value, StatusCode> {
+        match refs_route(Ax(app.clone()), Query(ViewQuery { desk: desk.map(str::to_string) })).await {
+            Ok(Json(v)) => Ok(v),
+            Err(e) => Err(e.0),
+        }
+    }
+
+    async fn get_view(app: &Shared, desk: Option<&str>) -> Value {
+        let Ok(Json(v)) = view(Ax(app.clone()), Query(ViewQuery { desk: desk.map(str::to_string) })).await else { panic!("view") };
+        v
+    }
+
+    #[tokio::test]
+    async fn refs_serves_the_open_or_named_desks_index_in_the_contracts_shape() {
+        let (app, dir) = scratch_app();
+        let a = app.db.write(|st| st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0));
+        let b = app.db.write(|st| st.put_desk(store::Desk { name: "Beta".into(), ..Default::default() }, D0));
+        assert_eq!(get_refs(&app, None).await.unwrap(), json!({"desk_id": null, "synced_ms": null, "issues": [], "prs": []}), "no desk open");
+        app.db.write(|st| st.open_desk = Some(a.clone()));
+        assert_eq!(get_refs(&app, None).await.unwrap(), json!({"desk_id": a, "synced_ms": null, "issues": [], "prs": []}), "empty before the first sync");
+        assert_eq!(get_refs(&app, Some("k404")).await, Err(StatusCode::NOT_FOUND));
+        let (scope, got) = refs_index();
+        assert!(app.refs.apply(&b, &scope, got, D0 + H));
+        let want = json!({
+            "desk_id": b, "synced_ms": D0 + H,
+            "issues": [{"key": "ABC-12", "title": "Add the widget", "state": "Done", "url": "https://linear.app/ws/issue/ABC-12"}],
+            "prs": [{"repo": "owner/repo", "number": 7, "title": "Widget", "state": "merged", "draft": false,
+                     "url": "https://github.com/owner/repo/pull/7", "branch": "feature/abc-12-widget", "keys": ["ABC-12"]}],
+        });
+        assert_eq!(get_refs(&app, Some(&b)).await.unwrap(), want);
+        assert_eq!(get_refs(&app, Some("beta")).await.unwrap(), want, "a desk by its name, as /view takes it");
+        assert_eq!(get_refs(&app, None).await.unwrap()["desk_id"], a.as_str(), "the open desk stays the default");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_view_carries_the_viewed_desks_refs_ms() {
+        let (app, dir) = scratch_app();
+        let a = app.db.write(|st| st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0));
+        let b = app.db.write(|st| st.put_desk(store::Desk { name: "Beta".into(), ..Default::default() }, D0));
+        assert_eq!(get_view(&app, None).await["refs_ms"], Value::Null, "no desk open");
+        app.db.write(|st| st.open_desk = Some(a.clone()));
+        assert_eq!(get_view(&app, None).await["refs_ms"], Value::Null, "before the first sync");
+        let (scope, got) = refs_index();
+        app.refs.apply(&b, &scope, got, D0 + H);
+        assert_eq!(get_view(&app, None).await["refs_ms"], Value::Null, "Alpha has none yet");
+        assert_eq!(get_view(&app, Some(&b)).await["refs_ms"], D0 + H);
+        app.refs.apply(&a, &refs::Scope::default(), refs::Fetched::default(), D0 + 2 * H);
+        assert_eq!(get_view(&app, None).await["refs_ms"], D0 + 2 * H);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_restarted_desk_serves_its_last_index_at_once() {
+        let (app, dir) = scratch_app();
+        let a = app.db.write(|st| st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0));
+        app.db.write(|st| st.open_desk = Some(a.clone()));
+        app.db.flush().unwrap();
+        let (scope, got) = refs_index();
+        app.refs.apply(&a, &scope, got, D0 + H);
+        let before = get_refs(&app, None).await.unwrap();
+        drop(app);
+        let again = Arc::new(App {
+            db: Db::open(dir.clone()).unwrap(),
+            refs: refs::Store::open(&dir),
+            token: "t".into(),
+            cache: Mutex::new(Cache::default()),
+            wsl_distro: None,
+            window_days: 7,
+            model: String::new(),
+        });
+        let after = get_refs(&again, None).await.unwrap();
+        assert_eq!(after, before);
+        assert_eq!(after["prs"][0]["keys"], json!(["ABC-12"]));
+        assert_eq!(get_view(&again, None).await["refs_ms"], D0 + H);
         std::fs::remove_dir_all(dir).ok();
     }
 

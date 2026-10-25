@@ -228,6 +228,47 @@ pub async fn my_issues(accounts: &[Account], scope: Option<&LinearBinding>) -> R
     Ok(out)
 }
 
+/// Every issue in a desk's scope — its project, or its whole team — in every
+/// state, Done and Canceled included, and the ones Linear has since archived
+/// (it archives closed issues after a while); trashed ones are not. Newest
+/// update first, up to `cap`: the desk's reference index (decision 56).
+pub async fn scope_issues(accounts: &[Account], b: &LinearBinding, cap: usize) -> Result<Vec<crate::refs::RefIssue>> {
+    let acct = accounts
+        .iter()
+        .find(|a| a.label == b.account)
+        .ok_or_else(|| anyhow!("no Linear account {:?} connected", b.account))?;
+    let (field, id) = scope_filter(b);
+    if id.is_empty() {
+        return Ok(vec![]);
+    }
+    let q = format!(
+        "query($p: ID, $a: String) {{ issues(first: 250, after: $a, orderBy: updatedAt, includeArchived: true, \
+         filter: {{ {field}: {{ id: {{ eq: $p }} }} }}) {{ nodes {{ identifier title url trashed state {{ name }} }} \
+         pageInfo {{ hasNextPage endCursor }} }} }}"
+    );
+    let q = q.as_str();
+    crate::refs::take_pages(cap, |after: Option<String>| async move {
+        let d = gql(acct, q, json!({ "p": id, "a": after })).await?;
+        let page = &d["issues"];
+        let rows = page["nodes"].as_array().into_iter().flatten().filter_map(ref_issue_from).collect();
+        let next = if page["pageInfo"]["hasNextPage"] == true { page["pageInfo"]["endCursor"].as_str().map(str::to_string) } else { None };
+        Ok((rows, next))
+    })
+    .await
+}
+
+fn ref_issue_from(n: &Value) -> Option<crate::refs::RefIssue> {
+    if n["trashed"] == true {
+        return None;
+    }
+    Some(crate::refs::RefIssue {
+        key: n["identifier"].as_str()?.to_string(),
+        title: n["title"].as_str().unwrap_or_default().to_string(),
+        state: n["state"]["name"].as_str().unwrap_or_default().to_string(),
+        url: n["url"].as_str().unwrap_or_default().to_string(),
+    })
+}
+
 /// Every Linear project in every connected workspace, with its teams — what
 /// the desk form picks from.
 pub async fn projects(accounts: &[Account]) -> Result<Vec<Value>> {
@@ -373,6 +414,17 @@ mod tests {
         assert_eq!(start_state(&states, "started"), None);
         assert_eq!(start_state(&states, "completed"), None);
         assert_eq!(start_state(&states[..2], "unstarted").as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn an_index_row_reads_out_of_the_graphql_shape_and_a_trashed_issue_is_none() {
+        let n = json!({"identifier": "ABC-12", "title": "Add the widget", "url": "https://linear.app/ws/issue/ABC-12",
+                       "trashed": null, "state": {"name": "Done"}});
+        let r = ref_issue_from(&n).unwrap();
+        assert_eq!((r.key.as_str(), r.title.as_str(), r.state.as_str()), ("ABC-12", "Add the widget", "Done"));
+        let mut t = n.clone();
+        t["trashed"] = json!(true);
+        assert!(ref_issue_from(&t).is_none());
     }
 
     #[test]

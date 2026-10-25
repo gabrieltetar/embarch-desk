@@ -16,6 +16,7 @@ mod localrepo;
 mod mcp;
 mod memory;
 mod paths;
+mod refs;
 mod server;
 mod service;
 mod slack;
@@ -191,8 +192,11 @@ async fn serve() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "embarch_desk=info".into()),
     ).init();
+    let db = db::open_default()?;
+    let refs = refs::Store::open(db.dir());
     let app = Arc::new(server::App {
-        db: db::open_default()?,
+        db,
+        refs,
         token: paths::desk_token()?,
         cache: Mutex::new(server::Cache { wsl_distro: server::detect_wsl_distro(), ..Default::default() }),
         wsl_distro: server::detect_wsl_distro(),

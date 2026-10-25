@@ -34,6 +34,11 @@ impl Db {
         Ok(Self { dir, state: Mutex::new(state), dirty: AtomicBool::new(migrated) })
     }
 
+    /// The data dir `state.json` lives in, which the reference index shares.
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     pub fn read<R>(&self, f: impl FnOnce(&State) -> R) -> R {
         f(&self.state.lock().expect("state lock"))
     }
