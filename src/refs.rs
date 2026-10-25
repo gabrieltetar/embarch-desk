@@ -5,9 +5,11 @@
 //! becomes a link. A card holds only its own item's PRs; a Done issue that
 //! never had a card was invisible until this.
 //!
-//! **A request never waits on the network**: the sync loop refreshes each
-//! desk's index at most every five minutes (and on `POST /sync`), and
-//! `GET /refs` answers from memory. The index is kept in `refs.json` beside
+//! **A request never waits on the network**: the index's own task refreshes
+//! each desk's index at most every five minutes, and at once when
+//! `POST /sync` wakes it, and `GET /refs` answers from memory. It runs beside
+//! the sync loop, not inside it, so a refresh waiting out its timeouts holds
+//! up neither housekeeping nor `POST /sync`. The index is kept in `refs.json` beside
 //! `state.json`, written only when it changes, so a restart serves the last
 //! one at once — and a polling window's state file is never rewritten for it.
 //!
@@ -182,12 +184,22 @@ struct Inner {
     desks: BTreeMap<String, Entry>,
     /// When each desk's refresh last started.
     checked: HashMap<String, i64>,
+    /// Bumped by every change to `desks`, so a write of `refs.json` knows
+    /// whether what it holds is still the newest.
+    version: u64,
 }
 
 /// Every desk's index, in memory and in `refs.json`.
 pub struct Store {
     path: PathBuf,
     inner: Mutex<Inner>,
+    /// The `version` last saved to `refs.json`, locked across a whole save:
+    /// two saves never share the temp file, and a save whose snapshot the
+    /// file already holds, or a newer one, writes nothing — the newest
+    /// index wins.
+    saved: Mutex<u64>,
+    /// `POST /sync` asking the refresh task for a pass now.
+    wake: tokio::sync::Notify,
 }
 
 impl Store {
@@ -202,7 +214,7 @@ impl Store {
             }),
             Err(_) => BTreeMap::new(),
         };
-        Self { path, inner: Mutex::new(Inner { desks, checked: HashMap::new() }) }
+        Self { path, inner: Mutex::new(Inner { desks, ..Default::default() }), saved: Mutex::new(0), wake: tokio::sync::Notify::new() }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -249,13 +261,29 @@ impl Store {
         }
     }
 
+    /// Ask the refresh task for a pass now; a pass already running is
+    /// followed by one more.
+    pub fn wake(&self) {
+        self.wake.notify_one();
+    }
+
+    /// Resolves when `wake` was called, at once if it was called while no
+    /// one waited.
+    pub async fn woken(&self) {
+        self.wake.notified().await;
+    }
+
     /// Drop the indexes of desks that no longer exist.
     pub fn retain(&self, desk_ids: &[&str]) {
         let removed = {
             let mut inner = self.lock();
             let before = inner.desks.len();
             inner.desks.retain(|k, _| desk_ids.contains(&k.as_str()));
-            inner.desks.len() != before
+            let removed = inner.desks.len() != before;
+            if removed {
+                inner.version += 1;
+            }
+            removed
         };
         if removed {
             self.persist();
@@ -301,20 +329,31 @@ impl Store {
             let synced_ms = if moved { Some(now) } else { old.index.synced_ms };
             let index = RefIndex { desk_id: Some(desk_id.to_string()), synced_ms, issues, prs };
             inner.desks.insert(desk_id.to_string(), Entry { linear_scope, repos: scope.repos.clone(), index });
+            inner.version += 1;
             moved
         };
         self.persist();
         changed
     }
 
+    /// Save the index as it is now. The snapshot is taken under the save
+    /// lock, so saves land in the order their snapshots were taken.
     fn persist(&self) {
-        let bytes = {
+        self.persist_with(paths::write_private);
+    }
+
+    fn persist_with(&self, write: impl FnOnce(&Path, &[u8]) -> Result<()>) {
+        let mut saved = self.saved.lock().expect("refs save lock");
+        let (version, bytes) = {
             let inner = self.lock();
-            serde_json::to_vec(&inner.desks)
+            (inner.version, serde_json::to_vec(&inner.desks))
         };
-        let res = bytes.map_err(anyhow::Error::from).and_then(|b| paths::write_private(&self.path, &b));
-        if let Err(e) = res {
-            tracing::warn!("saving the reference index failed: {e:#}");
+        if version <= *saved {
+            return;
+        }
+        match bytes.map_err(anyhow::Error::from).and_then(|b| write(&self.path, &b)) {
+            Ok(()) => *saved = version,
+            Err(e) => tracing::warn!("saving the reference index failed: {e:#}"),
         }
     }
 }
@@ -499,5 +538,87 @@ mod tests {
         assert!(s.claim("k2", 0));
         s.forget_checked(None);
         assert!(s.claim("k1", REFRESH_MS + 2) && s.claim("k2", 1), "POST /sync makes every desk due");
+    }
+
+    #[test]
+    fn concurrent_refreshes_leave_refs_json_whole_and_newest() {
+        let dir = scratch();
+        let s = Store::open(&dir);
+        let sc = scope(&[]);
+        std::thread::scope(|t| {
+            for n in 0..8 {
+                let (s, sc) = (&s, &sc);
+                t.spawn(move || {
+                    for round in 1..=25 {
+                        let got = Fetched { issues: Some(vec![issue(&format!("ABC-{round}"), "Done")]), prs: vec![] };
+                        assert!(s.apply(&format!("k{n}"), sc, got, round));
+                    }
+                });
+            }
+        });
+        let again = Store::open(&dir);
+        for n in 0..8 {
+            let k = format!("k{n}");
+            assert_eq!(again.json(Some(&k)), s.json(Some(&k)), "{k}: refs.json holds the last refresh");
+            assert_eq!(again.json(Some(&k))["issues"][0]["key"], "ABC-25");
+        }
+        assert!(!dir.join("refs.tmp").exists(), "no save is left half done");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_slow_save_never_lands_over_a_newer_one() {
+        let dir = scratch();
+        let s = Store::open(&dir);
+        let sc = scope(&[]);
+        let one = |key: &str| Fetched { issues: Some(vec![issue(key, "Done")]), prs: vec![] };
+        assert!(s.apply("k1", &sc, one("ABC-1"), 100));
+        {
+            let mut inner = s.lock();
+            inner.desks.get_mut("k1").unwrap().index.issues[0].key = "ABC-2".into();
+            inner.version += 1;
+        }
+        let (entered, in_write) = std::sync::mpsc::channel();
+        let (newer_done, newer_saved) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|t| {
+            let s = &s;
+            // A save of ABC-2 that stalls in its write until a newer save is
+            // done, or 300 ms pass.
+            t.spawn(move || {
+                s.persist_with(|p, b| {
+                    entered.send(()).unwrap();
+                    newer_saved.recv_timeout(std::time::Duration::from_millis(300)).ok();
+                    paths::write_private(p, b)
+                })
+            });
+            in_write.recv().unwrap();
+            assert!(s.apply("k1", &sc, one("ABC-3"), 300));
+            newer_done.send(()).ok();
+        });
+        assert_eq!(Store::open(&dir).json(Some("k1"))["issues"][0]["key"], "ABC-3", "the newest refresh is what refs.json holds");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_save_the_file_already_holds_writes_nothing() {
+        let dir = scratch();
+        let s = Store::open(&dir);
+        assert!(s.apply("k1", &scope(&[]), Fetched { issues: Some(vec![issue("ABC-1", "Done")]), prs: vec![] }, 100));
+        let file = dir.join("refs.json");
+        std::fs::write(&file, b"{}").unwrap();
+        s.persist();
+        assert_eq!(std::fs::read(&file).unwrap(), b"{}", "the snapshot was already saved");
+        s.retain(&["k9"]);
+        assert_eq!(Store::open(&dir).synced_ms("k1"), None, "a change saves again");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_wake_while_no_one_waits_is_kept_for_the_next_wait() {
+        let s = Store::open(&std::env::temp_dir().join("desk-refs-never-written"));
+        s.wake();
+        s.wake();
+        tokio::time::timeout(std::time::Duration::from_secs(1), s.woken()).await.expect("the wake was kept");
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), s.woken()).await.is_err(), "two wakes are one pass");
     }
 }

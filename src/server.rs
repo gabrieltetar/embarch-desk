@@ -2133,7 +2133,10 @@ async fn sync_now(Ax(app): Ax<Shared>) -> ApiResult {
         c.last_slack_ms = 0;
         c.pr_checked.clear();
     }
+    // Every desk's reference index is due, and its task is woken rather than
+    // waited on: a refresh waiting out its timeouts is not this request's.
     app.refs.forget_checked(None);
+    app.refs.wake();
     sync_once(&app, true).await;
     Ok(Json(json!({ "ok": true })))
 }
@@ -2207,8 +2210,6 @@ pub async fn sync_once(app: &App, force_issues: bool) {
         }
     }
 
-    refresh_refs(app, &conns.linear, &gh).await;
-
     if now - app.cache.lock().expect("cache").last_slack_ms > 2 * 60_000 {
         let mut items = vec![];
         let mut errors = vec![];
@@ -2240,8 +2241,13 @@ pub async fn sync_once(app: &App, force_issues: bool) {
 }
 
 /// Every desk's reference index whose five minutes are up (decision 56),
-/// one desk at a time; a deleted desk's index goes.
-async fn refresh_refs(app: &App, linear_accounts: &[crate::connectors::Account], gh: &[crate::connectors::Account]) {
+/// one desk at a time, each claimed before its fetch; a deleted desk's
+/// index goes.
+async fn refresh_refs<F, Fut>(app: &App, mut fetch: F)
+where
+    F: FnMut(refs::Scope) -> Fut,
+    Fut: std::future::Future<Output = refs::Fetched>,
+{
     let desks: Vec<(String, refs::Scope)> = app.db.read(|st| st.desks.values().map(|d| (d.id.clone(), refs::Scope::of(d))).collect());
     app.refs.retain(&desks.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>());
     for (id, scope) in desks {
@@ -2249,9 +2255,41 @@ async fn refresh_refs(app: &App, linear_accounts: &[crate::connectors::Account],
             continue;
         }
         let started = std::time::Instant::now();
-        let got = refs::fetch(linear_accounts, gh, &scope).await;
+        let got = fetch(scope.clone()).await;
         let changed = app.refs.apply(&id, &scope, got, now_ms());
         tracing::debug!("reference index {id}: refreshed in {} ms, changed: {changed}", started.elapsed().as_millis());
+    }
+}
+
+/// The reference index's own task (decision 56): a pass every 30 seconds,
+/// and at once when `POST /sync` wakes it, over the desks whose five
+/// minutes are up. It runs beside the sync loop, never inside it: on a
+/// network that drops packets every request waits out its timeout, and that
+/// must hold up neither timer catch-up, claim and mail expiry, the Slack
+/// feed nor `POST /sync`. Only this task refreshes, so passes never overlap.
+pub async fn refs_loop(app: Shared) {
+    refs_loop_with(app, std::time::Duration::from_secs(30), |app| async move {
+        let Ok(conns) = Connectors::load() else { return };
+        let gh = conns.github_accounts();
+        let (linear, gh) = (&conns.linear, &gh);
+        refresh_refs(&app, |scope| async move { refs::fetch(linear, gh, &scope).await }).await;
+    })
+    .await
+}
+
+async fn refs_loop_with<P, Fut>(app: Shared, every: std::time::Duration, mut pass: P)
+where
+    P: FnMut(Shared) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = app.refs.woken() => {}
+        }
+        pass(app.clone()).await;
     }
 }
 
@@ -2881,6 +2919,78 @@ mod tests {
         assert_eq!(after, before);
         assert_eq!(after["prs"][0]["keys"], json!(["ABC-12"]));
         assert_eq!(get_view(&again, None).await["refs_ms"], D0 + H);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    async fn until(what: &str, mut ok: impl FnMut() -> bool) {
+        let wait = async {
+            while !ok() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.is_err() {
+            panic!("timed out waiting for {what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hung_reference_refresh_holds_up_nothing_and_post_sync_reruns_it_after() {
+        let (app, dir) = scratch_app();
+        let desk = |name: &str, repo: &str| store::Desk { name: name.into(), github_repos: vec![repo.into()], ..Default::default() };
+        let a = app.db.write(|st| st.put_desk(desk("Alpha", "o/a"), D0));
+        let b = app.db.write(|st| st.put_desk(desk("Beta", "o/b"), D0));
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (open, gate) = tokio::sync::watch::channel(false);
+        let pass = {
+            let calls = calls.clone();
+            move |app: Shared| {
+                let (calls, gate) = (calls.clone(), gate.clone());
+                async move {
+                    refresh_refs(&app, |scope: refs::Scope| {
+                        let first = {
+                            let mut c = calls.lock().unwrap();
+                            c.push(scope.repos.join(","));
+                            c.len() == 1
+                        };
+                        let mut gate = gate.clone();
+                        async move {
+                            if first {
+                                // A network that drops packets: the first fetch hangs until let go.
+                                gate.wait_for(|o| *o).await.ok();
+                            }
+                            refs::Fetched { issues: None, prs: scope.repos.iter().map(|r| (r.clone(), Some(vec![]))).collect() }
+                        }
+                    })
+                    .await
+                }
+            }
+        };
+        let task = tokio::spawn(refs_loop_with(app.clone(), std::time::Duration::from_secs(3600), pass));
+        until("the first fetch", || calls.lock().unwrap().len() == 1).await;
+        let hung = calls.lock().unwrap()[0].clone();
+        let (first, second) = if hung == "o/a" { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
+        assert!(!app.refs.claim(&first, now_ms()), "a desk is claimed before its fetch");
+        housekeep(&app, now_ms());
+        // What POST /sync does for the index, while a pass hangs.
+        app.refs.forget_checked(None);
+        app.refs.wake();
+        assert_eq!((app.refs.synced_ms(&a), app.refs.synced_ms(&b)), (None, None));
+        open.send(true).unwrap();
+        until("the pass and the one POST /sync asked for", || calls.lock().unwrap().len() == 3).await;
+        until("the second desk's index", || app.refs.synced_ms(&second).is_some()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let other = if hung == "o/a" { "o/b" } else { "o/a" };
+        assert_eq!(*calls.lock().unwrap(), [hung.as_str(), other, hung.as_str()], "the desk fetched before POST /sync is fetched again, the other once, after it");
+        assert!(app.refs.synced_ms(&first).is_some());
+        task.abort();
+        // Five minutes per desk still holds: a pass now fetches nothing.
+        let fetched = Mutex::new(0);
+        refresh_refs(&app, |_| {
+            *fetched.lock().unwrap() += 1;
+            async { refs::Fetched::default() }
+        })
+        .await;
+        assert_eq!(*fetched.lock().unwrap(), 0);
         std::fs::remove_dir_all(dir).ok();
     }
 
