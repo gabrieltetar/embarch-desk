@@ -2933,8 +2933,11 @@ mod tests {
         }
     }
 
+    // What POST /sync does for the index while the task's pass hangs: it makes every desk due and wakes the
+    // task, waiting on neither, and one more pass follows the hung one for the desk fetched before the wake.
+    // That sync_once itself never refreshes is not tested here: it reads the real connectors (decision 56).
     #[tokio::test]
-    async fn a_hung_reference_refresh_holds_up_nothing_and_post_sync_reruns_it_after() {
+    async fn a_sync_wake_during_a_hung_reference_pass_reruns_it_after_for_the_desk_fetched_before() {
         let (app, dir) = scratch_app();
         let desk = |name: &str, repo: &str| store::Desk { name: name.into(), github_repos: vec![repo.into()], ..Default::default() };
         let a = app.db.write(|st| st.put_desk(desk("Alpha", "o/a"), D0));
@@ -2970,7 +2973,6 @@ mod tests {
         let hung = calls.lock().unwrap()[0].clone();
         let (first, second) = if hung == "o/a" { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
         assert!(!app.refs.claim(&first, now_ms()), "a desk is claimed before its fetch");
-        housekeep(&app, now_ms());
         // What POST /sync does for the index, while a pass hangs.
         app.refs.forget_checked(None);
         app.refs.wake();
