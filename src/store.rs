@@ -576,6 +576,11 @@ impl Git for RealGit {
     }
 }
 
+/// `YYYY-MM-DD`, a real calendar day, nothing looser (`2026-1-5` is not one).
+pub fn is_date(s: &str) -> bool {
+    s.len() == 10 && chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+}
+
 /// A folder as the mailbox compares it: no trailing slash.
 pub fn norm_folder(path: &str) -> String {
     let p = path.trim();
@@ -755,8 +760,11 @@ impl State {
     /// the user set them, else the gap Harvest's entries that day left — so
     /// no hour is sent twice. That freezes now as its `final_seconds`.
     pub fn fold_tile(&mut self, item_id: &str, from: &str, into: &str, now: i64) -> Result<(), String> {
-        if from == into {
-            return Err("a tile cannot fold into itself".into());
+        if !is_date(from) || !is_date(into) {
+            return Err("a fold names two dates, YYYY-MM-DD".into());
+        }
+        if into <= from {
+            return Err("a tile folds into a later day, never the same or an earlier one".into());
         }
         for d in [from, into] {
             let open = self.tiles.get(&format!("{item_id}@{d}")).is_none_or(|t| t.status == TileStatus::Open);

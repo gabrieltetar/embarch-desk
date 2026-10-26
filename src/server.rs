@@ -187,11 +187,14 @@ fn tile_json(st: &State, item_id: &str, date: &str) -> Value {
     let id = format!("{item_id}@{date}");
     let seconds = st.tile_seconds(item_id, date);
     let t = st.tiles.get(&id);
+    let folded = t.is_some_and(|t| t.status == TileStatus::Folded);
     let captured = seconds as f64 / 3600.0;
     let logged = st.logged_hours(item_id, date);
     // The tile proposes only what Harvest doesn't already hold for this item
-    // that day (decision 41).
-    let computed = ((captured - logged).max(0.0) * 100.0).round() / 100.0;
+    // that day (decision 41). A folded tile's seconds are already that gap,
+    // frozen at the fold, so they are not reduced again (decision 60).
+    let computed = if folded { captured } else { (captured - logged).max(0.0) };
+    let computed = (computed * 100.0).round() / 100.0;
     let override_hours = t.and_then(|t| t.hours_override);
     // Its own lines and those of the tiles folded into it, as the polish
     // reads them (decision 58).
@@ -819,9 +822,11 @@ async fn session_line(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): Jso
 // ---------------------------------------------------------------- tiles
 
 fn split_tile_id(id: &str) -> Result<(String, String), ApiError> {
-    id.rsplit_once('@')
-        .map(|(i, d)| (i.to_string(), d.to_string()))
-        .ok_or_else(|| bad("a tile id is <item>@<date>"))
+    let (i, d) = id.rsplit_once('@').ok_or_else(|| bad("a tile id is <item>@<date>"))?;
+    if !store::is_date(d) {
+        return Err(bad("a tile id is <item>@<YYYY-MM-DD>"));
+    }
+    Ok((i.to_string(), d.to_string()))
 }
 
 fn require_open(st: &State, id: &str) -> Result<(), ApiError> {
@@ -1028,6 +1033,15 @@ async fn polish_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     Ok(Json(app.db.read(|st| tile_json(st, &item, &date))))
 }
 
+/// The Harvest note when nobody wrote one: the lines the dialog shows, the
+/// tile's own and those of the tiles folded into it, oldest first.
+fn approve_fallback_note(st: &State, item_id: &str, date: &str) -> String {
+    let t = st.tiles.get(&format!("{item_id}@{date}"));
+    let mut lines: Vec<&store::Line> = t.into_iter().chain(st.folded_into(item_id, date)).flat_map(|t| t.lines.iter()).collect();
+    lines.sort_by_key(|l| l.ms);
+    lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("; ")
+}
+
 /// ✓: the tile becomes a Harvest time entry. The human's alone — no MCP
 /// tool reaches this route.
 async fn approve_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
@@ -1039,8 +1053,7 @@ async fn approve_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult 
         let note = t
             .and_then(|t| t.note.clone())
             .filter(|n| !n.trim().is_empty())
-            .or_else(|| t.map(|t| t.lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>().join("; ")))
-            .unwrap_or_default();
+            .unwrap_or_else(|| approve_fallback_note(st, &item, &date));
         let j = tile_json(st, &item, &date);
         Ok::<_, ApiError>((target, note, j["hours"].as_f64().unwrap_or(0.0), j["seconds"].as_i64().unwrap_or(0)))
     })?;
@@ -2652,6 +2665,70 @@ mod tests {
         // A week on, the folded tile stays while its target is open.
         st.prune(D0 + 60 * H + store::ARCHIVE_AFTER_MS + H);
         assert_eq!(tile_json(&st, &w, "2026-10-24")["hours"], 4.5);
+    }
+
+    #[test]
+    fn a_fold_goes_only_to_a_later_real_day_and_a_tile_id_names_a_real_day() {
+        let mut st = State::default();
+        let w = st.create_item("Comms", None, D0);
+        for (sid, day) in [("s1", 0), ("s2", 2)] {
+            let mut s = crate::store::testing::session(sid);
+            s.item_id = Some(w.clone());
+            crate::store::record_activity(&mut s, D0 + day * 24 * H + 9 * H, &UtcDays);
+            crate::store::record_activity(&mut s, D0 + day * 24 * H + 10 * H, &UtcDays);
+            st.sessions.insert(sid.into(), s);
+        }
+        for bad_into in ["2026-10-22", "2026-10-20", "2026-10-24x", "later", "2026-1-24", "2026-13-24", ""] {
+            assert!(st.fold_tile(&w, "2026-10-22", bad_into, D0).is_err(), "{bad_into}");
+        }
+        assert!(st.fold_tile(&w, "2026-10-24", "2026-10-22", D0).is_err(), "an earlier day");
+        assert!(st.fold_tile(&w, "nope", "2026-10-24", D0).is_err());
+        assert!(st.tiles.values().all(|t| t.status == TileStatus::Open), "nothing changed");
+        assert!(split_tile_id("w1@2026-10-22").is_ok());
+        for id in ["w1", "w1@tomorrow", "w1@2026-02-30", "w1@", "w1@2026-1-2"] {
+            assert!(split_tile_id(id).is_err(), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_folded_day_reports_the_hours_it_carried_not_less_the_harvest_hours_twice() {
+        let mut st = State::default();
+        let w = st.create_item("Comms", Some(store::IssueRef { key: "ABC-1".into(), ..Default::default() }), D0);
+        for (sid, day, hours) in [("s1", 0, 3), ("s2", 2, 1)] {
+            let mut s = crate::store::testing::session(sid);
+            s.item_id = Some(w.clone());
+            crate::store::record_activity(&mut s, D0 + day * 24 * H + 9 * H, &UtcDays);
+            crate::store::record_activity(&mut s, D0 + day * 24 * H + (9 + hours) * H, &UtcDays);
+            st.sessions.insert(sid.into(), s);
+        }
+        st.harvest_logged.insert("2026-10-22".into(), vec![store::LoggedEntry {
+            id: 1, issue_key: Some("ABC-1".into()), hours: 0.5, notes: "x".into(), ..Default::default()
+        }]);
+        st.fold_tile(&w, "2026-10-22", "2026-10-24", D0 + 60 * H).unwrap();
+        let t = tile_json(&st, &w, "2026-10-22");
+        assert_eq!((t["hours"].as_f64(), t["captured_hours"].as_f64(), t["logged_hours"].as_f64()), (Some(2.5), Some(2.5), Some(0.5)), "{t}");
+        assert_eq!(t["covered"], false);
+        let d = day_json(&st, "2026-10-22", D0 + 60 * H);
+        let row = &d["groups"][0]["items"][0];
+        assert_eq!((row["hours"].as_f64(), row["captured_hours"].as_f64()), (Some(2.5), Some(2.5)), "{row}");
+        assert_eq!(tile_json(&st, &w, "2026-10-24")["hours"], 3.5, "the target carries it once");
+    }
+
+    #[test]
+    fn the_approve_note_falls_back_to_the_lines_of_the_folded_tiles_too() {
+        let mut st = State::default();
+        let w = st.create_item("Comms", None, D0);
+        for (sid, day) in [("s1", 0), ("s2", 2)] {
+            let mut s = crate::store::testing::session(sid);
+            s.item_id = Some(w.clone());
+            crate::store::record_activity(&mut s, D0 + day * 24 * H + 9 * H, &UtcDays);
+            crate::store::record_activity(&mut s, D0 + day * 24 * H + 10 * H, &UtcDays);
+            st.sessions.insert(sid.into(), s);
+        }
+        st.add_line(&w, "2026-10-22", "read the contract", "agent", D0 + 10 * H);
+        st.fold_tile(&w, "2026-10-22", "2026-10-24", D0 + 60 * H).unwrap();
+        assert!(st.tiles[&format!("{w}@2026-10-24")].lines.is_empty(), "the target has none of its own");
+        assert_eq!(approve_fallback_note(&st, &w, "2026-10-24"), "read the contract");
     }
 
     #[test]
