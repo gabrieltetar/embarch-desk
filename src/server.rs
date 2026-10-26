@@ -205,7 +205,7 @@ fn tile_json(st: &State, item_id: &str, date: &str) -> Value {
         "id": id,
         "date": date,
         "seconds": seconds,
-        "hours": override_hours.unwrap_or(computed),
+        "hours": override_hours.or(t.and_then(|t| t.sent_hours)).unwrap_or(computed),
         "computed_hours": computed,
         "captured_hours": (captured * 100.0).round() / 100.0,
         "logged_hours": (logged * 100.0).round() / 100.0,
@@ -853,15 +853,21 @@ async fn tile_line(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<Li
 struct TilePatch {
     #[serde(default)]
     note: Option<String>,
-    #[serde(default)]
-    hours: Option<f64>,
+    /// Absent leaves the override alone; a number sets it; `null` clears it
+    /// so the tile goes back to computed hours (decision 61).
+    #[serde(default, deserialize_with = "some_or_null")]
+    hours: Option<Option<f64>>,
     #[serde(default)]
     harvest: Option<HarvestTarget>,
 }
 
+fn some_or_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Error> {
+    Option::<f64>::deserialize(d).map(Some)
+}
+
 async fn patch_tile(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<TilePatch>) -> ApiResult {
     let (item, date) = split_tile_id(&id)?;
-    if b.hours.is_some_and(|h| !(0.0..=24.0).contains(&h)) {
+    if b.hours.flatten().is_some_and(|h| !(0.0..=24.0).contains(&h)) {
         return Err(bad("hours must be between 0 and 24"));
     }
     app.db.write(|st| {
@@ -874,7 +880,7 @@ async fn patch_tile(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<T
             t.note = Some(n);
         }
         if let Some(h) = b.hours {
-            t.hours_override = Some(h);
+            t.hours_override = h;
         }
         if let Some(h) = b.harvest {
             t.harvest = Some(h);
@@ -1070,7 +1076,7 @@ async fn approve_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult 
         t.acted_ms = Some(now);
         t.final_seconds = Some(seconds);
         t.note = Some(note);
-        t.hours_override = Some(hours);
+        t.sent_hours = Some(hours);
     });
     if let Err(e) = refresh_logged(&app, &date).await {
         tracing::warn!("re-reading Harvest after the entry: {e:#}");
@@ -2176,12 +2182,7 @@ async fn remove_entry(Ax(app): Ax<Shared>, Path((account, id)): Path<(u64, u64)>
     let conns = Connectors::load()?;
     harvest::delete_entry(&conns.harvest, account, id).await?;
     app.db.write(|st| {
-        for t in st.tiles.values_mut().filter(|t| t.harvest_entry_id == Some(id)) {
-            t.status = TileStatus::Open;
-            t.harvest_entry_id = None;
-            t.acted_ms = None;
-            t.final_seconds = None;
-        }
+        st.reopen_tiles_of_entry(id);
     });
     if let Some(date) = entry_date(&app, id) {
         refresh_logged(&app, &date).await?;
@@ -2630,6 +2631,62 @@ mod tests {
         st.harvest_logged.clear();
         let v = view_json(&st, &Cache::default(), D0 + 11 * H, 7, None, &UtcDays);
         assert_eq!(v["hand"][0]["hours"], 1.0);
+    }
+
+    #[test]
+    fn a_tile_whose_entry_goes_reopens_on_the_current_gap_and_a_typed_override_is_kept_or_cleared() {
+        let mut st = State::default();
+        let issue = store::IssueRef { key: "ABC-1".into(), ..Default::default() };
+        let w = st.create_item("Bootload", Some(issue), D0);
+        let mut s1 = crate::store::testing::session("s");
+        s1.item_id = Some(w.clone());
+        crate::store::record_activity(&mut s1, D0 + 9 * H, &UtcDays);
+        crate::store::record_activity(&mut s1, D0 + 10 * H, &UtcDays);
+        st.sessions.insert("s".into(), s1);
+        // The state approve_tile leaves: sent hours, no override.
+        let t = st.tile_mut(&w, "2026-10-22");
+        t.status = TileStatus::Approved;
+        t.harvest_entry_id = Some(7);
+        t.final_seconds = Some(3600);
+        t.sent_hours = Some(1.0);
+        st.harvest_logged.insert("2026-10-22".into(), vec![store::LoggedEntry {
+            id: 7, issue_key: Some("ABC-1".into()), hours: 1.0, notes: "x".into(), ..Default::default()
+        }]);
+        assert_eq!(tile_json(&st, &w, "2026-10-22")["hours"], 1.0, "an approved tile reads what it sent");
+        // More session time, then the entry is deleted.
+        let mut s = st.sessions.remove("s").unwrap();
+        crate::store::record_activity(&mut s, D0 + 11 * H, &UtcDays);
+        st.sessions.insert("s".into(), s);
+        st.harvest_logged.clear();
+        st.reopen_tiles_of_entry(7);
+        let j = tile_json(&st, &w, "2026-10-22");
+        assert_eq!(j["status"], "open");
+        assert_eq!(j["hours"], 2.0, "the reopened tile proposes the current gap, not the deleted entry's hours");
+        // Harvest covers it again: it closes itself.
+        st.harvest_logged.insert("2026-10-22".into(), vec![store::LoggedEntry {
+            id: 8, issue_key: Some("ABC-1".into()), hours: 2.0, notes: "y".into(), ..Default::default()
+        }]);
+        assert_eq!(tile_json(&st, &w, "2026-10-22")["covered"], true);
+        st.harvest_logged.clear();
+        // A typed override survives a reopen.
+        let t = st.tile_mut(&w, "2026-10-22");
+        t.hours_override = Some(0.5);
+        t.status = TileStatus::Approved;
+        t.harvest_entry_id = Some(9);
+        t.sent_hours = Some(0.5);
+        st.reopen_tiles_of_entry(9);
+        assert_eq!(tile_json(&st, &w, "2026-10-22")["hours"], 0.5);
+        // PATCH null clears it; absent leaves it.
+        let p: TilePatch = serde_json::from_str(r#"{"note":"n"}"#).unwrap();
+        assert_eq!(p.hours, None);
+        let p: TilePatch = serde_json::from_str(r#"{"hours":null}"#).unwrap();
+        assert_eq!(p.hours, Some(None));
+        let p: TilePatch = serde_json::from_str(r#"{"hours":1.5}"#).unwrap();
+        assert_eq!(p.hours, Some(Some(1.5)));
+        if let Some(h) = Some(None::<f64>) {
+            st.tile_mut(&w, "2026-10-22").hours_override = h;
+        }
+        assert_eq!(tile_json(&st, &w, "2026-10-22")["hours"], 2.0);
     }
 
     #[test]

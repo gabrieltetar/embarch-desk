@@ -428,8 +428,14 @@ pub struct Tile {
     pub lines: Vec<Line>,
     #[serde(default)]
     pub note: Option<String>,
+    /// Hours a person typed (decision 57). Only that: nothing the desk
+    /// computed or sent ever lands here (decision 61).
     #[serde(default)]
     pub hours_override: Option<f64>,
+    /// The hours ✓ sent to Harvest, kept so the approved record reads true.
+    /// Cleared when the entry goes and the tile reopens (decision 61).
+    #[serde(default)]
+    pub sent_hours: Option<f64>,
     #[serde(default)]
     pub harvest: Option<HarvestTarget>,
     #[serde(default)]
@@ -710,6 +716,19 @@ impl State {
         id
     }
 
+    /// The entry a ✓ made is gone: its tiles open again with what ✓ froze
+    /// cleared, so they propose the current gap. A person's typed override
+    /// stays (decision 61).
+    pub fn reopen_tiles_of_entry(&mut self, entry: u64) {
+        for t in self.tiles.values_mut().filter(|t| t.harvest_entry_id == Some(entry)) {
+            t.status = TileStatus::Open;
+            t.harvest_entry_id = None;
+            t.acted_ms = None;
+            t.final_seconds = None;
+            t.sent_hours = None;
+        }
+    }
+
     pub fn tile_mut(&mut self, item_id: &str, date: &str) -> &mut Tile {
         let id = format!("{item_id}@{date}");
         self.tiles.entry(id.clone()).or_insert_with(|| Tile {
@@ -719,6 +738,7 @@ impl State {
             lines: vec![],
             note: None,
             hours_override: None,
+            sent_hours: None,
             harvest: None,
             status: TileStatus::Open,
             harvest_entry_id: None,
