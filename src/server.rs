@@ -1048,10 +1048,47 @@ fn approve_fallback_note(st: &State, item_id: &str, date: &str) -> String {
     lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("; ")
 }
 
+/// A typed override sends what the person typed, so a gap that moved under
+/// it is the one thing ✓ refuses over, once (decision 62); with no override
+/// ✓ sends the fresh gap.
+fn gap_moved_under_override(before: f64, after: f64, typed: Option<f64>) -> bool {
+    typed.is_some() && (before - after).abs() > 0.005
+}
+
+/// How long a past day's Harvest entries are trusted before the sync loop
+/// reads that day again (decision 62) [chosen].
+const PAST_DAY_REFRESH_MS: i64 = 10 * 60_000;
+
+/// The earlier days with a waiting tile whose Harvest read is older than
+/// `PAST_DAY_REFRESH_MS`: one per distinct day, never one per tile, so a
+/// pass makes at most one read per such day.
+fn past_days_due(st: &State, fetched: &HashMap<String, i64>, today: &str, now: i64) -> Vec<String> {
+    let mut days: Vec<String> = st
+        .tile_keys()
+        .into_iter()
+        .filter(|(i, d)| d.as_str() < today && st.tiles.get(&format!("{i}@{d}")).is_none_or(|t| t.status == TileStatus::Open))
+        .map(|(_, d)| d)
+        .filter(|d| now - fetched.get(d).copied().unwrap_or(0) > PAST_DAY_REFRESH_MS)
+        .collect();
+    days.sort();
+    days.dedup();
+    days
+}
+
 /// ✓: the tile becomes a Harvest time entry. The human's alone — no MCP
 /// tool reaches this route.
 async fn approve_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     let (item, date) = split_tile_id(&id)?;
+    // Re-read the tile's day before computing what to send (decision 62): an
+    // entry typed into Harvest since the day was last read would otherwise
+    // be sent twice. A failed read falls back to what is stored.
+    let before = app.db.read(|st| {
+        require_open(st, &id)?;
+        Ok::<_, ApiError>((tile_json(st, &item, &date)["computed_hours"].as_f64().unwrap_or(0.0), st.tiles.get(&id).and_then(|t| t.hours_override)))
+    })?;
+    if let Err(e) = refresh_logged(&app, &date).await {
+        tracing::warn!("re-reading Harvest for {date} before the entry: {e:#}");
+    }
     let (target, note, hours, seconds) = app.db.read(|st| {
         require_open(st, &id)?;
         let t = st.tiles.get(&id);
@@ -1063,6 +1100,14 @@ async fn approve_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult 
         let j = tile_json(st, &item, &date);
         Ok::<_, ApiError>((target, note, j["hours"].as_f64().unwrap_or(0.0), j["seconds"].as_i64().unwrap_or(0)))
     })?;
+    let after = app.db.read(|st| tile_json(st, &item, &date)["computed_hours"].as_f64().unwrap_or(0.0));
+    if gap_moved_under_override(before.0, after, before.1) {
+        return Err(bad(format!(
+            "Harvest changed for {date} since this tile was read: the gap is now {after:.2} h, was {:.2} h, and you typed {:.2} h; check the hours and press send again",
+            before.0,
+            before.1.unwrap_or(0.0)
+        )));
+    }
     if hours <= 0.0 {
         return Err(bad("this tile has no time; set its hours before sending it"));
     }
@@ -2304,6 +2349,17 @@ pub async fn sync_once(app: &App, force_issues: bool) {
             tracing::warn!("reading Harvest for {today}: {e:#}");
         }
     }
+    let due = {
+        let fetched = app.cache.lock().expect("cache").logged_fetched.clone();
+        app.db.read(|st| past_days_due(st, &fetched, &today, now))
+    };
+    for day in due {
+        if let Err(e) = refresh_logged(app, &day).await {
+            tracing::warn!("reading Harvest for {day}: {e:#}");
+            // Back off a failed day for the interval rather than retry every pass.
+            app.cache.lock().expect("cache").logged_fetched.insert(day, now);
+        }
+    }
 }
 
 /// Every desk's reference index whose five minutes are up (decision 56),
@@ -2687,6 +2743,33 @@ mod tests {
             st.tile_mut(&w, "2026-10-22").hours_override = h;
         }
         assert_eq!(tile_json(&st, &w, "2026-10-22")["hours"], 2.0);
+    }
+
+    #[test]
+    fn past_days_with_waiting_tiles_are_read_once_each_per_interval_and_a_moved_gap_refuses_an_override() {
+        let mut st = State::default();
+        for (n, title) in ["a", "b", "c"].iter().enumerate() {
+            let w = st.create_item(title, None, D0);
+            for day in ["2026-10-21", "2026-10-22"] {
+                if n < 2 || day == "2026-10-22" {
+                    st.tile_mut(&w, day);
+                }
+            }
+            st.tile_mut(&w, "2026-10-23");
+        }
+        let done = st.create_item("done", None, D0);
+        st.tile_mut(&done, "2026-10-20").status = TileStatus::Approved;
+        let mut fetched = HashMap::new();
+        let now = D0 + 100 * H;
+        let due = past_days_due(&st, &fetched, "2026-10-23", now);
+        assert_eq!(due, ["2026-10-21", "2026-10-22"], "one read per distinct earlier day, not per tile, and not today or an acted-on tile's day");
+        fetched.insert("2026-10-21".to_string(), now - 60_000);
+        assert_eq!(past_days_due(&st, &fetched, "2026-10-23", now), ["2026-10-22"], "a fresh read is left alone");
+        fetched.insert("2026-10-21".to_string(), now - PAST_DAY_REFRESH_MS - 1);
+        assert_eq!(past_days_due(&st, &fetched, "2026-10-23", now).len(), 2);
+        assert!(gap_moved_under_override(2.0, 1.0, Some(2.0)));
+        assert!(!gap_moved_under_override(2.0, 2.0, Some(2.0)));
+        assert!(!gap_moved_under_override(2.0, 1.0, None), "with no override ✓ sends the fresh gap");
     }
 
     #[test]
