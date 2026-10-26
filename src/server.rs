@@ -1089,7 +1089,7 @@ async fn approve_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult 
     if let Err(e) = refresh_logged(&app, &date).await {
         tracing::warn!("re-reading Harvest for {date} before the entry: {e:#}");
     }
-    let (target, note, hours, seconds) = app.db.read(|st| {
+    let (target, note, hours, seconds, reference) = app.db.read(|st| {
         require_open(st, &id)?;
         let t = st.tiles.get(&id);
         let target = st.tile_target(&item, &date).0.ok_or_else(|| bad("pick a Harvest project and task first, or Polish to have Claude guess one"))?;
@@ -1098,7 +1098,9 @@ async fn approve_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult 
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| approve_fallback_note(st, &item, &date));
         let j = tile_json(st, &item, &date);
-        Ok::<_, ApiError>((target, note, j["hours"].as_f64().unwrap_or(0.0), j["seconds"].as_i64().unwrap_or(0)))
+        // The entry links its item's Linear issue, as Linear's integration does (decision 63).
+        let reference = st.items.get(&item).and_then(|i| i.issue.as_ref()).and_then(|i| harvest::linear_reference(&i.key, &i.url));
+        Ok::<_, ApiError>((target, note, j["hours"].as_f64().unwrap_or(0.0), j["seconds"].as_i64().unwrap_or(0), reference))
     })?;
     let after = app.db.read(|st| tile_json(st, &item, &date)["computed_hours"].as_f64().unwrap_or(0.0));
     if gap_moved_under_override(before.0, after, before.1) {
@@ -1112,7 +1114,7 @@ async fn approve_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult 
         return Err(bad("this tile has no time; set its hours before sending it"));
     }
     let conns = Connectors::load()?;
-    let entry = harvest::create_entry(&conns.harvest, target.account_id, target.project_id, target.task_id, &date, hours, &note).await?;
+    let entry = harvest::create_entry(&conns.harvest, target.account_id, target.project_id, target.task_id, &date, hours, &note, reference.as_ref()).await?;
     let now = now_ms();
     app.db.write(|st| {
         let t = st.tile_mut(&item, &date);

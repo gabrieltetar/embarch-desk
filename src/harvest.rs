@@ -218,6 +218,44 @@ pub async fn delete_entry(conns: &[Account], account_id: u64, entry_id: u64) -> 
     Ok(())
 }
 
+/// The Harvest icon on the entries Linear's own integration makes [measured
+/// 2026-10-26, from one such entry's `external_reference`].
+const LINEAR_ICON: &str = "https://proxy.harvestfiles.com/production_harvestapp_public/uploads/platform_icons/linear.app.png?1614522198";
+
+/// An entry's link to its Linear issue (decision 63), shaped as Linear's own
+/// Harvest integration writes one: the issue key as `id`, the workspace's URL
+/// key as `group_id`, the issue's short permalink. Harvest's docs name only
+/// `id`, `group_id`, `account_id` and `permalink` as parameters; `service`
+/// and its icon ride along so the entry reads as the integration's do. None
+/// for a URL that is not a Linear issue's.
+pub fn linear_reference(key: &str, url: &str) -> Option<Value> {
+    let rest = url.strip_prefix("https://linear.app/")?;
+    let mut parts = rest.split('/');
+    let workspace = parts.next().filter(|w| !w.is_empty())?;
+    if parts.next() != Some("issue") || key.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "id": key, "group_id": workspace, "account_id": Value::Null,
+        "permalink": format!("https://linear.app/{workspace}/issue/{key}"),
+        "service": "linear.app", "service_icon_url": LINEAR_ICON,
+    }))
+}
+
+/// What `create_entry` posts: hours to the hundredth, and the issue's link
+/// when the entry has one.
+fn entry_body(project_id: u64, task_id: u64, date: &str, hours: f64, notes: &str, reference: Option<&Value>) -> Value {
+    let mut body = json!({
+        "project_id": project_id, "task_id": task_id, "spent_date": date,
+        "hours": (hours * 100.0).round() / 100.0, "notes": notes,
+    });
+    if let Some(r) = reference {
+        body["external_reference"] = r.clone();
+    }
+    body
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn create_entry(
     conns: &[Account],
     account_id: u64,
@@ -226,6 +264,7 @@ pub async fn create_entry(
     date: &str,
     hours: f64,
     notes: &str,
+    reference: Option<&Value>,
 ) -> Result<u64> {
     for (c, a) in accounts(conns).await? {
         if a.account_id != account_id {
@@ -235,10 +274,7 @@ pub async fn create_entry(
             .post(format!("{API}/time_entries"))
             .bearer_auth(&c.token)
             .header("Harvest-Account-Id", account_id.to_string())
-            .json(&json!({
-                "project_id": project_id, "task_id": task_id, "spent_date": date,
-                "hours": (hours * 100.0).round() / 100.0, "notes": notes,
-            }))
+            .json(&entry_body(project_id, task_id, date, hours, notes, reference))
             .send()
             .await?;
         let status = resp.status();
@@ -257,6 +293,24 @@ mod tests {
 
     fn acct() -> HarvestAccount {
         HarvestAccount { connector: "c".into(), account_id: 7, name: "Acme".into() }
+    }
+
+    #[test]
+    fn an_issue_entry_carries_its_linear_link_as_linear_writes_it() {
+        let r = linear_reference("ABC-123", "https://linear.app/acme/issue/ABC-123/fix-the-widget").unwrap();
+        assert_eq!(r["id"], "ABC-123");
+        assert_eq!(r["group_id"], "acme");
+        assert_eq!(r["permalink"], "https://linear.app/acme/issue/ABC-123");
+        assert_eq!(r["service"], "linear.app");
+        assert!(r["account_id"].is_null());
+        let body = entry_body(1, 2, "2026-10-26", 1.234, "n", Some(&r));
+        assert_eq!(body["external_reference"], r);
+        assert_eq!(body["hours"], 1.23);
+        assert!(entry_body(1, 2, "2026-10-26", 1.0, "n", None).get("external_reference").is_none(), "no issue, no link");
+        for url in ["", "https://example.com/acme/issue/ABC-123", "https://linear.app/acme/project/x", "https://linear.app//issue/ABC-123"] {
+            assert!(linear_reference("ABC-123", url).is_none(), "{url}");
+        }
+        assert!(linear_reference("", "https://linear.app/acme/issue/ABC-123").is_none());
     }
 
     #[tokio::test]
