@@ -103,6 +103,7 @@ pub fn router(app: Shared) -> Router {
         .route("/tiles/{id}/polish", post(polish_tile))
         .route("/tiles/{id}/approve", post(approve_tile))
         .route("/tiles/{id}/discard", post(discard_tile))
+        .route("/tiles/{id}/fold", post(fold_tile))
         .route("/harvest/targets", get(harvest_targets))
         .route("/slack/draft", post(slack_draft))
         .route("/slack/reply", post(slack_reply))
@@ -191,26 +192,43 @@ fn tile_json(st: &State, item_id: &str, date: &str) -> Value {
     // The tile proposes only what Harvest doesn't already hold for this item
     // that day (decision 41).
     let computed = ((captured - logged).max(0.0) * 100.0).round() / 100.0;
+    let override_hours = t.and_then(|t| t.hours_override);
+    // Its own lines and those of the tiles folded into it, as the polish
+    // reads them (decision 58).
+    let mut lines: Vec<store::Line> =
+        t.into_iter().chain(st.folded_into(item_id, date)).flat_map(|t| t.lines.iter().cloned()).collect();
+    lines.sort_by_key(|l| l.ms);
     json!({
         "id": id,
         "date": date,
         "seconds": seconds,
-        "hours": t.and_then(|t| t.hours_override).unwrap_or(computed),
+        "hours": override_hours.unwrap_or(computed),
         "computed_hours": computed,
         "captured_hours": (captured * 100.0).round() / 100.0,
         "logged_hours": (logged * 100.0).round() / 100.0,
-        "lines": lines_json(t.map(|t| t.lines.as_slice()).unwrap_or_default()),
+        "lines": lines_json(&lines),
         "note": t.and_then(|t| t.note.clone()),
         "harvest": st.tile_target(item_id, date).0,
         "harvest_from_desk": st.tile_target(item_id, date).1,
         "status": t.map(|t| t.status.clone()).unwrap_or_default(),
+        "covered": override_hours.is_none() && logged > 0.0 && computed == 0.0,
+        "folded_into": t.and_then(|t| t.folded_into.clone()),
     })
 }
 
+/// A tile with nothing left to send: Harvest already holds at least the
+/// time it captured, and nobody set its hours by hand. It closes itself
+/// (decision 57) and opens again if the entries covering it go.
+fn covered(st: &State, item_id: &str, date: &str) -> bool {
+    tile_json(st, item_id, date)["covered"] == true
+}
+
+/// The tiles still waiting for a ✓ or ✕: open, and not covered.
 fn open_tile_keys(st: &State) -> Vec<(String, String)> {
     st.tile_keys()
         .into_iter()
         .filter(|(i, d)| st.tiles.get(&format!("{i}@{d}")).is_none_or(|t| t.status == TileStatus::Open))
+        .filter(|(i, d)| !covered(st, i, d))
         .collect()
 }
 
@@ -337,19 +355,26 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, desk: Op
     let in_open = |i: &store::WorkItem| scope.is_none() || i.desk_id == scope;
     let mut items: Vec<&store::WorkItem> =
         st.items.values().filter(|i| visible(st, i, now, window_days, &open) && in_open(i)).collect();
-    // Other desks' unsent tiles, so nothing waits unseen behind a switch.
-    let elsewhere: Vec<Value> = open
+    // The hand (decision 57): every tile waiting for a ✓ or ✕, on every
+    // desk, so nothing waits unseen behind a switch — this desk's first,
+    // then oldest first.
+    let mut hand: Vec<(bool, Value)> = open
         .iter()
         .filter_map(|(i, d)| {
             let item = st.items.get(i)?;
-            (!in_open(item) && st.tile_seconds(i, d) > 0).then(|| {
+            (!item.archived && (st.tile_seconds(i, d) > 0 || st.tiles.contains_key(&format!("{i}@{d}")))).then(|| {
                 let mut t = tile_json(st, i, d);
+                t["item_id"] = json!(item.id);
+                t["key"] = json!(item.issue.as_ref().map(|r| r.key.clone()));
                 t["item_title"] = json!(item.title);
+                t["desk_id"] = json!(item.desk_id);
                 t["desk"] = json!(item.desk_id.as_ref().and_then(|k| st.desks.get(k)).map(|k| k.name.clone()));
-                t
+                (in_open(item), t)
             })
         })
         .collect();
+    hand.sort_by(|a, b| (!a.0, a.1["date"].as_str()).cmp(&(!b.0, b.1["date"].as_str())));
+    let hand: Vec<Value> = hand.into_iter().map(|(_, t)| t).collect();
     items.sort_by_key(|i| (!i.pinned, std::cmp::Reverse(i.last_activity_ms)));
     let cards: Vec<Value> = items
         .iter()
@@ -418,7 +443,7 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, desk: Op
         "connectors": cache.connectors,
         "ignore": st.ignore,
         "drafts": st.drafts.values().filter(|d| d.status == "open").collect::<Vec<_>>(),
-        "elsewhere": elsewhere,
+        "hand": hand,
         "desks": st.desks.values().collect::<Vec<_>>(),
         "open_desk": st.open_desk.as_ref().and_then(|k| st.desks.get(k)),
         "day": day_json(st, &today, now),
@@ -803,6 +828,7 @@ fn require_open(st: &State, id: &str) -> Result<(), ApiError> {
     match st.tiles.get(id).map(|t| t.status.clone()) {
         Some(TileStatus::Approved) => Err(bad("this tile is already in Harvest")),
         Some(TileStatus::Discarded) => Err(bad("this tile was discarded")),
+        Some(TileStatus::Folded) => Err(bad("this tile was folded into a later one")),
         _ => Ok(()),
     }
 }
@@ -1052,6 +1078,21 @@ async fn discard_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult 
         Ok::<_, ApiError>(())
     })?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct FoldBody {
+    /// The date of the item's tile that takes this one's time and lines.
+    into: String,
+}
+
+/// Fold a tile into a later one of the same item (decision 58): one Harvest
+/// entry, dated the later day, carries both.
+async fn fold_tile(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<FoldBody>) -> ApiResult {
+    let (item, date) = split_tile_id(&id)?;
+    let now = now_ms();
+    app.db.write(|st| st.fold_tile(&item, &date, &b.into, now)).map_err(bad)?;
+    Ok(Json(app.db.read(|st| tile_json(st, &item, &b.into))))
 }
 
 // ---------------------------------------------------------------- slack
@@ -1666,6 +1707,7 @@ pub fn day_json(st: &State, date: &str, now: i64) -> Value {
                 "logged_hours": entries.iter().map(|e| e.hours).sum::<f64>(),
                 "harvest_entries": entries,
                 "status": t["status"],
+                "folded_into": t["folded_into"],
                 "harvest": t["harvest"],
                 "lines": lines,
                 "note": tile.and_then(|t| t.note.clone()),
@@ -2442,7 +2484,7 @@ mod tests {
     }
 
     #[test]
-    fn an_open_desk_scopes_the_cards_and_other_desks_unsent_tiles_wait_in_a_strip() {
+    fn an_open_desk_scopes_the_cards_and_the_hand_holds_every_desks_unsent_tiles() {
         let mut st = State::default();
         let a = st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0);
         let b = st.put_desk(store::Desk { name: "Beta".into(), ..Default::default() }, D0);
@@ -2459,8 +2501,9 @@ mod tests {
         let v = view_json(&st, &Cache::default(), D0 + 11 * H, 7, None, &UtcDays);
         let cards: Vec<&str> = v["cards"].as_array().unwrap().iter().map(|c| c["title"].as_str().unwrap()).collect();
         assert_eq!(cards, ["on alpha"]);
-        assert_eq!(v["elsewhere"][0]["item_title"], "on beta");
-        assert_eq!(v["elsewhere"][0]["desk"], "Beta");
+        assert_eq!(v["hand"][0]["item_title"], "on beta");
+        assert_eq!(v["hand"][0]["desk"], "Beta");
+        assert_eq!(v["hand"][0]["item_id"], wb.as_str());
         assert_eq!(v["open_desk"]["name"], "Alpha");
         st.open_desk = None;
         let all = view_json(&st, &Cache::default(), D0 + 11 * H, 7, None, &UtcDays);
@@ -2511,6 +2554,94 @@ mod tests {
         assert_eq!(item["harvest_entries"][0]["id"], 1);
         assert!(rows.iter().any(|r| r["title"] == "Weekly sync" && r["status"] == "harvest_only"));
         assert_eq!(d["total_hours"], 3.5, "1h unsent + 2.5h already in Harvest");
+    }
+
+    #[test]
+    fn the_hand_puts_the_open_desks_tiles_first_then_oldest_first() {
+        let mut st = State::default();
+        let a = st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0);
+        let b = st.put_desk(store::Desk { name: "Beta".into(), ..Default::default() }, D0);
+        let issue = store::IssueRef { key: "ABC-1".into(), ..Default::default() };
+        let wa = st.create_item("on alpha", Some(issue), D0);
+        let wb = st.create_item("on beta", None, D0);
+        st.items.get_mut(&wa).unwrap().desk_id = Some(a.clone());
+        st.items.get_mut(&wb).unwrap().desk_id = Some(b.clone());
+        for (sid, w, day) in [("s1", &wb, 0), ("s2", &wa, 1), ("s3", &wa, 0)] {
+            let mut s = crate::store::testing::session(sid);
+            s.item_id = Some(w.clone());
+            crate::store::record_activity(&mut s, D0 + day * 24 * H + 9 * H, &UtcDays);
+            crate::store::record_activity(&mut s, D0 + day * 24 * H + 10 * H, &UtcDays);
+            st.sessions.insert(sid.into(), s);
+        }
+        st.open_desk = Some(a.clone());
+        let v = view_json(&st, &Cache::default(), D0 + 35 * H, 7, None, &UtcDays);
+        let hand: Vec<(&str, &str)> = v["hand"].as_array().unwrap().iter()
+            .map(|t| (t["item_title"].as_str().unwrap(), t["date"].as_str().unwrap())).collect();
+        assert_eq!(hand, [("on alpha", "2026-10-22"), ("on alpha", "2026-10-23"), ("on beta", "2026-10-22")]);
+        assert_eq!(v["hand"][0]["key"], "ABC-1");
+        st.items.get_mut(&wb).unwrap().archived = true;
+        let v = view_json(&st, &Cache::default(), D0 + 35 * H, 7, None, &UtcDays);
+        assert_eq!(v["hand"].as_array().unwrap().len(), 2, "an archived card's tiles leave the hand");
+    }
+
+    #[test]
+    fn a_tile_harvest_already_covers_closes_itself_and_opens_again_when_the_entry_goes() {
+        let mut st = State::default();
+        let issue = store::IssueRef { key: "ABC-1".into(), ..Default::default() };
+        let w = st.create_item("Bootload", Some(issue), D0);
+        let mut s1 = crate::store::testing::session("s");
+        s1.item_id = Some(w.clone());
+        crate::store::record_activity(&mut s1, D0 + 9 * H, &UtcDays);
+        crate::store::record_activity(&mut s1, D0 + 10 * H, &UtcDays);
+        st.sessions.insert("s".into(), s1);
+        st.harvest_logged.insert("2026-10-22".into(), vec![store::LoggedEntry {
+            id: 1, issue_key: Some("ABC-1".into()), hours: 4.0, notes: "ABC-1: bring-up".into(), ..Default::default()
+        }]);
+        assert_eq!(tile_json(&st, &w, "2026-10-22")["covered"], true);
+        let v = view_json(&st, &Cache::default(), D0 + 11 * H, 7, None, &UtcDays);
+        assert_eq!(v["hand"].as_array().unwrap().len(), 0, "{v}");
+        assert_eq!(v["cards"][0]["tiles"].as_array().unwrap().len(), 0);
+        st.tile_mut(&w, "2026-10-22").hours_override = Some(0.5);
+        assert_eq!(tile_json(&st, &w, "2026-10-22")["covered"], false, "hours set by hand are the user's call");
+        st.tile_mut(&w, "2026-10-22").hours_override = None;
+        st.harvest_logged.clear();
+        let v = view_json(&st, &Cache::default(), D0 + 11 * H, 7, None, &UtcDays);
+        assert_eq!(v["hand"][0]["hours"], 1.0);
+    }
+
+    #[test]
+    fn a_folded_tile_sends_its_time_and_lines_with_the_later_one() {
+        let mut st = State::default();
+        let w = st.create_item("Comms", None, D0);
+        for (sid, day, hours) in [("s1", 0, 2), ("s2", 2, 3)] {
+            let mut s = crate::store::testing::session(sid);
+            s.item_id = Some(w.clone());
+            crate::store::record_activity(&mut s, D0 + day * 24 * H + 9 * H, &UtcDays);
+            crate::store::record_activity(&mut s, D0 + day * 24 * H + (9 + hours) * H, &UtcDays);
+            st.sessions.insert(sid.into(), s);
+        }
+        st.add_line(&w, "2026-10-22", "read the contract", "agent", D0 + 10 * H);
+        st.add_line(&w, "2026-10-24", "wrote the link", "agent", D0 + 58 * H);
+        st.harvest_logged.insert("2026-10-22".into(), vec![store::LoggedEntry { id: 1, hours: 0.5, notes: "x".into(), ..Default::default() }]);
+        st.items.get_mut(&w).unwrap().issue = Some(store::IssueRef { key: "ABC-1".into(), ..Default::default() });
+        st.harvest_logged.get_mut("2026-10-22").unwrap()[0].issue_key = Some("ABC-1".into());
+        assert!(st.fold_tile(&w, "2026-10-22", "2026-10-22", D0).is_err());
+        assert!(st.fold_tile(&w, "2026-10-22", "2026-10-23", D0).is_err(), "no tile that day");
+        st.fold_tile(&w, "2026-10-22", "2026-10-24", D0 + 60 * H).unwrap();
+        let v = view_json(&st, &Cache::default(), D0 + 60 * H, 7, None, &UtcDays);
+        let hand = v["hand"].as_array().unwrap();
+        assert_eq!(hand.len(), 1, "{v}");
+        assert_eq!((hand[0]["date"].as_str(), hand[0]["hours"].as_f64()), (Some("2026-10-24"), Some(4.5)), "the half hour Harvest held is not carried");
+        let notes: Vec<String> = st.day_notes(&w, "2026-10-24", &UtcDays).into_iter().map(|l| l.text).collect();
+        assert_eq!(notes, ["read the contract", "wrote the link"]);
+        assert_eq!(hand[0]["lines"].as_array().unwrap().len(), 2, "the card shows the lines it will send");
+        assert!(st.fold_tile(&w, "2026-10-22", "2026-10-24", D0).is_err(), "already folded");
+        let d = day_json(&st, "2026-10-22", D0 + 60 * H);
+        assert_eq!(d["groups"][0]["items"][0]["folded_into"], "2026-10-24");
+        assert_eq!(d["unsent_hours"], 0.0);
+        // A week on, the folded tile stays while its target is open.
+        st.prune(D0 + 60 * H + store::ARCHIVE_AFTER_MS + H);
+        assert_eq!(tile_json(&st, &w, "2026-10-24")["hours"], 4.5);
     }
 
     #[test]

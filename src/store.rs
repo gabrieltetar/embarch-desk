@@ -414,6 +414,9 @@ pub enum TileStatus {
     Open,
     Approved,
     Discarded,
+    /// Its time and lines went into a later tile of the same item, which
+    /// sends them as one Harvest entry.
+    Folded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,6 +442,9 @@ pub struct Tile {
     /// record stays true after its sessions are pruned.
     #[serde(default)]
     pub final_seconds: Option<i64>,
+    /// The date of the tile this one was folded into, same item.
+    #[serde(default)]
+    pub folded_into: Option<String>,
 }
 
 /// A write an agent proposed. Prose never leaves the desk unseen (decision
@@ -713,23 +719,65 @@ impl State {
             harvest_entry_id: None,
             acted_ms: None,
             final_seconds: None,
+            folded_into: None,
         })
     }
 
-    /// Session-open seconds on one item on one day: the plain sum of spans.
+    /// Session-open seconds on one item on one day: the plain sum of spans,
+    /// plus whatever earlier tiles were folded into this one.
     pub fn tile_seconds(&self, item_id: &str, date: &str) -> i64 {
         if let Some(t) = self.tiles.get(&format!("{item_id}@{date}")) {
             if let Some(s) = t.final_seconds {
                 return s;
             }
         }
-        self.sessions
+        let own: i64 = self
+            .sessions
             .values()
             .filter(|s| !s.ignored)
             .flat_map(|s| s.spans.iter())
             .filter(|sp| sp.item_id.as_deref() == Some(item_id) && sp.date == date)
             .map(|sp| (sp.last_ms - sp.first_ms) / 1000)
-            .sum()
+            .sum();
+        own + self.folded_into(item_id, date).map(|t| t.final_seconds.unwrap_or(0)).sum::<i64>()
+    }
+
+    /// The tiles of an item folded into its tile on `date`.
+    pub fn folded_into<'a>(&'a self, item_id: &'a str, date: &'a str) -> impl Iterator<Item = &'a Tile> + 'a {
+        self.tiles.values().filter(move |t| {
+            t.item_id == item_id && t.status == TileStatus::Folded && t.folded_into.as_deref() == Some(date)
+        })
+    }
+
+    /// Fold an item's open tile on `from` into its open tile on `into`: the
+    /// time and the lines go with it, and one Harvest entry dated `into`
+    /// carries both. What it carries is what it proposed — its own hours if
+    /// the user set them, else the gap Harvest's entries that day left — so
+    /// no hour is sent twice. That freezes now as its `final_seconds`.
+    pub fn fold_tile(&mut self, item_id: &str, from: &str, into: &str, now: i64) -> Result<(), String> {
+        if from == into {
+            return Err("a tile cannot fold into itself".into());
+        }
+        for d in [from, into] {
+            let open = self.tiles.get(&format!("{item_id}@{d}")).is_none_or(|t| t.status == TileStatus::Open);
+            if !open || !self.tile_keys().contains(&(item_id.to_string(), d.to_string())) {
+                return Err(format!("no open tile on {d} for this item"));
+            }
+        }
+        let captured = self.tile_seconds(item_id, from);
+        let logged = (self.logged_hours(item_id, from) * 3600.0).round() as i64;
+        let seconds = match self.tiles.get(&format!("{item_id}@{from}")).and_then(|t| t.hours_override) {
+            Some(h) => (h * 3600.0).round() as i64,
+            None => (captured - logged).max(0),
+        };
+        // The target gets a record, so the fold outlives its sessions.
+        self.tile_mut(item_id, into);
+        let t = self.tile_mut(item_id, from);
+        t.status = TileStatus::Folded;
+        t.folded_into = Some(into.to_string());
+        t.acted_ms = Some(now);
+        t.final_seconds = Some(seconds);
+        Ok(())
     }
 
     /// Every (item, date) that has time or a tile record — the tiles that exist.
@@ -885,7 +933,8 @@ impl State {
         let mut seen = std::collections::HashSet::new();
         kept.retain(|l| seen.insert(&l.source_path));
         let tile = self.tiles.get(&format!("{item_id}@{date}")).into_iter().flat_map(|t| t.lines.iter());
-        let mut out: Vec<Line> = tile.chain(kept).cloned().collect();
+        let folded = self.folded_into(item_id, date).flat_map(|t| t.lines.iter());
+        let mut out: Vec<Line> = tile.chain(folded).chain(kept).cloned().collect();
         out.sort_by_key(|l| l.ms);
         out
     }
@@ -1198,12 +1247,25 @@ impl State {
     /// removed, so a pass that removed nothing leaves the state file alone.
     pub fn prune(&mut self, now: i64) -> (Vec<Tile>, bool) {
         let before = (self.sessions.len(), self.pending_launches.len(), self.mailbox.len(), self.harvest_logged.len());
-        let old: Vec<String> = self
+        let mut old: Vec<String> = self
             .tiles
             .values()
             .filter(|t| t.status != TileStatus::Open && t.acted_ms.is_some_and(|a| now - a > ARCHIVE_AFTER_MS))
             .map(|t| t.id.clone())
             .collect();
+        // A folded tile's seconds are part of its target's until the target
+        // freezes them, so it goes to history with the target, not before.
+        let going = old.clone();
+        old.retain(|id| {
+            let t = &self.tiles[id];
+            match (&t.status, &t.folded_into) {
+                (TileStatus::Folded, Some(d)) => {
+                    let target = format!("{}@{d}", t.item_id);
+                    going.contains(&target) || !self.tiles.contains_key(&target)
+                }
+                _ => true,
+            }
+        });
         let archived: Vec<Tile> = old.iter().filter_map(|id| self.tiles.remove(id)).collect();
         // The tile goes to history; its lines stay on the item, which is
         // where the work's knowledge gathers.
