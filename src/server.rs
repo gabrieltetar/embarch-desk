@@ -903,7 +903,7 @@ async fn cached_recent(app: &App) -> Vec<Value> {
         }
     }
     let Ok(conns) = Connectors::load() else { return vec![] };
-    let r = harvest::recent_entries(&conns.harvest, 45).await.unwrap_or_default();
+    let r = harvest::recent_entries(&conns.harvest, 45).await.map(|e| e.entries).unwrap_or_default();
     app.cache.lock().expect("cache").harvest_recent = Some((now, r.clone()));
     r
 }
@@ -1263,9 +1263,11 @@ fn open_linear(app: &App) -> Option<store::LinearBinding> {
 
 async fn linear_mine(Ax(app): Ax<Shared>) -> ApiResult {
     let scope = open_linear(&app);
+    let (issues, truncated) = linear::my_issues(&linear_accounts()?, scope.as_ref()).await?;
     Ok(Json(json!({
         "scope": scope.as_ref().map(|b| b.project_name.clone()),
-        "issues": linear::my_issues(&linear_accounts()?, scope.as_ref()).await?,
+        "issues": issues,
+        "truncated": truncated,
     })))
 }
 
@@ -1472,9 +1474,17 @@ async fn harvest_entries(Json(b): Json<EntriesBody>) -> ApiResult {
             return Err(bad(format!("{d} is not a YYYY-MM-DD date")));
         }
     }
-    let entries = harvest::entries_between(&conns.harvest, &from, &to).await?;
+    let read = harvest::entries_between(&conns.harvest, &from, &to).await?;
+    let (entries, truncated) = (read.entries, read.truncated);
     let total: f64 = entries.iter().filter_map(|e| e["hours"].as_f64()).sum();
-    Ok(Json(json!({ "from": from, "to": to, "total_hours": (total * 100.0).round() / 100.0, "entries": entries })))
+    let mut out = json!({ "from": from, "to": to, "total_hours": (total * 100.0).round() / 100.0, "entries": entries, "truncated": truncated });
+    if truncated {
+        out["note"] = json!(format!(
+            "Cut at {} entries per Harvest account: total_hours is a lower bound. Ask for a shorter range.",
+            harvest::ENTRIES_CAP
+        ));
+    }
+    Ok(Json(out))
 }
 
 #[derive(Deserialize)]
@@ -1786,7 +1796,7 @@ async fn day(Ax(app): Ax<Shared>, Path(date): Path<String>) -> ApiResult {
 
 async fn pickup(Ax(app): Ax<Shared>) -> ApiResult {
     let scope = open_linear(&app);
-    let issues = linear::my_issues(&linear_accounts()?, scope.as_ref()).await?;
+    let (issues, _) = linear::my_issues(&linear_accounts()?, scope.as_ref()).await?;
     let carded: std::collections::HashSet<String> = app.db.read(|st| {
         st.items
             .values()
@@ -2067,7 +2077,7 @@ pub async fn refresh_logged(app: &App, date: &str) -> anyhow::Result<()> {
     if conns.harvest.is_empty() {
         return Ok(());
     }
-    let raw = harvest::entries_between(&conns.harvest, date, date).await?;
+    let raw = harvest::entries_between(&conns.harvest, date, date).await?.entries;
     let entries: Vec<store::LoggedEntry> = raw
         .iter()
         .map(|e| {

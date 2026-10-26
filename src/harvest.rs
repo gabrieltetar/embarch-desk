@@ -103,34 +103,66 @@ pub async fn targets(conns: &[Account]) -> Result<Vec<Target>> {
     Ok(out)
 }
 
+/// Most entries read per Harvest account in one call (spec.md §4). A year
+/// of daily entries fits; a longer range comes back cut and says so.
+pub const ENTRIES_CAP: usize = 2000;
+
+/// What `entries_between` read, and whether the cap cut it short.
+pub struct Entries {
+    pub entries: Vec<Value>,
+    pub truncated: bool,
+}
+
 /// The user's own entries from `from` to `to` (YYYY-MM-DD, inclusive), as
 /// `(account, project, task, notes, date, hours)` — what an agent reads back,
-/// and the examples a project guess is made from.
-pub async fn entries_between(conns: &[Account], from: &str, to: &str) -> Result<Vec<Value>> {
+/// and the examples a project guess is made from. Pages on `next_page` up to
+/// `ENTRIES_CAP` per account.
+pub async fn entries_between(conns: &[Account], from: &str, to: &str) -> Result<Entries> {
     let mut out = vec![];
+    let mut truncated = false;
     for (c, a) in accounts(conns).await? {
         let me = get(&c.token, Some(a.account_id), &format!("{API}/users/me")).await?;
         let uid = me["id"].as_u64().unwrap_or(0);
-        let v = get(
-            &c.token,
-            Some(a.account_id),
-            &format!("{API}/time_entries?user_id={uid}&from={from}&to={to}&per_page=100"),
-        )
+        let (rows, cut) = crate::connectors::take_capped(ENTRIES_CAP, |page: Option<u64>| {
+            let (token, a) = (c.token.clone(), a.clone());
+            async move {
+                let page = page.unwrap_or(1);
+                let v = get(
+                    &token,
+                    Some(a.account_id),
+                    &format!("{API}/time_entries?user_id={uid}&from={from}&to={to}&per_page=100&page={page}"),
+                )
+                .await?;
+                Ok(entry_page(&v, &a))
+            }
+        })
         .await?;
-        for e in v["time_entries"].as_array().into_iter().flatten() {
-            out.push(json!({
+        out.extend(rows);
+        truncated |= cut;
+    }
+    Ok(Entries { entries: out, truncated })
+}
+
+/// One page of `/time_entries` as the rows an agent reads, and the next page.
+fn entry_page(v: &Value, a: &HarvestAccount) -> (Vec<Value>, Option<u64>) {
+    let rows = v["time_entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            json!({
                 "id": e["id"], "is_running": e["is_running"],
                 "account_id": a.account_id, "account": a.name,
                 "project_id": e["project"]["id"], "project": e["project"]["name"], "client": e["client"]["name"],
                 "task_id": e["task"]["id"], "task": e["task"]["name"],
                 "notes": e["notes"], "date": e["spent_date"], "hours": e["hours"],
-            }));
-        }
-    }
-    Ok(out)
+            })
+        })
+        .collect();
+    (rows, v["next_page"].as_u64())
 }
 
-pub async fn recent_entries(conns: &[Account], days: i64) -> Result<Vec<Value>> {
+pub async fn recent_entries(conns: &[Account], days: i64) -> Result<Entries> {
     let today = chrono::Local::now().date_naive();
     let from = today - chrono::Duration::days(days);
     entries_between(conns, &from.to_string(), &today.to_string()).await
@@ -217,4 +249,37 @@ pub async fn create_entry(
         return body["id"].as_u64().ok_or_else(|| anyhow!("harvest returned no entry id"));
     }
     bail!("no connected Harvest account has id {account_id}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn acct() -> HarvestAccount {
+        HarvestAccount { connector: "c".into(), account_id: 7, name: "Acme".into() }
+    }
+
+    #[tokio::test]
+    async fn entries_from_three_pages_all_arrive_and_the_cap_flags_a_cut() {
+        // Synthetic pages: 100, 100, 50 entries, next_page chained.
+        let pages = |cap: usize| async move {
+            crate::connectors::take_capped(cap, |p: Option<u64>| async move {
+                let p = p.unwrap_or(1);
+                let n = if p == 3 { 50 } else { 100 };
+                let list: Vec<Value> = (0..n).map(|i| json!({ "id": p * 1000 + i, "hours": 1.0 })).collect();
+                let v = json!({ "time_entries": list, "next_page": if p < 3 { json!(p + 1) } else { Value::Null } });
+                Ok(entry_page(&v, &acct()))
+            })
+            .await
+            .unwrap()
+        };
+        let (rows, cut) = pages(2000).await;
+        assert_eq!(rows.len(), 250);
+        assert!(!cut);
+        assert_eq!(rows[0]["account"], "Acme");
+        assert_eq!(rows[249]["id"], 3049);
+        let (rows, cut) = pages(120).await;
+        assert_eq!(rows.len(), 120);
+        assert!(cut);
+    }
 }

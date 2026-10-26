@@ -109,9 +109,56 @@ pub fn http() -> reqwest::Client {
         .expect("reqwest client builds")
 }
 
+/// Pages until `cap` rows or the last page, and says whether the cap cut
+/// something off. `fetch` takes the cursor (none for the first page) and
+/// returns a page's rows and the next cursor.
+pub async fn take_capped<T, C, F, Fut>(cap: usize, mut fetch: F) -> Result<(Vec<T>, bool)>
+where
+    F: FnMut(Option<C>) -> Fut,
+    Fut: std::future::Future<Output = Result<(Vec<T>, Option<C>)>>,
+{
+    let mut out = vec![];
+    let mut cursor = None;
+    loop {
+        let (rows, next) = fetch(cursor.take()).await?;
+        out.extend(rows);
+        if out.len() > cap {
+            out.truncate(cap);
+            return Ok((out, true));
+        }
+        match next {
+            Some(_) if out.len() == cap => return Ok((out, true)),
+            Some(c) => cursor = Some(c),
+            None => return Ok((out, false)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn take_capped_follows_every_page_and_flags_a_cut() {
+        let pages = |n: usize| move |c: Option<usize>| async move {
+            let p = c.unwrap_or(1);
+            Ok((vec![p; 2], if p < n { Some(p + 1) } else { None }))
+        };
+        let (rows, cut) = take_capped(100, pages(3)).await.unwrap();
+        assert_eq!(rows, vec![1, 1, 2, 2, 3, 3]);
+        assert!(!cut);
+        let (rows, cut) = take_capped(5, pages(3)).await.unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(cut);
+        // Exactly the cap with nothing after it is not a cut.
+        let (rows, cut) = take_capped(6, pages(3)).await.unwrap();
+        assert_eq!(rows.len(), 6);
+        assert!(!cut);
+        // Landing on the cap with a page still to come is.
+        let (rows, cut) = take_capped(4, pages(3)).await.unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(cut);
+    }
 
     #[test]
     fn upsert_replaces_by_label_and_rejects_blanks() {

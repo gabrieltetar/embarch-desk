@@ -202,30 +202,46 @@ fn scope_filter(b: &LinearBinding) -> (&'static str, &str) {
 const OPEN_STATES: &str = "state: { type: { nin: [\"completed\", \"canceled\"] } }";
 const ROW_FIELDS: &str = "nodes { identifier title url updatedAt state { name } }";
 
+/// Most open assigned issues read per workspace (spec.md §4).
+pub const MINE_CAP: usize = 500;
+
 /// Open issues assigned to the user — in the open desk's Linear project when
-/// one is open, else in every connected workspace.
-pub async fn my_issues(accounts: &[Account], scope: Option<&LinearBinding>) -> Result<Vec<Value>> {
+/// one is open, else in every connected workspace — and whether `MINE_CAP`
+/// cut any workspace's list.
+pub async fn my_issues(accounts: &[Account], scope: Option<&LinearBinding>) -> Result<(Vec<Value>, bool)> {
     let mut out = vec![];
+    let mut truncated = false;
     for acct in in_scope(accounts, scope) {
-        let d = match scope {
+        let (decl, filter, vars) = match scope {
             Some(b) => {
                 let (field, id) = scope_filter(b);
-                let q = format!(
-                    "query($p: ID) {{ viewer {{ assignedIssues(first: 50, orderBy: updatedAt, \
-                     filter: {{ {OPEN_STATES}, {field}: {{ id: {{ eq: $p }} }} }}) {{ {ROW_FIELDS} }} }} }}"
-                );
-                gql(acct, &q, json!({ "p": id })).await?
+                ("($p: ID, $a: String)", format!("{OPEN_STATES}, {field}: {{ id: {{ eq: $p }} }}"), json!({ "p": id }))
             }
-            None => {
-                let q = format!(
-                    "{{ viewer {{ assignedIssues(first: 50, orderBy: updatedAt, filter: {{ {OPEN_STATES} }}) {{ {ROW_FIELDS} }} }} }}"
-                );
-                gql(acct, &q, json!({})).await?
-            }
+            None => ("($a: String)", OPEN_STATES.to_string(), json!({})),
         };
-        out.extend(issue_rows(acct, &d["viewer"]["assignedIssues"]["nodes"]));
+        let q = format!(
+            "query{decl} {{ viewer {{ assignedIssues(first: 50, after: $a, orderBy: updatedAt, filter: {{ {filter} }}) \
+             {{ {ROW_FIELDS} pageInfo {{ hasNextPage endCursor }} }} }} }}"
+        );
+        let q = q.as_str();
+        let vars = &vars;
+        let (rows, cut) = crate::connectors::take_capped(MINE_CAP, |after: Option<String>| async move {
+            let mut v = vars.clone();
+            v["a"] = json!(after);
+            let d = gql(acct, q, v).await?;
+            Ok(issue_page(acct, &d["viewer"]["assignedIssues"]))
+        })
+        .await?;
+        out.extend(rows);
+        truncated |= cut;
     }
-    Ok(out)
+    Ok((out, truncated))
+}
+
+/// One page of `assignedIssues` as rows, and the cursor of the next.
+fn issue_page(acct: &Account, page: &Value) -> (Vec<Value>, Option<String>) {
+    let next = if page["pageInfo"]["hasNextPage"] == true { page["pageInfo"]["endCursor"].as_str().map(str::to_string) } else { None };
+    (issue_rows(acct, &page["nodes"]), next)
 }
 
 /// Every issue in a desk's scope — its project, or its whole team — in every
@@ -400,6 +416,27 @@ pub fn start_state(states: &[Value], current_type: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn assigned_issues_page_on_the_cursor_until_the_cap() {
+        let acct = Account { label: "w".into(), token: "t".into() };
+        let page = |after: Option<String>| {
+            let n: u32 = after.as_deref().map(|a| a.parse().unwrap()).unwrap_or(0);
+            let nodes: Vec<Value> = (0..50).map(|i| json!({ "identifier": format!("X-{}", n * 50 + i) })).collect();
+            let more = n < 1;
+            json!({ "nodes": nodes, "pageInfo": { "hasNextPage": more, "endCursor": format!("{}", n + 1) } })
+        };
+        let (rows, cut) = crate::connectors::take_capped(MINE_CAP, |a| {
+            let p = page(a);
+            let acct = &acct;
+            async move { Ok(issue_page(acct, &p)) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 100);
+        assert!(!cut);
+        assert_eq!(rows[99]["key"], "X-99");
+    }
 
     #[test]
     fn start_work_moves_an_issue_forward_to_in_progress_only() {
