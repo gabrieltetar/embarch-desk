@@ -184,6 +184,9 @@ fn lines_json(lines: &[store::Line]) -> Vec<Value> {
 }
 
 fn tile_json(st: &State, item_id: &str, date: &str) -> Value {
+    if let Some(m) = st.more(item_id, date) {
+        return more_json(st, item_id, date, &m);
+    }
     let id = format!("{item_id}@{date}");
     let seconds = st.tile_seconds(item_id, date);
     let t = st.tiles.get(&id);
@@ -216,6 +219,36 @@ fn tile_json(st: &State, item_id: &str, date: &str) -> Value {
         "status": t.map(|t| t.status.clone()).unwrap_or_default(),
         "covered": override_hours.is_none() && logged > 0.0 && computed == 0.0,
         "folded_into": t.and_then(|t| t.folded_into.clone()),
+        "more": false,
+    })
+}
+
+/// An approved tile's continuation (decision 64), in the shape of a waiting
+/// tile: its hours are what ✓ adds to the entry, `logged_hours` what the
+/// item already has in Harvest that day, its lines those taken since the ✓.
+fn more_json(st: &State, item_id: &str, date: &str, m: &store::More) -> Value {
+    let id = format!("{item_id}@{date}");
+    let t = &st.tiles[&id];
+    let since = t.acted_ms.unwrap_or(0);
+    let lines: Vec<store::Line> = t.lines.iter().filter(|l| l.ms > since).cloned().collect();
+    json!({
+        "id": id,
+        "date": date,
+        "seconds": m.seconds,
+        "hours": m.hours,
+        "computed_hours": m.computed_hours,
+        "captured_hours": (m.seconds as f64 / 36.0).round() / 100.0,
+        "logged_hours": (st.harvest_hours(item_id, date) * 100.0).round() / 100.0,
+        "entry_hours": m.entry_hours,
+        "lines": lines_json(&lines),
+        "note": t.more_note.clone(),
+        "sent_note": t.note.clone(),
+        "harvest": st.tile_target(item_id, date).0,
+        "harvest_from_desk": st.tile_target(item_id, date).1,
+        "status": t.status.clone(),
+        "covered": false,
+        "folded_into": null,
+        "more": true,
     })
 }
 
@@ -226,11 +259,12 @@ fn covered(st: &State, item_id: &str, date: &str) -> bool {
     tile_json(st, item_id, date)["covered"] == true
 }
 
-/// The tiles still waiting for a ✓ or ✕: open, and not covered.
+/// The tiles still waiting for a ✓ or ✕: open and not covered, or approved
+/// with a continuation (decision 64).
 fn open_tile_keys(st: &State) -> Vec<(String, String)> {
     st.tile_keys()
         .into_iter()
-        .filter(|(i, d)| st.tiles.get(&format!("{i}@{d}")).is_none_or(|t| t.status == TileStatus::Open))
+        .filter(|(i, d)| st.waiting(i, d))
         .filter(|(i, d)| !covered(st, i, d))
         .collect()
 }
@@ -838,11 +872,21 @@ fn require_open(st: &State, id: &str) -> Result<(), ApiError> {
     }
 }
 
+/// [`require_open`], or an approved tile's continuation (decision 64):
+/// `true` when the route acts on the continuation.
+fn require_waiting(st: &State, id: &str) -> Result<bool, ApiError> {
+    let (item, date) = split_tile_id(id)?;
+    if st.more(&item, &date).is_some() {
+        return Ok(true);
+    }
+    require_open(st, id).map(|_| false)
+}
+
 async fn tile_line(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<LineBody>) -> ApiResult {
     let (item, date) = split_tile_id(&id)?;
     let note = b.note(now_ms(), "user")?;
     app.db.write(|st| {
-        require_open(st, &id)?;
+        require_waiting(st, &id)?;
         st.add_note(&item, &date, note);
         Ok::<_, ApiError>(())
     })?;
@@ -871,11 +915,21 @@ async fn patch_tile(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<T
         return Err(bad("hours must be between 0 and 24"));
     }
     app.db.write(|st| {
-        require_open(st, &id)?;
+        let more = require_waiting(st, &id)?;
         if !st.items.contains_key(&item) {
             return Err(missing("no such work item"));
         }
         let t = st.tile_mut(&item, &date);
+        // A continuation edits the entry it adds to, whose project stays.
+        if more {
+            if let Some(n) = b.note {
+                t.more_note = Some(n);
+            }
+            if let Some(h) = b.hours {
+                t.more_hours = h;
+            }
+            return Ok(());
+        }
         if let Some(n) = b.note {
             t.note = Some(n);
         }
@@ -988,22 +1042,26 @@ pub fn polish_prompt(item_label: &str, date: &str, hours: f64, lines: &[store::L
 /// goes to Harvest is the summary of the day's notes, chat-desk proposal 43).
 async fn polish_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     let (item, date) = split_tile_id(&id)?;
-    let (label, hours, lines) = app.db.read(|st| {
-        require_open(st, &id)?;
+    let (label, hours, lines, more) = app.db.read(|st| {
+        let more = require_waiting(st, &id)?;
         let w = st.items.get(&item).ok_or_else(|| missing("no such work item"))?;
         let label = match &w.issue {
             Some(r) => format!("{} {} (Linear issue)", r.key, r.title),
             None => format!("{} (no Linear issue)", w.title),
         };
         let t = tile_json(st, &item, &date);
+        // A continuation's note replaces the entry's, so it covers the day's
+        // whole entry, the hours already in it included (decision 64).
+        let hours = t["hours"].as_f64().unwrap_or(0.0) + t["entry_hours"].as_f64().unwrap_or(0.0);
         // That day's notes of every kind (proposal 43).
         let lines = st.day_notes(&item, &date, &LocalDays);
-        Ok::<_, ApiError>((label, t["hours"].as_f64().unwrap_or(0.0), lines))
+        Ok::<_, ApiError>((label, hours, lines, more))
     })?;
     let (desk_target, _) = app.db.read(|st| st.tile_target(&item, &date));
     // A desk names its Harvest project and task (decision 10 of the open-desk
-    // proposal): Claude drafts only the note, and no targets are fetched.
-    let (targets, recent) = if desk_target.is_some() {
+    // proposal): Claude drafts only the note, and no targets are fetched. A
+    // continuation's entry has its project already.
+    let (targets, recent) = if desk_target.is_some() || more {
         (vec![], vec![])
     } else {
         (cached_targets(&app).await?, cached_recent(&app).await)
@@ -1024,6 +1082,12 @@ async fn polish_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     });
     app.db.write(|st| {
         let t = st.tile_mut(&item, &date);
+        if more {
+            if !note.is_empty() {
+                t.more_note = Some(note.clone());
+            }
+            return;
+        }
         if !note.is_empty() {
             t.note = Some(note.clone());
         }
@@ -1066,7 +1130,7 @@ fn past_days_due(st: &State, fetched: &HashMap<String, i64>, today: &str, now: i
     let mut days: Vec<String> = st
         .tile_keys()
         .into_iter()
-        .filter(|(i, d)| d.as_str() < today && st.tiles.get(&format!("{i}@{d}")).is_none_or(|t| t.status == TileStatus::Open))
+        .filter(|(i, d)| d.as_str() < today && st.waiting(i, d))
         .map(|(_, d)| d)
         .filter(|d| now - fetched.get(d).copied().unwrap_or(0) > PAST_DAY_REFRESH_MS)
         .collect();
@@ -1079,6 +1143,9 @@ fn past_days_due(st: &State, fetched: &HashMap<String, i64>, today: &str, now: i
 /// tool reaches this route.
 async fn approve_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     let (item, date) = split_tile_id(&id)?;
+    if app.db.read(|st| require_waiting(st, &id))? {
+        return approve_more(&app, &id, &item, &date).await;
+    }
     // Re-read the tile's day before computing what to send (decision 62): an
     // entry typed into Harvest since the day was last read would otherwise
     // be sent twice. A failed read falls back to what is stored.
@@ -1125,17 +1192,99 @@ async fn approve_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult 
         t.note = Some(note);
         t.sent_hours = Some(hours);
     });
-    if let Err(e) = refresh_logged(&app, &date).await {
+    settle_after_send(&app, &item, &date).await;
+    Ok(Json(json!({ "harvest_entry_id": entry, "hours": hours })))
+}
+
+/// Read the day back after a ✓ and keep what Harvest holds for the item, so
+/// a continuation proposes only what was not typed into Harvest since
+/// (decision 64). A failed read keeps the sent hours as the mark.
+async fn settle_after_send(app: &App, item: &str, date: &str) {
+    if let Err(e) = refresh_logged(app, date).await {
         tracing::warn!("re-reading Harvest after the entry: {e:#}");
     }
-    Ok(Json(json!({ "harvest_entry_id": entry, "hours": hours })))
+    app.db.write(|st| {
+        let h = st.harvest_hours(item, date);
+        st.tile_mut(item, date).harvest_at_send = Some(h);
+    });
+}
+
+/// ✓ on a continuation (decision 64): its hours go onto the entry the first
+/// ✓ made, which takes the continuation's note — or keeps its own, with the
+/// lines taken since appended.
+async fn approve_more(app: &App, id: &str, item: &str, date: &str) -> ApiResult {
+    let before = app.db.read(|st| {
+        let j = tile_json(st, item, date);
+        (j["computed_hours"].as_f64().unwrap_or(0.0), st.tiles.get(id).and_then(|t| t.more_hours))
+    });
+    if let Err(e) = refresh_logged(app, date).await {
+        tracing::warn!("re-reading Harvest for {date} before the entry: {e:#}");
+    }
+    let (account, entry, added, total, note, seconds) = app.db.read(|st| {
+        if !require_waiting(st, id)? {
+            return Err(bad("this tile has no time since it was sent"));
+        }
+        let t = &st.tiles[id];
+        let entry = t.harvest_entry_id.ok_or_else(|| bad("this tile's Harvest entry is unknown"))?;
+        let account = st
+            .own_entry(item, date)
+            .map(|e| e.account_id)
+            .or(st.tile_target(item, date).0.map(|h| h.account_id))
+            .ok_or_else(|| bad("this tile's Harvest account is unknown"))?;
+        let j = tile_json(st, item, date);
+        let added = j["hours"].as_f64().unwrap_or(0.0);
+        let total = ((j["entry_hours"].as_f64().unwrap_or(0.0) + added) * 100.0).round() / 100.0;
+        let note = t.more_note.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
+            let new: Vec<&str> = j["lines"].as_array().into_iter().flatten().filter_map(|l| l["text"].as_str()).collect();
+            let sent = t.note.clone().unwrap_or_default();
+            [sent.as_str()].into_iter().chain(new).filter(|s| !s.trim().is_empty()).collect::<Vec<_>>().join("; ")
+        });
+        Ok::<_, ApiError>((account, entry, added, total, note, st.live_seconds(item, date)))
+    })?;
+    let after = app.db.read(|st| tile_json(st, item, date)["computed_hours"].as_f64().unwrap_or(0.0));
+    if gap_moved_under_override(before.0, after, before.1) {
+        return Err(bad(format!(
+            "Harvest changed for {date} since this tile was read: the time since the ✓ is now {after:.2} h, was {:.2} h, and you typed {:.2} h; check the hours and press send again",
+            before.0,
+            before.1.unwrap_or(0.0)
+        )));
+    }
+    if added <= 0.0 {
+        return Err(bad("this continuation has no time; set its hours before sending it"));
+    }
+    if total > 24.0 {
+        return Err(bad(format!("the entry would hold {total:.2} h, more than a day")));
+    }
+    let conns = Connectors::load()?;
+    harvest::update_entry(&conns.harvest, account, entry, Some(total), Some(&note)).await?;
+    let now = now_ms();
+    app.db.write(|st| {
+        let t = st.tile_mut(item, date);
+        t.acted_ms = Some(now);
+        t.final_seconds = Some(seconds);
+        t.note = Some(note);
+        t.sent_hours = Some(total);
+        t.more_hours = None;
+        t.more_note = None;
+    });
+    settle_after_send(app, item, date).await;
+    Ok(Json(json!({ "harvest_entry_id": entry, "hours": added, "entry_hours": total })))
 }
 
 async fn discard_tile(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     let (item, date) = split_tile_id(&id)?;
     let now = now_ms();
     app.db.write(|st| {
-        require_open(st, &id)?;
+        // ✕ on a continuation drops only the time since the ✓; the entry
+        // and its record stay (decision 64).
+        if require_waiting(st, &id)? {
+            let seconds = st.live_seconds(&item, &date);
+            let t = st.tile_mut(&item, &date);
+            t.final_seconds = Some(seconds);
+            t.more_hours = None;
+            t.more_note = None;
+            return Ok(());
+        }
         let seconds = st.tile_seconds(&item, &date);
         let t = st.tile_mut(&item, &date);
         t.status = TileStatus::Discarded;
@@ -1783,6 +1932,7 @@ pub fn day_json(st: &State, date: &str, now: i64) -> Value {
                 "logged_hours": entries.iter().map(|e| e.hours).sum::<f64>(),
                 "harvest_entries": entries,
                 "status": t["status"],
+                "more": t["more"],
                 "folded_into": t["folded_into"],
                 "harvest": t["harvest"],
                 "lines": lines,
@@ -1824,7 +1974,7 @@ pub fn day_json(st: &State, date: &str, now: i64) -> Value {
     let unsent: f64 = groups
         .iter()
         .flat_map(|g| g.3.iter())
-        .filter(|r| r["status"] == "open")
+        .filter(|r| r["status"] == "open" || r["more"] == true)
         .filter_map(|r| r["hours"].as_f64())
         .sum();
     let logged: f64 = st.harvest_logged.get(date).into_iter().flatten().map(|e| e.hours).sum();
@@ -2745,6 +2895,47 @@ mod tests {
             st.tile_mut(&w, "2026-10-22").hours_override = h;
         }
         assert_eq!(tile_json(&st, &w, "2026-10-22")["hours"], 2.0);
+    }
+
+    #[test]
+    fn an_approved_tile_with_time_since_its_send_is_dealt_again_as_a_continuation() {
+        let mut st = State::default();
+        let issue = store::IssueRef { key: "ABC-1".into(), ..Default::default() };
+        let w = st.create_item("Bootload", Some(issue), D0);
+        let mut s1 = crate::store::testing::session("s");
+        s1.item_id = Some(w.clone());
+        crate::store::record_activity(&mut s1, D0 + 9 * H, &UtcDays);
+        crate::store::record_activity(&mut s1, D0 + 13 * H, &UtcDays);
+        st.sessions.insert("s".into(), s1);
+        st.add_line(&w, "2026-10-22", "sent with the entry", "agent", D0 + 9 * H);
+        st.add_line(&w, "2026-10-22", "after the send", "agent", D0 + 12 * H);
+        let t = st.tile_mut(&w, "2026-10-22");
+        t.status = TileStatus::Approved;
+        t.final_seconds = Some(3600);
+        t.sent_hours = Some(1.5);
+        t.harvest_entry_id = Some(7);
+        t.acted_ms = Some(D0 + 10 * H);
+        t.note = Some("ABC-1: bring-up".into());
+        st.harvest_logged.insert("2026-10-22".into(), vec![store::LoggedEntry {
+            id: 7, issue_key: Some("ABC-1".into()), hours: 1.5, notes: "ABC-1: bring-up".into(), ..Default::default()
+        }]);
+        let v = view_json(&st, &Cache::default(), D0 + 13 * H, 7, None, &UtcDays);
+        let t = &v["hand"][0];
+        assert_eq!((t["more"].as_bool(), t["hours"].as_f64(), t["logged_hours"].as_f64()), (Some(true), Some(3.0), Some(1.5)), "{t}");
+        assert_eq!(t["lines"].as_array().unwrap().len(), 1);
+        assert_eq!(t["lines"][0]["text"], "after the send");
+        assert_eq!((t["note"].clone(), t["sent_note"].as_str()), (Value::Null, Some("ABC-1: bring-up")), "not ready until someone looks");
+        let d = day_json(&st, "2026-10-22", D0 + 13 * H);
+        assert_eq!(d["unsent_hours"], 3.0);
+        assert_eq!(d["total_hours"], 4.5);
+        assert_eq!(past_days_due(&st, &HashMap::new(), "2026-10-23", D0 + 30 * H), ["2026-10-22"]);
+        // ✕ drops only the time since: the record stays approved.
+        let live = st.live_seconds(&w, "2026-10-22");
+        st.tile_mut(&w, "2026-10-22").final_seconds = Some(live);
+        assert!(require_waiting(&st, &format!("{w}@2026-10-22")).is_err());
+        let v = view_json(&st, &Cache::default(), D0 + 13 * H, 7, None, &UtcDays);
+        assert_eq!(v["hand"].as_array().unwrap().len(), 0);
+        assert_eq!(tile_json(&st, &w, "2026-10-22")["status"], "approved");
     }
 
     #[test]

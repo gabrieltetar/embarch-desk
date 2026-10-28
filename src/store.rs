@@ -24,6 +24,9 @@ pub const LAUNCH_CLAIM_MS: i64 = 10 * 60 * 1000;
 pub const ARCHIVE_AFTER_MS: i64 = 7 * 24 * 3600 * 1000;
 /// Sessions quiet this long, with nothing left on an open tile, are dropped.
 pub const SESSION_TTL_MS: i64 = 35 * 24 * 3600 * 1000;
+/// Time captured after a ✓ under which no continuation is dealt (decision
+/// 64): the session's own last events after the click are not more work.
+pub const MORE_MIN_SECONDS: i64 = 5 * 60;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
@@ -451,6 +454,30 @@ pub struct Tile {
     /// The date of the tile this one was folded into, same item.
     #[serde(default)]
     pub folded_into: Option<String>,
+    /// Hours a person typed for an approved tile's continuation (decision 64).
+    #[serde(default)]
+    pub more_hours: Option<f64>,
+    /// The note drafted for the entry a continuation's ✓ updates; the sent
+    /// one stays in `note` until then.
+    #[serde(default)]
+    pub more_note: Option<String>,
+    /// Harvest's hours for the item that day right after the last ✓, so time
+    /// typed into Harvest since is not proposed again.
+    #[serde(default)]
+    pub harvest_at_send: Option<f64>,
+}
+
+/// What an approved tile captured since its ✓ (decision 64), dealt again as
+/// a continuation whose ✓ adds to the same Harvest entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct More {
+    pub seconds: i64,
+    /// Those seconds less what Harvest took on for the item since the ✓.
+    pub computed_hours: f64,
+    /// What the continuation proposes: the typed hours, else the computed.
+    pub hours: f64,
+    /// The entry's hours now: Harvest's, else what ✓ sent.
+    pub entry_hours: f64,
 }
 
 /// A write an agent proposed. Prose never leaves the desk unseen (decision
@@ -726,6 +753,9 @@ impl State {
             t.acted_ms = None;
             t.final_seconds = None;
             t.sent_hours = None;
+            t.more_hours = None;
+            t.more_note = None;
+            t.harvest_at_send = None;
         }
     }
 
@@ -745,6 +775,9 @@ impl State {
             acted_ms: None,
             final_seconds: None,
             folded_into: None,
+            more_hours: None,
+            more_note: None,
+            harvest_at_send: None,
         })
     }
 
@@ -756,6 +789,11 @@ impl State {
                 return s;
             }
         }
+        self.live_seconds(item_id, date)
+    }
+
+    /// [`State::tile_seconds`] as the sessions have it now, past any freeze.
+    pub fn live_seconds(&self, item_id: &str, date: &str) -> i64 {
         let own: i64 = self
             .sessions
             .values()
@@ -1196,6 +1234,41 @@ impl State {
             .sum()
     }
 
+    /// The entry an item's tile created, as Harvest last read it.
+    pub fn own_entry(&self, item_id: &str, date: &str) -> Option<&LoggedEntry> {
+        let own = self.tiles.get(&format!("{item_id}@{date}")).and_then(|t| t.harvest_entry_id)?;
+        self.harvest_logged.get(date)?.iter().find(|e| e.id == own)
+    }
+
+    /// Every hour Harvest holds for an item on a day, its own tile's included.
+    pub fn harvest_hours(&self, item_id: &str, date: &str) -> f64 {
+        self.logged_hours(item_id, date) + self.own_entry(item_id, date).map_or(0.0, |e| e.hours)
+    }
+
+    /// An approved tile's continuation (decision 64): the time its sessions
+    /// ran after the ✓, less any hours Harvest took on for the item since.
+    /// `None` when that is under [`MORE_MIN_SECONDS`] and nobody typed its
+    /// hours, as a covered open tile closes itself.
+    pub fn more(&self, item_id: &str, date: &str) -> Option<More> {
+        let t = self.tiles.get(&format!("{item_id}@{date}")).filter(|t| t.status == TileStatus::Approved)?;
+        let seconds = (self.live_seconds(item_id, date) - t.final_seconds.unwrap_or(0)).max(0);
+        let now = self.harvest_hours(item_id, date);
+        let grew = (now - t.harvest_at_send.unwrap_or(now)).max(0.0);
+        let computed = ((seconds as f64 / 3600.0 - grew).max(0.0) * 100.0).round() / 100.0;
+        if t.more_hours.is_none() && computed * 3600.0 < MORE_MIN_SECONDS as f64 {
+            return None;
+        }
+        let entry_hours = self.own_entry(item_id, date).map(|e| e.hours).or(t.sent_hours).unwrap_or(0.0);
+        Some(More { seconds, computed_hours: computed, hours: t.more_hours.unwrap_or(computed), entry_hours })
+    }
+
+    /// A tile still waiting on a person: open, or approved with a
+    /// continuation.
+    pub fn waiting(&self, item_id: &str, date: &str) -> bool {
+        self.tiles.get(&format!("{item_id}@{date}")).is_none_or(|t| t.status == TileStatus::Open)
+            || self.more(item_id, date).is_some()
+    }
+
     /// The effective Harvest target of a tile: its own, else its desk's.
     pub fn tile_target(&self, item_id: &str, date: &str) -> (Option<HarvestTarget>, bool) {
         if let Some(h) = self.tiles.get(&format!("{item_id}@{date}")).and_then(|t| t.harvest.clone()) {
@@ -1279,6 +1352,7 @@ impl State {
             .tiles
             .values()
             .filter(|t| t.status != TileStatus::Open && t.acted_ms.is_some_and(|a| now - a > ARCHIVE_AFTER_MS))
+            .filter(|t| self.more(&t.item_id, &t.date).is_none())
             .map(|t| t.id.clone())
             .collect();
         // A folded tile's seconds are part of its target's until the target
@@ -1302,15 +1376,8 @@ impl State {
             self.notes.entry(t.item_id.clone()).or_default().extend(t.lines.iter().cloned());
             self.notes_moved(&t.item_id, before, now);
         }
-        let open: std::collections::BTreeSet<(String, String)> = self
-            .tile_keys()
-            .into_iter()
-            .filter(|(i, d)| {
-                self.tiles
-                    .get(&format!("{i}@{d}"))
-                    .is_none_or(|t| t.status == TileStatus::Open)
-            })
-            .collect();
+        let open: std::collections::BTreeSet<(String, String)> =
+            self.tile_keys().into_iter().filter(|(i, d)| self.waiting(i, d)).collect();
         self.sessions.retain(|_, s| {
             now - s.last_ms < SESSION_TTL_MS
                 || s.spans.iter().any(|sp| {
@@ -1518,6 +1585,53 @@ mod tests {
         let (archived, _) = st.prune(D0 + 8 * DAY);
         assert_eq!(archived.len(), 1);
         assert!(st.tiles.is_empty());
+    }
+
+    #[test]
+    fn time_after_a_send_is_a_continuation_less_what_harvest_took_on_since() {
+        let mut st = State::default();
+        let issue = IssueRef { key: "ABC-1".into(), ..Default::default() };
+        let w = st.create_item("x", Some(issue), D0);
+        let mut s = session("s");
+        s.item_id = Some(w.clone());
+        record_activity(&mut s, D0 + 9 * H, &UtcDays);
+        record_activity(&mut s, D0 + 10 * H, &UtcDays);
+        st.sessions.insert("s".into(), s);
+        // ✓ sent typed hours over the hour captured, as a person may.
+        let t = st.tile_mut(&w, "2026-10-22");
+        t.status = TileStatus::Approved;
+        t.final_seconds = Some(3600);
+        t.sent_hours = Some(1.5);
+        t.hours_override = Some(1.5);
+        t.harvest_entry_id = Some(7);
+        t.acted_ms = Some(D0 + 10 * H);
+        let entry = |id, hours| LoggedEntry { id, hours, issue_key: Some("ABC-1".into()), ..Default::default() };
+        st.harvest_logged.insert("2026-10-22".into(), vec![entry(7, 1.5)]);
+        let on = |st: &mut State, ms| {
+            let mut s = st.sessions.remove("s").unwrap();
+            record_activity(&mut s, ms, &UtcDays);
+            st.sessions.insert("s".into(), s);
+        };
+        assert_eq!(st.more(&w, "2026-10-22"), None);
+        on(&mut st, D0 + 10 * H + 4 * 60_000);
+        assert_eq!(st.more(&w, "2026-10-22"), None, "a session's last minutes after the click are not more work");
+        on(&mut st, D0 + 12 * H);
+        let m = st.more(&w, "2026-10-22").unwrap();
+        assert_eq!((m.seconds, m.hours, m.entry_hours), (7200, 2.0, 1.5), "the time after the ✓, whatever the ✓ sent");
+        assert!(st.waiting(&w, "2026-10-22"));
+        assert_eq!(st.tile_seconds(&w, "2026-10-22"), 3600, "the approved record keeps what it sent");
+        // An hour typed into Harvest since the ✓ is not proposed again.
+        st.tile_mut(&w, "2026-10-22").harvest_at_send = Some(1.5);
+        st.harvest_logged.insert("2026-10-22".into(), vec![entry(7, 1.5), entry(8, 0.5)]);
+        assert_eq!(st.more(&w, "2026-10-22").unwrap().hours, 1.5);
+        st.harvest_logged.insert("2026-10-22".into(), vec![entry(7, 3.5)]);
+        assert_eq!(st.more(&w, "2026-10-22"), None, "the entry raised in Harvest covers it");
+        st.tile_mut(&w, "2026-10-22").more_hours = Some(0.25);
+        assert_eq!(st.more(&w, "2026-10-22").unwrap().hours, 0.25, "typed hours are the person's call");
+        let (archived, _) = st.prune(D0 + 8 * DAY);
+        assert!(archived.is_empty() && st.sessions.contains_key("s"), "a waiting continuation is neither archived nor loses its sessions");
+        st.reopen_tiles_of_entry(7);
+        assert_eq!(st.tiles[&format!("{w}@2026-10-22")].more_hours, None);
     }
 
     #[test]
