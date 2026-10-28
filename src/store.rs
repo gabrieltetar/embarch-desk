@@ -1253,7 +1253,9 @@ impl State {
         let t = self.tiles.get(&format!("{item_id}@{date}")).filter(|t| t.status == TileStatus::Approved)?;
         let seconds = (self.live_seconds(item_id, date) - t.final_seconds.unwrap_or(0)).max(0);
         let now = self.harvest_hours(item_id, date);
-        let grew = (now - t.harvest_at_send.unwrap_or(now)).max(0.0);
+        // A tile sent before the mark was kept measures from what ✓ sent.
+        let base = t.harvest_at_send.or(t.sent_hours.map(|s| s + self.logged_hours(item_id, date))).unwrap_or(now);
+        let grew = (now - base).max(0.0);
         let computed = ((seconds as f64 / 3600.0 - grew).max(0.0) * 100.0).round() / 100.0;
         if t.more_hours.is_none() && computed * 3600.0 < MORE_MIN_SECONDS as f64 {
             return None;
@@ -1620,6 +1622,11 @@ mod tests {
         assert_eq!((m.seconds, m.hours, m.entry_hours), (7200, 2.0, 1.5), "the time after the ✓, whatever the ✓ sent");
         assert!(st.waiting(&w, "2026-10-22"));
         assert_eq!(st.tile_seconds(&w, "2026-10-22"), 3600, "the approved record keeps what it sent");
+        // A tile sent before the mark was kept: the entry raised in Harvest
+        // since its ✓ still counts.
+        st.harvest_logged.insert("2026-10-22".into(), vec![entry(7, 2.5)]);
+        assert_eq!(st.more(&w, "2026-10-22").unwrap().hours, 1.0);
+        st.harvest_logged.insert("2026-10-22".into(), vec![entry(7, 1.5)]);
         // An hour typed into Harvest since the ✓ is not proposed again.
         st.tile_mut(&w, "2026-10-22").harvest_at_send = Some(1.5);
         st.harvest_logged.insert("2026-10-22".into(), vec![entry(7, 1.5), entry(8, 0.5)]);
