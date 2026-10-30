@@ -19,7 +19,6 @@ mod paths;
 mod refs;
 mod server;
 mod service;
-mod slack;
 mod store;
 mod uri;
 mod worktree;
@@ -52,7 +51,7 @@ enum Cmd {
     },
     /// Add a connector; the token is read from stdin so it stays out of shell history.
     Connect {
-        /// linear, harvest, github or slack
+        /// linear, harvest or github
         kind: String,
         /// A name for this account, e.g. the workspace
         label: String,

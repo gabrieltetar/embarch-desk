@@ -3,7 +3,7 @@ name = "embarch-desk"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "The EmbArch desk: work items that join a Linear issue to its PRs, Claude Code sessions, bench activity and time, plus the Linear/Harvest/GitHub/Slack connectors behind embarch-ui's Desk tab. embarch-doc/embarch-desk/spec.md is current truth."
+description = "The EmbArch desk: work items that join a Linear issue to its PRs, Claude Code sessions, bench activity and time, plus the Linear/Harvest/GitHub connectors behind embarch-ui's Desk tab. embarch-doc/embarch-desk/spec.md is current truth."
 
 [dependencies]
 anyhow = "1.0.103"

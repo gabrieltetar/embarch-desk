@@ -6,7 +6,7 @@
 
 Update them proactively per [../embarch-doc/DOC-PROTOCOL.md](../embarch-doc/DOC-PROTOCOL.md) whenever a notable design decision, feature, or status change happens here — §4 says when, §5 says how, and history goes in a `changelog.d/` fragment rather than into a doc.
 
-**Connector data never lands here.** Issue titles, Slack messages, client names and hours live in the user's own `~/.local/share/embarch-desk/`; tokens in `~/.config/embarch-desk/`. Tests use synthetic values only.
+**Connector data never lands here.** Issue titles, PR titles, client names and hours live in the user's own `~/.local/share/embarch-desk/`; tokens in `~/.config/embarch-desk/`. Tests use synthetic values only.
 
 ## Git
 

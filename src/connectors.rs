@@ -1,17 +1,21 @@
 //! The pasted tokens, one per account, in `connectors.toml` (owner-only).
 //!
 //! v1 takes tokens, not OAuth (proposal decision 16): a GitHub token or the
-//! user's existing `gh` login, a Linear personal API key per workspace, a
-//! Harvest personal access token (which covers every account its user has),
-//! and a Slack user token from an app the user made in their own workspace
-//! from `slack-manifest.json`. **No token ever leaves this file except in the
-//! request it authorizes** — the HTTP surface reports labels, never values.
+//! user's existing `gh` login, a Linear personal API key per workspace, and a
+//! Harvest personal access token (which covers every account its user has).
+//! **No token ever leaves this file except in the request it authorizes** —
+//! the HTTP surface reports labels, never values.
+//!
+//! A kind this version does not know — a `[[slack]]` table from before the
+//! Slack connector was removed (decision 66) — is never read, and is written
+//! back as it was whenever the file is saved: the desk does not delete a
+//! token it was not asked to delete.
 
 use crate::paths;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const KINDS: [&str; 4] = ["linear", "harvest", "github", "slack"];
+pub const KINDS: [&str; 3] = ["linear", "harvest", "github"];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Account {
@@ -27,8 +31,9 @@ pub struct Connectors {
     pub harvest: Vec<Account>,
     #[serde(default)]
     pub github: Vec<Account>,
-    #[serde(default)]
-    pub slack: Vec<Account>,
+    /// Every table of a kind not above, kept only to be saved back unchanged.
+    #[serde(flatten)]
+    pub other: toml::Table,
 }
 
 impl Connectors {
@@ -55,7 +60,6 @@ impl Connectors {
             "linear" => &mut self.linear,
             "harvest" => &mut self.harvest,
             "github" => &mut self.github,
-            "slack" => &mut self.slack,
             other => bail!("unknown connector kind {other:?}; one of {KINDS:?}"),
         })
     }
@@ -81,7 +85,7 @@ impl Connectors {
     }
 
     /// GitHub accounts, falling back to the user's `gh` login when none was
-    /// pasted — the cheapest connector of the four.
+    /// pasted — the cheapest connector of the three.
     pub fn github_accounts(&self) -> Vec<Account> {
         if !self.github.is_empty() {
             return self.github.clone();
@@ -168,7 +172,8 @@ mod tests {
         c.upsert("linear", "client", "c").unwrap();
         assert_eq!(c.linear.len(), 2);
         assert_eq!(c.linear[0].token, "b");
-        assert!(c.upsert("slack", "", "x").is_err());
+        assert!(c.upsert("harvest", "", "x").is_err());
+        assert!(c.upsert("slack", "ws", "xoxp-1").is_err());
         assert!(c.upsert("jira", "a", "b").is_err());
         assert!(c.remove("linear", "work").unwrap());
         assert!(!c.remove("linear", "work").unwrap());
@@ -178,8 +183,28 @@ mod tests {
     fn the_file_round_trips() {
         let mut c = Connectors::default();
         c.upsert("harvest", "me", "pat").unwrap();
-        c.upsert("slack", "ws", "xoxp-1").unwrap();
+        c.upsert("github", "me", "ghp-1").unwrap();
         let back: Connectors = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
+    }
+
+    /// A file written before the Slack connector went (decision 66) loads,
+    /// its Slack account is no kind the desk knows, and a save keeps it.
+    #[test]
+    fn a_retired_kind_loads_is_ignored_and_survives_a_save() {
+        let old = "[[linear]]\nlabel = \"work\"\ntoken = \"lin-1\"\n\n[[slack]]\nlabel = \"ws\"\ntoken = \"xoxp-1\"\n";
+        let mut c: Connectors = toml::from_str(old).unwrap();
+        assert_eq!(c.linear.len(), 1);
+        assert!(c.list_mut("slack").is_err());
+        assert!(c.remove("slack", "ws").is_err());
+        c.upsert("harvest", "me", "pat").unwrap();
+        let saved = toml::to_string(&c).unwrap();
+        let back: toml::Table = toml::from_str(&saved).unwrap();
+        let slack = back["slack"].as_array().unwrap();
+        assert_eq!(slack.len(), 1);
+        assert_eq!(slack[0]["label"].as_str(), Some("ws"));
+        assert_eq!(slack[0]["token"].as_str(), Some("xoxp-1"));
+        assert_eq!(back["harvest"].as_array().unwrap().len(), 1);
+        assert_eq!(back["linear"].as_array().unwrap().len(), 1);
     }
 }

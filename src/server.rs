@@ -2,7 +2,7 @@
 //! `embarch-ui` (which proxies the Desk tab's calls) and the desk's own MCP
 //! server. Every route but `/health` wants the desk token as a bearer; the
 //! browser never reaches this port directly, so a page on some other site
-//! cannot make the desk post to Slack as the user.
+//! cannot make the desk write to Linear or Harvest as the user.
 //!
 //! Writes come in two kinds (proposal decision 15): a status move goes
 //! straight through — an issue's status, a tile's ✓ — and anything carrying
@@ -14,7 +14,7 @@ use crate::connectors::Connectors;
 use crate::db::Db;
 use crate::events::{self, HookEvent};
 use crate::store::{self, Days, HarvestTarget, LocalDays, MailboxEntry, PendingLaunch, RealGit, State, TakeError, TileStatus};
-use crate::{brief, github, harvest, linear, localrepo, refs, slack, uri};
+use crate::{brief, github, harvest, linear, localrepo, refs, uri};
 use axum::extract::{Path, Query, State as Ax};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -39,13 +39,10 @@ pub struct App {
 #[derive(Default)]
 pub struct Cache {
     pub connectors: Vec<Value>,
-    pub slack: Vec<slack::FeedItem>,
-    pub slack_errors: Vec<String>,
     pub harvest_targets: Option<(i64, Vec<harvest::Target>)>,
     pub harvest_recent: Option<(i64, Vec<Value>)>,
     pub pr_checked: HashMap<String, i64>,
     pub last_status_ms: i64,
-    pub last_slack_ms: i64,
     pub logged_fetched: HashMap<String, i64>,
     /// `claude agents --json`, by session id: live state of every session.
     pub agents: HashMap<String, Value>,
@@ -105,8 +102,6 @@ pub fn router(app: Shared) -> Router {
         .route("/tiles/{id}/discard", post(discard_tile))
         .route("/tiles/{id}/fold", post(fold_tile))
         .route("/harvest/targets", get(harvest_targets))
-        .route("/slack/draft", post(slack_draft))
-        .route("/slack/reply", post(slack_reply))
         .route("/connectors", get(list_connectors).post(add_connector))
         .route("/connectors/{kind}/{label}", delete(remove_connector))
         .route("/ignore", get(get_ignore).put(put_ignore))
@@ -456,7 +451,6 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, desk: Op
             })
         })
         .collect();
-    let unread = cache.slack.iter().filter(|f| f.unread).count();
     let waiting = st
         .sessions
         .values()
@@ -470,13 +464,6 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, desk: Op
         "sessions": view_sessions(st, cache, now),
         "settings": st.settings,
         "sessions_waiting": waiting,
-        "slack": {
-            "mentions": cache.slack.iter().filter(|f| f.kind == "mention").count(),
-            "dms": cache.slack.iter().filter(|f| f.kind == "dm").count(),
-            "unread": unread,
-            "items": cache.slack,
-            "errors": cache.slack_errors,
-        },
         "connectors": cache.connectors,
         "ignore": st.ignore,
         "drafts": st.drafts.values().filter(|d| d.status == "open").collect::<Vec<_>>(),
@@ -1310,58 +1297,6 @@ async fn fold_tile(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<Fo
     Ok(Json(app.db.read(|st| tile_json(st, &item, &b.into))))
 }
 
-// ---------------------------------------------------------------- slack
-
-#[derive(Deserialize)]
-struct DraftBody {
-    account: String,
-    channel: String,
-    ts: String,
-}
-
-async fn slack_draft(Ax(app): Ax<Shared>, Json(b): Json<DraftBody>) -> ApiResult {
-    let msg = app
-        .cache
-        .lock()
-        .expect("cache")
-        .slack
-        .iter()
-        .find(|f| f.account == b.account && f.channel == b.channel && f.ts == b.ts)
-        .cloned()
-        .ok_or_else(|| missing("that message is no longer in the feed"))?;
-    let prompt = format!(
-        "{} wrote to me on Slack ({}):\n\n{}\n\nDraft my reply: short, plain, friendly, no sign-off. \
-         If it needs information I would have to look up, say what I will check instead of inventing it. \
-         Reply with the message text only.",
-        msg.user_name,
-        if msg.kind == "dm" { "a direct message".to_string() } else { format!("a mention in #{}", msg.channel_name) },
-        msg.text
-    );
-    let draft = claude::ask("You draft short Slack replies for the user to review before sending.", &prompt, &app.model).await?;
-    Ok(Json(json!({ "draft": draft.trim(), "thread_ts": msg.thread_ts.clone().unwrap_or(msg.ts.clone()) })))
-}
-
-#[derive(Deserialize)]
-struct ReplyBody {
-    account: String,
-    channel: String,
-    #[serde(default)]
-    thread_ts: Option<String>,
-    text: String,
-}
-
-/// Sends what the user approved — the reply's text comes from the request,
-/// never from a stored draft.
-async fn slack_reply(Ax(_app): Ax<Shared>, Json(b): Json<ReplyBody>) -> ApiResult {
-    if b.text.trim().is_empty() {
-        return Err(bad("an empty reply"));
-    }
-    let conns = Connectors::load()?;
-    let acct = conns.slack.iter().find(|a| a.label == b.account).ok_or_else(|| missing("no such Slack connector"))?;
-    let ts = slack::reply(acct, &b.channel, b.thread_ts.as_deref(), b.text.trim()).await?;
-    Ok(Json(json!({ "ts": ts })))
-}
-
 // ---------------------------------------------------------------- connectors
 
 async fn list_connectors(Ax(app): Ax<Shared>) -> ApiResult {
@@ -1370,7 +1305,6 @@ async fn list_connectors(Ax(app): Ax<Shared>) -> ApiResult {
         "linear": conns.linear.iter().map(|a| &a.label).collect::<Vec<_>>(),
         "harvest": conns.harvest.iter().map(|a| &a.label).collect::<Vec<_>>(),
         "github": conns.github.iter().map(|a| &a.label).collect::<Vec<_>>(),
-        "slack": conns.slack.iter().map(|a| &a.label).collect::<Vec<_>>(),
     });
     let status = app.cache.lock().expect("cache").connectors.clone();
     Ok(Json(json!({ "accounts": labels, "status": status })))
@@ -1390,7 +1324,6 @@ async fn check_one(kind: &str, acct: &crate::connectors::Account) -> Value {
             .await
             .map(|v| v.iter().map(|(_, a)| a.name.clone()).collect::<Vec<_>>().join(", ")),
         "github" => github::whoami(acct).await,
-        "slack" => slack::whoami(acct).await.map(|(_, team, _)| team),
         _ => Err(anyhow::anyhow!("unknown kind")),
     };
     match r {
@@ -1402,6 +1335,11 @@ async fn check_one(kind: &str, acct: &crate::connectors::Account) -> Value {
 /// A pasted token is checked against its service before it is kept, so a
 /// typo is an error now rather than a silent empty card later.
 async fn add_connector(Ax(app): Ax<Shared>, Json(b): Json<AddConnector>) -> ApiResult {
+    // Before the token goes anywhere: `slack`, a kind removed in decision 66,
+    // is refused by name rather than as a token its service rejected.
+    if !crate::connectors::KINDS.contains(&b.kind.as_str()) {
+        return Err(bad(format!("unknown connector kind {:?}; one of {}", b.kind, crate::connectors::KINDS.join(", "))));
+    }
     let acct = crate::connectors::Account { label: b.label.trim().into(), token: b.token.trim().into() };
     let check = check_one(&b.kind, &acct).await;
     if check["ok"].as_bool() != Some(true) {
@@ -2393,7 +2331,6 @@ async fn sync_now(Ax(app): Ax<Shared>) -> ApiResult {
     {
         let mut c = app.cache.lock().expect("cache");
         c.last_status_ms = 0;
-        c.last_slack_ms = 0;
         c.pr_checked.clear();
     }
     // Every desk's reference index is due, and its task is woken rather than
@@ -2405,14 +2342,14 @@ async fn sync_now(Ax(app): Ax<Shared>) -> ApiResult {
 }
 
 /// One pass of the background refresh: connector checks every five
-/// minutes, the visible cards' issues and PRs, the Slack feed every two.
+/// minutes, the visible cards' issues and PRs, and Harvest's entries.
 pub async fn sync_once(app: &App, force_issues: bool) {
     let now = now_ms();
     let Ok(conns) = Connectors::load() else { return };
 
     if now - app.cache.lock().expect("cache").last_status_ms > 5 * 60_000 {
         let mut status = vec![];
-        for (kind, list) in [("linear", &conns.linear), ("harvest", &conns.harvest), ("slack", &conns.slack)] {
+        for (kind, list) in [("linear", &conns.linear), ("harvest", &conns.harvest)] {
             for a in list.iter() {
                 status.push(check_one(kind, a).await);
             }
@@ -2473,22 +2410,6 @@ pub async fn sync_once(app: &App, force_issues: bool) {
         }
     }
 
-    if now - app.cache.lock().expect("cache").last_slack_ms > 2 * 60_000 {
-        let mut items = vec![];
-        let mut errors = vec![];
-        for a in &conns.slack {
-            match slack::feed(a).await {
-                Ok(mut f) => items.append(&mut f),
-                Err(e) => errors.push(format!("{}: {e:#}", a.label)),
-            }
-        }
-        slack::sort_feed(&mut items);
-        let mut c = app.cache.lock().expect("cache");
-        c.slack = items;
-        c.slack_errors = errors;
-        c.last_slack_ms = now;
-    }
-
     if let Some((asked_ms, agents)) = live_agents("claude").await {
         let mut c = app.cache.lock().expect("cache");
         c.agents = agents;
@@ -2539,8 +2460,8 @@ where
 /// and at once when `POST /sync` wakes it, over the desks whose five
 /// minutes are up. It runs beside the sync loop, never inside it: on a
 /// network that drops packets every request waits out its timeout, and that
-/// must hold up neither timer catch-up, claim and mail expiry, the Slack
-/// feed nor `POST /sync`. Only this task refreshes, so passes never overlap.
+/// must hold up neither timer catch-up, claim and mail expiry nor
+/// `POST /sync`. Only this task refreshes, so passes never overlap.
 pub async fn refs_loop(app: Shared) {
     refs_loop_with(app, std::time::Duration::from_secs(30), |app| async move {
         let Ok(conns) = Connectors::load() else { return };

@@ -22,7 +22,6 @@ On the Desk tab, **Connectors**, or from a shell with the token on stdin:
 ```sh
 embarch-desk connect linear <workspace>   < key    # Linear: Settings → Security & access → Personal API keys
 embarch-desk connect harvest <name>       < token  # id.getharvest.com/developers → personal access token
-embarch-desk connect slack <workspace>    < token  # an app from slack-manifest.json; its User OAuth Token
 ```
 
 GitHub needs nothing if `gh` is logged in.
