@@ -1945,8 +1945,9 @@ async fn day(Ax(app): Ax<Shared>, Path(date): Path<String>) -> ApiResult {
 // embarch-desk-sessions-proposal.md: the open desk's issues with no card
 // yet, and Start work — the issue to In Progress, a worktree beside the main
 // clone on Linear's branch, auto mode, the launch claim, and the VS Code
-// links with the read-and-summarize prompt pre-filled. The owner presses
-// Enter: nothing documented submits a VS Code chat from outside.
+// links with a prompt pre-filled: `/promptu --item …` when Promptu is on and
+// installed, else the read-and-summarize starter (decision 67). The owner
+// presses Enter: nothing documented submits a VS Code chat from outside.
 
 async fn pickup(Ax(app): Ax<Shared>) -> ApiResult {
     let scope = open_linear(&app);
@@ -1972,6 +1973,34 @@ pub fn start_prompt(issue: &store::IssueRef, item_id: &str, branch: &str) -> Str
          then wait for my first instruction. (EmbArch desk work item {item_id}; this worktree is on {branch}.)",
         issue.key, issue.title, issue.url
     )
+}
+
+/// What Start work types into Claude Code's panel when Promptu is there
+/// (decision 67): the `/promptu` skill runs the pass on the issue, with the
+/// work item as its desk source. The title on one line: a slash command's
+/// arguments end at a line break.
+pub fn promptu_prompt(issue: &store::IssueRef, item_id: &str) -> String {
+    let title = issue.title.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("/promptu --item {item_id} Work on {} — {title}", issue.key)
+}
+
+/// Which starter Claude Code's panel gets, and the warning when Promptu's
+/// absence forced the old one (decision 67).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Starter {
+    Promptu,
+    Summarize,
+}
+
+pub const PROMPTU_ABSENT: &str =
+    "Promptu is not installed (no `promptu` in ~/.local/share/embarch/bin or on the desk's PATH): the read-and-summarize starter instead";
+
+pub fn pick_starter(promptu_on: bool, promptu_installed: bool) -> (Starter, Option<&'static str>) {
+    match (promptu_on, promptu_installed) {
+        (true, true) => (Starter::Promptu, None),
+        (true, false) => (Starter::Summarize, Some(PROMPTU_ABSENT)),
+        (false, _) => (Starter::Summarize, None),
+    }
 }
 
 /// The clone a worktree comes from: the card's own repo when it is a main
@@ -2050,7 +2079,22 @@ async fn start_work(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     });
     match mailbox_id {
         Some(m) => out["mailbox_id"] = json!(m),
-        None => out["claude_uri"] = json!(uri::claude_uri(&prompt)),
+        None => {
+            // Claude Code's panel: `/promptu` when it is on and installed, else
+            // the starter it always had (decision 67). The mailbox's start
+            // keeps that starter too, for the chats that predate Promptu.
+            let on = app.db.read(|st| st.settings.promptu);
+            let (starter, warning) = pick_starter(on, on && crate::promptu::installed());
+            if let Some(w) = warning {
+                out["warnings"].as_array_mut().expect("warnings").push(json!(w));
+            }
+            let typed = match starter {
+                Starter::Promptu => promptu_prompt(&issue, &id),
+                Starter::Summarize => prompt,
+            };
+            out["starter"] = json!(if starter == Starter::Promptu { "promptu" } else { "summarize" });
+            out["claude_uri"] = json!(uri::claude_uri(&typed));
+        }
     }
     Ok(Json(out))
 }
@@ -2144,12 +2188,17 @@ async fn get_settings(Ax(app): Ax<Shared>) -> ApiResult {
 struct SettingsPatch {
     #[serde(default)]
     chat_panel: Option<bool>,
+    #[serde(default)]
+    promptu: Option<bool>,
 }
 
 async fn put_settings(Ax(app): Ax<Shared>, Json(b): Json<SettingsPatch>) -> ApiResult {
     let s = app.db.write(|st| {
         if let Some(on) = b.chat_panel {
             st.settings.chat_panel = on;
+        }
+        if let Some(on) = b.promptu {
+            st.settings.promptu = on;
         }
         st.settings.clone()
     });
@@ -3014,6 +3063,38 @@ mod tests {
     }
 
     #[test]
+    fn the_promptu_starter_names_the_item_the_key_and_the_title_on_one_line() {
+        let issue = store::IssueRef { key: "ABC-7".into(), title: "Loader  retries\nafter a reset".into(), url: "https://linear.app/x/issue/ABC-7".into(), ..Default::default() };
+        assert_eq!(promptu_prompt(&issue, "w9"), "/promptu --item w9 Work on ABC-7 — Loader retries after a reset");
+        assert_eq!(
+            uri::claude_uri(&promptu_prompt(&issue, "w9")),
+            "vscode://anthropic.claude-code/open?prompt=%2Fpromptu%20--item%20w9%20Work%20on%20ABC-7%20%E2%80%94%20Loader%20retries%20after%20a%20reset"
+        );
+    }
+
+    #[test]
+    fn the_panel_gets_promptu_only_when_it_is_on_and_installed() {
+        assert_eq!(pick_starter(true, true), (Starter::Promptu, None));
+        assert_eq!(pick_starter(true, false), (Starter::Summarize, Some(PROMPTU_ABSENT)), "absent: the old starter, and a warning");
+        assert_eq!(pick_starter(false, true), (Starter::Summarize, None), "turned off: the old starter, nothing to warn of");
+        assert_eq!(pick_starter(false, false), (Starter::Summarize, None));
+    }
+
+    #[tokio::test]
+    async fn the_settings_route_takes_and_gives_back_promptu() {
+        let (app, dir) = scratch_app();
+        let Ok(Json(v)) = get_settings(Ax(app.clone())).await else { panic!("settings") };
+        assert_eq!((v["chat_panel"].as_bool(), v["promptu"].as_bool()), (Some(false), Some(true)), "promptu is on by default");
+        let put = |b: Value| put_settings(Ax(app.clone()), Json(serde_json::from_value(b).unwrap()));
+        let Ok(Json(v)) = put(json!({"promptu": false})).await else { panic!("put") };
+        assert_eq!((v["chat_panel"].as_bool(), v["promptu"].as_bool()), (Some(false), Some(false)));
+        let Ok(Json(v)) = put(json!({"chat_panel": true})).await else { panic!("put") };
+        assert_eq!((v["chat_panel"].as_bool(), v["promptu"].as_bool()), (Some(true), Some(false)), "a patch leaves the other setting alone");
+        assert!(!app.db.read(|st| st.settings.promptu));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn the_polish_prompt_carries_lines_targets_and_the_reply_shape() {
         let lines = vec![store::Line::new(0, "smp: retry a busy upload", "commit")];
         let targets = vec![harvest::Target {
@@ -3090,6 +3171,7 @@ mod tests {
         let row = &v["cards"][0]["live_sessions"][0];
         assert_eq!((row["state"].as_str(), row["client"].as_str(), row["cwd"].as_str()), (Some("busy"), Some("embarch-chat"), Some("/w/repo")));
         assert_eq!(v["settings"]["chat_panel"], false);
+        assert_eq!(v["settings"]["promptu"], true, "the view carries the promptu setting");
     }
 
     fn scratch_app() -> (Shared, std::path::PathBuf) {

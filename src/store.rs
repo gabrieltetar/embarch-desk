@@ -90,13 +90,29 @@ pub struct State {
     pub settings: Settings,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
     /// Start work leaves its start in the mailbox for the embarch-chat panel
     /// instead of pre-filling Claude Code's. Off until the chat ships (chat
     /// proposal decision 4).
     #[serde(default)]
     pub chat_panel: bool,
+    /// With the chat setting off, Start work types `/promptu --item …` into
+    /// Claude Code's panel instead of the read-and-summarize starter, when
+    /// Promptu is installed (decision 67). On by default, a state written
+    /// before it existed included.
+    #[serde(default = "on")]
+    pub promptu: bool,
+}
+
+fn on() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { chat_panel: false, promptu: true }
+    }
 }
 
 /// One request waiting for a VS Code window's embarch-chat panel, taken once
@@ -1753,7 +1769,21 @@ mod tests {
         let again: State = serde_json::from_value(serde_json::to_value(&st).unwrap()).unwrap();
         assert_eq!(again.tiles["w1@2026-10-22"].lines, lines);
         assert!(!again.settings.chat_panel && again.mailbox.is_empty() && !again.memory_imported);
+        assert!(again.settings.promptu, "a state written before the promptu setting loads with it on");
         assert_eq!(again.notes_ms("w1"), Some(D0 + 2), "with no change recorded, the newest note's time");
+    }
+
+    #[test]
+    fn the_promptu_setting_is_on_unless_turned_off() {
+        assert!(Settings::default().promptu && !Settings::default().chat_panel);
+        assert!(State::default().settings.promptu);
+        // A settings block written before the field existed.
+        let s: Settings = serde_json::from_value(serde_json::json!({ "chat_panel": true })).unwrap();
+        assert!(s.chat_panel && s.promptu);
+        let off: Settings = serde_json::from_value(serde_json::json!({ "chat_panel": false, "promptu": false })).unwrap();
+        assert!(!off.promptu);
+        let back: Settings = serde_json::from_value(serde_json::to_value(&off).unwrap()).unwrap();
+        assert_eq!(back, off, "off survives a save and a load");
     }
 
     #[test]

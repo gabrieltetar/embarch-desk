@@ -16,6 +16,7 @@ mod localrepo;
 mod mcp;
 mod memory;
 mod paths;
+mod promptu;
 mod refs;
 mod server;
 mod service;
