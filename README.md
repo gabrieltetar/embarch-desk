@@ -11,9 +11,11 @@ cargo build --release
 install -m 755 target/release/embarch-desk ~/.local/share/embarch/bin/
 embarch-desk service install                 # systemd user unit, starts now and at login
 embarch-desk ignore add ~/path/to/untracked  # repos whose sessions are never tracked
-claude plugin marketplace add "$PWD"
+claude plugin marketplace add gabrieltetar/embarch-umbrella   # the suite's `embarch` marketplace
 claude plugin install embarch-desk@embarch
 ```
+
+The marketplace lives in [embarch-umbrella](https://github.com/gabrieltetar/embarch-umbrella) and takes the plugin from this repo's `plugin/` on GitHub, so a change there reaches Claude Code once it is pushed and its version in `plugin/.claude-plugin/plugin.json` is bumped.
 
 ## Connect
 
