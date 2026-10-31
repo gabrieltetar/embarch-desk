@@ -12,6 +12,7 @@ mod github;
 mod harvest;
 mod hook;
 mod linear;
+mod linear_mcp;
 mod localrepo;
 mod mcp;
 mod memory;
@@ -56,6 +57,10 @@ enum Cmd {
         kind: String,
         /// A name for this account, e.g. the workspace
         label: String,
+        /// Linear only: sign in through Linear's MCP server in the browser
+        /// instead of reading a key, for a workspace that gives you none.
+        #[arg(long)]
+        mcp: bool,
     },
     /// Remove a connector.
     Disconnect { kind: String, label: String },
@@ -100,7 +105,11 @@ fn main() -> Result<()> {
         },
         Cmd::Mcp => runtime()?.block_on(mcp::serve()),
         Cmd::Serve => runtime()?.block_on(serve()),
-        Cmd::Connect { kind, label } => {
+        Cmd::Connect { kind, label, mcp: true } => {
+            anyhow::ensure!(kind == "linear", "--mcp signs in to Linear only");
+            runtime()?.block_on(sign_in_through_mcp(&label))
+        }
+        Cmd::Connect { kind, label, mcp: false } => {
             let mut token = String::new();
             std::io::stdin().read_to_string(&mut token)?;
             runtime()?.block_on(async {
@@ -181,6 +190,28 @@ fn main() -> Result<()> {
             }
             Ok(())
         }),
+    }
+}
+
+/// Hand the user the sign-in link, then wait for the browser to come back to
+/// the desk (decision 68).
+async fn sign_in_through_mcp(label: &str) -> Result<()> {
+    let c = client::DeskClient::new(Duration::from_secs(60))?;
+    let v = c.post("/linear/signin", serde_json::json!({ "label": label })).await?;
+    let state = v["state"].as_str().unwrap_or_default();
+    println!("Open this link, sign in to Linear and pick the workspace for {label}:\n\n{}\n", v["url"].as_str().unwrap_or_default());
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        // A 404 once the link's 10 minutes are up ends the wait.
+        let s = c.get(&format!("/linear/signin/{state}")).await?;
+        match s["status"].as_str() {
+            Some("ok") => {
+                println!("linear/{label} connected: {}", s["detail"].as_str().unwrap_or(""));
+                return Ok(());
+            }
+            Some("failed") => anyhow::bail!("linear/{label} did not connect: {}", s["detail"].as_str().unwrap_or("")),
+            _ => {}
+        }
     }
 }
 

@@ -3,6 +3,9 @@
 //! v1 takes tokens, not OAuth (proposal decision 16): a GitHub token or the
 //! user's existing `gh` login, a Linear personal API key per workspace, and a
 //! Harvest personal access token (which covers every account its user has).
+//! The one exception is a Linear workspace that gives the user no key: it
+//! signs in through Linear's MCP server, and its account carries the grant
+//! that renews the token (decision 68).
 //! **No token ever leaves this file except in the request it authorizes** —
 //! the HTTP surface reports labels, never values.
 //!
@@ -21,6 +24,25 @@ pub const KINDS: [&str; 3] = ["linear", "harvest", "github"];
 pub struct Account {
     pub label: String,
     pub token: String,
+    /// Set on a Linear account signed in through Linear's MCP server, whose
+    /// `token` lasts a day and reaches only that server (decision 68).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpGrant>,
+}
+
+impl Account {
+    pub fn new(label: &str, token: &str) -> Self {
+        Self { label: label.into(), token: token.into(), mcp: None }
+    }
+}
+
+/// What renews an MCP sign-in's token: the client the desk registered for
+/// it, the refresh token, and when the current token runs out.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct McpGrant {
+    pub client_id: String,
+    pub refresh_token: String,
+    pub expires_ms: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -71,9 +93,14 @@ impl Connectors {
         if label.is_empty() || token.is_empty() {
             bail!("a connector needs a label and a token");
         }
+        self.put(kind, Account::new(label, token))
+    }
+
+    /// Add or replace an account whole, its MCP grant included.
+    pub fn put(&mut self, kind: &str, acct: Account) -> Result<()> {
         let list = self.list_mut(kind)?;
-        list.retain(|a| a.label != label);
-        list.push(Account { label: label.into(), token: token.into() });
+        list.retain(|a| a.label != acct.label);
+        list.push(acct);
         Ok(())
     }
 
@@ -97,7 +124,7 @@ impl Connectors {
                 if t.is_empty() {
                     vec![]
                 } else {
-                    vec![Account { label: "gh login".into(), token: t }]
+                    vec![Account::new("gh login", &t)]
                 }
             }
             _ => vec![],
@@ -184,8 +211,14 @@ mod tests {
         let mut c = Connectors::default();
         c.upsert("harvest", "me", "pat").unwrap();
         c.upsert("github", "me", "ghp-1").unwrap();
-        let back: Connectors = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        let grant = McpGrant { client_id: "c1".into(), refresh_token: "r1".into(), expires_ms: 5 };
+        c.put("linear", Account { mcp: Some(grant), ..Account::new("client", "a1") }).unwrap();
+        let saved = toml::to_string(&c).unwrap();
+        let back: Connectors = toml::from_str(&saved).unwrap();
         assert_eq!(back, c);
+        // A pasted key's table stays as it was: no empty `mcp` written beside it.
+        assert_eq!(saved.matches("[linear.mcp]").count(), 1);
+        assert!(!saved.contains("[harvest.mcp]"));
     }
 
     /// A file written before the Slack connector went (decision 66) loads,

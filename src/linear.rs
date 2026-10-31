@@ -1,8 +1,11 @@
 //! Linear over GraphQL with a personal API key. A key reaches one
 //! workspace, so an issue key is asked of each account in turn and the one
-//! that answers is remembered on the issue.
+//! that answers is remembered on the issue. An account signed in through
+//! Linear's MCP server instead is answered by `linear_mcp`, in the same
+//! shapes (decision 68).
 
 use crate::connectors::{http, Account};
+use crate::linear_mcp;
 use crate::store::{IssueRef, LinearBinding};
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
@@ -30,6 +33,9 @@ async fn gql(acct: &Account, query: &str, vars: Value) -> Result<Value> {
 
 /// The workspace's name, which is what a connector check reports.
 pub async fn whoami(acct: &Account) -> Result<String> {
+    if acct.mcp.is_some() {
+        return linear_mcp::whoami(acct).await;
+    }
     let d = gql(acct, "{ viewer { name organization { name } } }", json!({})).await?;
     Ok(format!(
         "{} @ {}",
@@ -59,19 +65,32 @@ fn issue_from(acct: &Account, v: &Value, now: i64) -> Option<IssueRef> {
 
 const ISSUE_FIELDS: &str = "id identifier title url branchName state { id name type } team { id key } project { id name }";
 
+/// Whether a GraphQL error is "Entity not found", which is how a workspace
+/// says "not mine".
+fn not_found(e: &anyhow::Error) -> bool {
+    e.to_string().to_lowercase().contains("not found")
+}
+
+/// One workspace's issue by key or id; `None` when it has no such issue.
+async fn issue_in(acct: &Account, id: &str, now: i64) -> Result<Option<IssueRef>> {
+    if acct.mcp.is_some() {
+        return linear_mcp::issue_ref(acct, id, now).await;
+    }
+    let q = format!("query($id: String!) {{ issue(id: $id) {{ {ISSUE_FIELDS} }} }}");
+    match gql(acct, &q, json!({ "id": id })).await {
+        Ok(d) => Ok(issue_from(acct, &d["issue"], now)),
+        Err(e) if not_found(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Find an issue by key (`ABC-123`) in whichever connected workspace has it.
 pub async fn find_issue(accounts: &[Account], key: &str, now: i64) -> Result<Option<IssueRef>> {
-    let q = format!("query($id: String!) {{ issue(id: $id) {{ {ISSUE_FIELDS} }} }}");
     let mut last_err = None;
     for acct in accounts {
-        match gql(acct, &q, json!({ "id": key })).await {
-            Ok(d) => {
-                if let Some(i) = issue_from(acct, &d["issue"], now) {
-                    return Ok(Some(i));
-                }
-            }
-            // "Entity not found" is how a workspace says "not mine".
-            Err(e) if e.to_string().to_lowercase().contains("not found") => {}
+        match issue_in(acct, key, now).await {
+            Ok(Some(i)) => return Ok(Some(i)),
+            Ok(None) => {}
             Err(e) => last_err = Some(e),
         }
     }
@@ -85,9 +104,7 @@ pub async fn refresh_issue(accounts: &[Account], issue: &IssueRef, now: i64) -> 
     let Some(acct) = accounts.iter().find(|a| a.label == issue.account) else {
         return find_issue(accounts, &issue.key, now).await;
     };
-    let q = format!("query($id: String!) {{ issue(id: $id) {{ {ISSUE_FIELDS} }} }}");
-    let d = gql(acct, &q, json!({ "id": issue.id })).await?;
-    Ok(issue_from(acct, &d["issue"], now))
+    issue_in(acct, &issue.id, now).await
 }
 
 /// The team's workflow states, in board order, for the card's dropdown.
@@ -96,6 +113,9 @@ pub async fn states(accounts: &[Account], issue: &IssueRef) -> Result<Vec<Value>
         .iter()
         .find(|a| a.label == issue.account)
         .ok_or_else(|| anyhow!("no Linear account {:?} connected", issue.account))?;
+    if acct.mcp.is_some() {
+        return linear_mcp::team_states(acct, &issue.team_id).await;
+    }
     let d = gql(
         acct,
         "query($id: String!) { team(id: $id) { states { nodes { id name type position } } } }",
@@ -116,6 +136,9 @@ pub async fn set_state(accounts: &[Account], issue: &IssueRef, state_id: &str, n
         .iter()
         .find(|a| a.label == issue.account)
         .ok_or_else(|| anyhow!("no Linear account {:?} connected", issue.account))?;
+    if acct.mcp.is_some() {
+        return linear_mcp::move_state(acct, issue, state_id, now).await;
+    }
     let q = format!(
         "mutation($id: String!, $s: String!) {{ issueUpdate(id: $id, input: {{ stateId: $s }}) \
          {{ success issue {{ {ISSUE_FIELDS} }} }} }}"
@@ -127,28 +150,53 @@ pub async fn set_state(accounts: &[Account], issue: &IssueRef, state_id: &str, n
     issue_from(acct, &d["issueUpdate"]["issue"], now).ok_or_else(|| anyhow!("Linear returned no issue"))
 }
 
-/// The account a key's team belongs to: the one that knows the issue.
-async fn account_for_key<'a>(accounts: &'a [Account], key: &str) -> Result<(&'a Account, Value)> {
-    let q = "query($id: String!) { issue(id: $id) { id identifier title url description priorityLabel \
-             createdAt updatedAt state { id name type } team { id key name } assignee { name } \
-             project { name } labels { nodes { name } } \
-             comments(first: 25) { nodes { body createdAt user { name } } } } }";
+/// Asks each account in turn until one has the key: `per` answers `None`
+/// for a workspace without it.
+async fn first_with<'a, T, F, Fut>(accounts: &'a [Account], key: &str, mut per: F) -> Result<T>
+where
+    F: FnMut(&'a Account) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<T>>>,
+{
     let mut last_err = None;
     for acct in accounts {
-        match gql(acct, q, json!({ "id": key })).await {
-            Ok(d) if d["issue"].is_object() => return Ok((acct, d["issue"].clone())),
-            Ok(_) => {}
-            Err(e) if e.to_string().to_lowercase().contains("not found") => {}
+        match per(acct).await {
+            Ok(Some(v)) => return Ok(v),
+            Ok(None) => {}
             Err(e) => last_err = Some(e),
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("no connected Linear workspace has {key}")))
 }
 
+/// One workspace's issue as GraphQL gives it, for `read_issue`; `None` when
+/// it has no such key.
+async fn gql_detail(acct: &Account, key: &str) -> Result<Option<Value>> {
+    let q = "query($id: String!) { issue(id: $id) { id identifier title url description priorityLabel \
+             createdAt updatedAt state { id name type } team { id key name } assignee { name } \
+             project { name } labels { nodes { name } } \
+             comments(first: 25) { nodes { body createdAt user { name } } } } }";
+    match gql(acct, q, json!({ "id": key })).await {
+        Ok(d) if d["issue"].is_object() => Ok(Some(detail_from(acct, &d["issue"]))),
+        Ok(_) => Ok(None),
+        Err(e) if not_found(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// An issue as an agent reads it: description, assignee, labels and the
 /// latest comments, oldest first.
 pub async fn read_issue(accounts: &[Account], key: &str) -> Result<Value> {
-    let (acct, i) = account_for_key(accounts, key).await?;
+    first_with(accounts, key, |acct| async move {
+        if acct.mcp.is_some() {
+            linear_mcp::issue_detail(acct, key).await
+        } else {
+            gql_detail(acct, key).await
+        }
+    })
+    .await
+}
+
+fn detail_from(acct: &Account, i: &Value) -> Value {
     let comments: Vec<Value> = i["comments"]["nodes"]
         .as_array()
         .into_iter()
@@ -156,7 +204,7 @@ pub async fn read_issue(accounts: &[Account], key: &str) -> Result<Value> {
         .map(|c| json!({ "author": c["user"]["name"], "at": c["createdAt"], "body": c["body"] }))
         .rev()
         .collect();
-    Ok(json!({
+    json!({
         "workspace": acct.label,
         "key": i["identifier"], "title": i["title"], "url": i["url"],
         "state": i["state"]["name"], "priority": i["priorityLabel"],
@@ -165,7 +213,7 @@ pub async fn read_issue(accounts: &[Account], key: &str) -> Result<Value> {
         "description": i["description"],
         "comments": comments,
         "updated": i["updatedAt"],
-    }))
+    })
 }
 
 fn issue_rows(acct: &Account, nodes: &Value) -> Vec<Value> {
@@ -191,7 +239,7 @@ fn in_scope<'a>(accounts: &'a [Account], scope: Option<&LinearBinding>) -> Vec<&
 }
 
 /// A desk bound to a project filters on it; one bound to a whole team, on the team.
-fn scope_filter(b: &LinearBinding) -> (&'static str, &str) {
+pub(crate) fn scope_filter(b: &LinearBinding) -> (&'static str, &str) {
     if b.project_id.is_empty() {
         ("team", b.team_id.as_str())
     } else {
@@ -212,6 +260,13 @@ pub async fn my_issues(accounts: &[Account], scope: Option<&LinearBinding>) -> R
     let mut out = vec![];
     let mut truncated = false;
     for acct in in_scope(accounts, scope) {
+        if acct.mcp.is_some() {
+            let (rows, cut) =
+                crate::connectors::take_capped(MINE_CAP, |after: Option<String>| linear_mcp::assigned_page(acct, scope, after)).await?;
+            out.extend(rows);
+            truncated |= cut;
+            continue;
+        }
         let (decl, filter, vars) = match scope {
             Some(b) => {
                 let (field, id) = scope_filter(b);
@@ -257,6 +312,9 @@ pub async fn scope_issues(accounts: &[Account], b: &LinearBinding, cap: usize) -
     if id.is_empty() {
         return Ok(vec![]);
     }
+    if acct.mcp.is_some() {
+        return crate::refs::take_pages(cap, |after: Option<String>| linear_mcp::scope_page(acct, b, after)).await;
+    }
     let q = format!(
         "query($p: ID, $a: String) {{ issues(first: 250, after: $a, orderBy: updatedAt, includeArchived: true, \
          filter: {{ {field}: {{ id: {{ eq: $p }} }} }}) {{ nodes {{ identifier title url trashed state {{ name }} }} \
@@ -291,6 +349,10 @@ pub async fn projects(accounts: &[Account]) -> Result<Vec<Value>> {
     let q = "{ projects(first: 150, orderBy: updatedAt) { nodes { id name state teams { nodes { id key name } } } } }";
     let mut out = vec![];
     for acct in accounts {
+        if acct.mcp.is_some() {
+            out.extend(linear_mcp::projects(acct).await?);
+            continue;
+        }
         let d = gql(acct, q, json!({})).await?;
         for p in d["projects"]["nodes"].as_array().into_iter().flatten() {
             out.push(json!({
@@ -313,6 +375,10 @@ pub async fn search(accounts: &[Account], query: &str, scope: Option<&LinearBind
     }
     let mut out = vec![];
     for acct in in_scope(accounts, scope) {
+        if acct.mcp.is_some() {
+            out.extend(linear_mcp::search(acct, query.trim(), scope).await?);
+            continue;
+        }
         let d = match scope {
             Some(b) => {
                 let (field, id) = scope_filter(b);
@@ -352,17 +418,34 @@ pub async fn set_state_by_name(accounts: &[Account], key: &str, name: &str, now:
 
 /// Post an approved comment. Only the Desk tab's Send reaches this.
 pub async fn post_comment(accounts: &[Account], key: &str, body: &str) -> Result<String> {
-    let (acct, i) = account_for_key(accounts, key).await?;
+    first_with(accounts, key, |acct| async move {
+        if acct.mcp.is_some() {
+            linear_mcp::comment(acct, key, body).await
+        } else {
+            gql_comment(acct, key, body).await
+        }
+    })
+    .await
+}
+
+/// `None` when this workspace has no such key.
+async fn gql_comment(acct: &Account, key: &str, body: &str) -> Result<Option<String>> {
+    let id = match gql(acct, "query($id: String!) { issue(id: $id) { id } }", json!({ "id": key })).await {
+        Ok(d) if d["issue"].is_object() => d["issue"]["id"].clone(),
+        Ok(_) => return Ok(None),
+        Err(e) if not_found(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
     let d = gql(
         acct,
         "mutation($id: String!, $b: String!) { commentCreate(input: { issueId: $id, body: $b }) { success comment { url } } }",
-        json!({ "id": i["id"], "b": body }),
+        json!({ "id": id, "b": body }),
     )
     .await?;
     if d["commentCreate"]["success"].as_bool() != Some(true) {
         bail!("Linear refused the comment");
     }
-    Ok(d["commentCreate"]["comment"]["url"].as_str().unwrap_or_default().to_string())
+    Ok(Some(d["commentCreate"]["comment"]["url"].as_str().unwrap_or_default().to_string()))
 }
 
 /// Create an approved issue in the team with this key, in whichever
@@ -375,6 +458,10 @@ pub async fn create_issue(
     project_id: Option<&str>,
 ) -> Result<(String, String)> {
     for acct in accounts {
+        if acct.mcp.is_some() {
+            let Some(team_id) = linear_mcp::team_id(acct, team_key).await? else { continue };
+            return linear_mcp::create_issue(acct, &team_id, title, description, project_id).await;
+        }
         let d = gql(
             acct,
             "query($k: String!) { teams(filter: { key: { eqIgnoreCase: $k } }) { nodes { id key } } }",
@@ -419,7 +506,7 @@ mod tests {
 
     #[tokio::test]
     async fn assigned_issues_page_on_the_cursor_until_the_cap() {
-        let acct = Account { label: "w".into(), token: "t".into() };
+        let acct = Account::new("w", "t");
         let page = |after: Option<String>| {
             let n: u32 = after.as_deref().map(|a| a.parse().unwrap()).unwrap_or(0);
             let nodes: Vec<Value> = (0..50).map(|i| json!({ "identifier": format!("X-{}", n * 50 + i) })).collect();
@@ -466,7 +553,7 @@ mod tests {
 
     #[test]
     fn an_issue_reads_out_of_the_graphql_shape() {
-        let acct = Account { label: "work".into(), token: "t".into() };
+        let acct = Account::new("work", "t");
         let v = json!({
             "id": "uuid", "identifier": "ABC-123", "title": "Bootload", "url": "https://linear.app/x/issue/ABC-123",
             "state": {"id": "s1", "name": "In Progress", "type": "started"},

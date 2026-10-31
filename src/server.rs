@@ -2,7 +2,9 @@
 //! `embarch-ui` (which proxies the Desk tab's calls) and the desk's own MCP
 //! server. Every route but `/health` wants the desk token as a bearer; the
 //! browser never reaches this port directly, so a page on some other site
-//! cannot make the desk write to Linear or Harvest as the user.
+//! cannot make the desk write to Linear or Harvest as the user. The one
+//! exception is Linear's sign-in coming back to `/oauth/linear/callback`
+//! (decision 68), which acts only on a state the desk itself handed out.
 //!
 //! Writes come in two kinds (proposal decision 15): a status move goes
 //! straight through — an issue's status, a tile's ✓ — and anything carrying
@@ -14,7 +16,7 @@ use crate::connectors::Connectors;
 use crate::db::Db;
 use crate::events::{self, HookEvent};
 use crate::store::{self, Days, HarvestTarget, LocalDays, MailboxEntry, PendingLaunch, RealGit, State, TakeError, TileStatus};
-use crate::{brief, github, harvest, linear, localrepo, refs, uri};
+use crate::{brief, github, harvest, linear, linear_mcp, localrepo, refs, uri};
 use axum::extract::{Path, Query, State as Ax};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -49,6 +51,21 @@ pub struct Cache {
     /// When `agents` was read.
     pub agents_ms: i64,
     pub wsl_distro: Option<String>,
+    /// Linear sign-ins through its MCP server, by the state each handed out.
+    pub signins: HashMap<String, SignIn>,
+}
+
+/// A Linear sign-in through Linear's MCP server, from the link the desk hands
+/// out to the browser coming back (decision 68).
+pub struct SignIn {
+    label: String,
+    client_id: String,
+    /// PKCE's verifier; emptied when the browser comes back, so a link works once.
+    verifier: String,
+    redirect: String,
+    started_ms: i64,
+    /// Once the browser came back: the account's check, or why it failed.
+    outcome: Option<Result<String, String>>,
 }
 
 pub fn now_ms() -> i64 {
@@ -104,6 +121,8 @@ pub fn router(app: Shared) -> Router {
         .route("/harvest/targets", get(harvest_targets))
         .route("/connectors", get(list_connectors).post(add_connector))
         .route("/connectors/{kind}/{label}", delete(remove_connector))
+        .route("/linear/signin", post(start_linear_signin))
+        .route("/linear/signin/{state}", get(linear_signin_status))
         .route("/ignore", get(get_ignore).put(put_ignore))
         .route("/linear/issue/{key}", get(linear_issue))
         .route("/linear/mine", get(linear_mine))
@@ -134,6 +153,7 @@ pub fn router(app: Shared) -> Router {
         .route_layer(axum::middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
         .route("/health", get(|| async { Json(json!({ "ok": true, "service": "embarch-desk", "version": env!("CARGO_PKG_VERSION") })) }))
+        .route("/oauth/linear/callback", get(linear_signin_callback))
         .merge(authed)
         .with_state(app)
 }
@@ -1340,7 +1360,7 @@ async fn add_connector(Ax(app): Ax<Shared>, Json(b): Json<AddConnector>) -> ApiR
     if !crate::connectors::KINDS.contains(&b.kind.as_str()) {
         return Err(bad(format!("unknown connector kind {:?}; one of {}", b.kind, crate::connectors::KINDS.join(", "))));
     }
-    let acct = crate::connectors::Account { label: b.label.trim().into(), token: b.token.trim().into() };
+    let acct = crate::connectors::Account::new(b.label.trim(), b.token.trim());
     let check = check_one(&b.kind, &acct).await;
     if check["ok"].as_bool() != Some(true) {
         return Err(bad(format!("{} rejected that token: {}", b.kind, check["detail"].as_str().unwrap_or("?"))));
@@ -1358,6 +1378,118 @@ async fn remove_connector(Ax(app): Ax<Shared>, Path((kind, label)): Path<(String
     conns.save()?;
     app.cache.lock().expect("cache").last_status_ms = 0;
     Ok(Json(json!({ "removed": removed })))
+}
+
+// ---------------------------------------------------------------- Linear sign-in through its MCP server
+
+/// A link outlives a slow login, not an abandoned one.
+const SIGN_IN_LIFE_MS: i64 = 10 * 60_000;
+
+#[derive(Deserialize)]
+struct SignInBody {
+    label: String,
+}
+
+/// Start a Linear sign-in through Linear's MCP server, for a workspace that
+/// gives the user no API key (decision 68): `{url, state}`, the link for the
+/// browser and what to ask `/linear/signin/{state}` about.
+async fn start_linear_signin(Ax(app): Ax<Shared>, Json(b): Json<SignInBody>) -> ApiResult {
+    let label = b.label.trim();
+    if label.is_empty() {
+        return Err(bad("a sign-in needs a name for the account, e.g. the workspace"));
+    }
+    let redirect = format!("http://127.0.0.1:{}/oauth/linear/callback", crate::paths::port());
+    let client_id = linear_mcp::register(&redirect).await?;
+    let (verifier, challenge) = linear_mcp::pkce()?;
+    let state = crate::paths::random_hex(16)?;
+    let url = linear_mcp::authorize_url(&client_id, &redirect, &challenge, &state);
+    let now = now_ms();
+    let mut cache = app.cache.lock().expect("cache");
+    cache.signins.retain(|_, s| now - s.started_ms < SIGN_IN_LIFE_MS);
+    let signin = SignIn { label: label.into(), client_id, verifier, redirect, started_ms: now, outcome: None };
+    cache.signins.insert(state.clone(), signin);
+    Ok(Json(json!({ "url": url, "state": state })))
+}
+
+/// `{status, label, detail}`: `waiting` until the browser comes back, then
+/// `ok` with the account's check or `failed` with why; 404 once expired.
+async fn linear_signin_status(Ax(app): Ax<Shared>, Path(state): Path<String>) -> ApiResult {
+    let now = now_ms();
+    let cache = app.cache.lock().expect("cache");
+    let s = cache
+        .signins
+        .get(&state)
+        .filter(|s| now - s.started_ms < SIGN_IN_LIFE_MS)
+        .ok_or_else(|| missing("no such sign-in, or it expired"))?;
+    Ok(Json(match &s.outcome {
+        None => json!({ "status": "waiting", "label": s.label }),
+        Some(Ok(d)) => json!({ "status": "ok", "label": s.label, "detail": d }),
+        Some(Err(e)) => json!({ "status": "failed", "label": s.label, "detail": e }),
+    }))
+}
+
+/// Where Linear sends the browser back. Outside the bearer, which a browser
+/// cannot carry: only a state this desk handed out, unused and under 10
+/// minutes old, does anything, and the code it brings is worthless without
+/// the PKCE verifier that never left the desk.
+async fn linear_signin_callback(Ax(app): Ax<Shared>, Query(q): Query<HashMap<String, String>>) -> axum::response::Html<String> {
+    let now = now_ms();
+    let state = q.get("state").cloned().unwrap_or_default();
+    let pending = {
+        let mut cache = app.cache.lock().expect("cache");
+        cache
+            .signins
+            .get_mut(&state)
+            .filter(|s| !s.verifier.is_empty() && now - s.started_ms < SIGN_IN_LIFE_MS)
+            .map(|s| (s.label.clone(), s.client_id.clone(), std::mem::take(&mut s.verifier), s.redirect.clone()))
+    };
+    let Some((label, client_id, verifier, redirect)) = pending else {
+        return signin_page(false, "This sign-in link is unknown, used or expired. Start again from the Desk tab's Connectors.");
+    };
+    let outcome = finish_signin(&label, &client_id, &verifier, &redirect, &q, now).await.map_err(|e| format!("{e:#}"));
+    let page = match &outcome {
+        Ok(d) => signin_page(true, &format!("Linear / {label} is connected: {d}. You can close this tab.")),
+        Err(e) => signin_page(false, &format!("Linear / {label} did not connect: {e}")),
+    };
+    let mut cache = app.cache.lock().expect("cache");
+    if let Some(s) = cache.signins.get_mut(&state) {
+        s.outcome = Some(outcome);
+    }
+    cache.last_status_ms = 0;
+    page
+}
+
+/// The code for a token, checked against the server before it is kept, as a
+/// pasted token is.
+async fn finish_signin(
+    label: &str,
+    client_id: &str,
+    verifier: &str,
+    redirect: &str,
+    q: &HashMap<String, String>,
+    now: i64,
+) -> anyhow::Result<String> {
+    if let Some(err) = q.get("error") {
+        anyhow::bail!("Linear answered {}", q.get("error_description").unwrap_or(err));
+    }
+    let code = q.get("code").ok_or_else(|| anyhow::anyhow!("Linear sent no code back"))?;
+    let (token, grant) = linear_mcp::exchange(client_id, redirect, code, verifier, now).await?;
+    let acct = crate::connectors::Account { label: label.into(), token, mcp: Some(grant) };
+    let detail = linear::whoami(&acct).await?;
+    let mut conns = Connectors::load()?;
+    conns.put("linear", acct)?;
+    conns.save()?;
+    Ok(detail)
+}
+
+fn signin_page(ok: bool, msg: &str) -> axum::response::Html<String> {
+    let msg = msg.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let title = if ok { "Signed in" } else { "Not signed in" };
+    axum::response::Html(format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>EmbArch Desk</title>\
+         <body style=\"font-family:system-ui,sans-serif;max-width:40em;margin:3em auto;padding:0 16px\">\
+         <h1>{title}</h1><p>{msg}</p></body>"
+    ))
 }
 
 // ---------------------------------------------------------------- ignore list
@@ -1401,7 +1533,7 @@ async fn put_ignore(Ax(app): Ax<Shared>, Json(b): Json<IgnoreBody>) -> ApiResult
 fn linear_accounts() -> Result<Vec<crate::connectors::Account>, ApiError> {
     let c = Connectors::load()?;
     if c.linear.is_empty() {
-        return Err(bad("no Linear workspace is connected; add a Linear API key on the Desk tab"));
+        return Err(bad("no Linear workspace is connected; add a Linear API key, or sign in through Linear's MCP, on the Desk tab"));
     }
     Ok(c.linear)
 }
@@ -3091,6 +3223,41 @@ mod tests {
         let Ok(Json(v)) = put(json!({"chat_panel": true})).await else { panic!("put") };
         assert_eq!((v["chat_panel"].as_bool(), v["promptu"].as_bool()), (Some(true), Some(false)), "a patch leaves the other setting alone");
         assert!(!app.db.read(|st| st.settings.promptu));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A sign-in link works once, within its 10 minutes, and only for the
+    /// state the desk handed out; a refused login is reported, not kept.
+    #[tokio::test]
+    async fn a_linear_sign_in_link_works_once_and_reports_a_refusal() {
+        let (app, dir) = scratch_app();
+        let fresh = |started_ms| SignIn {
+            label: "client".into(),
+            client_id: "cid".into(),
+            verifier: "v".into(),
+            redirect: "http://127.0.0.1:4891/oauth/linear/callback".into(),
+            started_ms,
+            outcome: None,
+        };
+        app.cache.lock().unwrap().signins.insert("st".into(), fresh(now_ms()));
+        app.cache.lock().unwrap().signins.insert("old".into(), fresh(now_ms() - SIGN_IN_LIFE_MS - 1));
+        let back = |q: &[(&str, &str)]| {
+            let q = q.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            linear_signin_callback(Ax(app.clone()), Query(q))
+        };
+        let status = |st: &str| linear_signin_status(Ax(app.clone()), Path(st.into()));
+        let Ok(Json(v)) = status("st").await else { panic!("status") };
+        assert_eq!(v["status"], "waiting");
+        let page = back(&[("state", "st"), ("error", "access_denied")]).await.0;
+        assert!(page.contains("Not signed in") && page.contains("access_denied"), "{page}");
+        let Ok(Json(v)) = status("st").await else { panic!("status") };
+        assert_eq!((v["status"].as_str(), v["label"].as_str()), (Some("failed"), Some("client")));
+        assert!(back(&[("state", "st"), ("code", "c")]).await.0.contains("unknown, used or expired"), "a link works once");
+        assert!(back(&[("state", "old"), ("code", "c")]).await.0.contains("unknown, used or expired"), "and only within its 10 minutes");
+        assert!(back(&[("state", "nope"), ("code", "c")]).await.0.contains("unknown, used or expired"));
+        assert!(status("old").await.is_err());
+        let page = signin_page(false, "<script>");
+        assert!(page.0.contains("&lt;script&gt;") && !page.0.contains("<script>"));
         std::fs::remove_dir_all(dir).ok();
     }
 
