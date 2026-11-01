@@ -3183,7 +3183,7 @@ mod tests {
         assert_eq!((row["status"].as_str(), row["waiting_for"].as_str()), (Some("waiting"), Some("permission prompt")));
         assert_eq!(row["answer_url"], "https://claude.ai/code/abc-123");
         assert_eq!(row["session_uri"], "vscode://anthropic.claude-code/open?session=abc-123");
-        assert_eq!(row["folder_uri"], "vscode://vscode-remote/wsl+Ubuntu/w/fw-abc-1");
+        assert_eq!(row["folder_uri"], "vscode://vscode-remote/wsl+Ubuntu/w/fw-abc-1?windowId=_blank");
         assert_eq!(row["last_reply"], "Here is the summary.");
     }
 
