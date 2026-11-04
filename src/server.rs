@@ -125,7 +125,9 @@ pub fn router(app: Shared) -> Router {
         .route("/linear/signin/{state}", get(linear_signin_status))
         .route("/ignore", get(get_ignore).put(put_ignore))
         .route("/linear/issue/{key}", get(linear_issue))
+        .route("/linear/issue/{key}/states", get(linear_issue_states))
         .route("/linear/mine", get(linear_mine))
+        .route("/linear/open", get(linear_open))
         .route("/linear/search", post(linear_search))
         .route("/linear/status", post(linear_status))
         .route("/drafts", post(create_draft))
@@ -394,6 +396,8 @@ fn view_sessions(st: &State, cache: &Cache, now: i64) -> Vec<Value> {
                 "last_ms": s.last_ms,
                 "cwd": s.cwd,
                 "client": s.client,
+                "folder_uri": (!s.cwd.is_empty()).then(|| uri::folder_uri(&s.cwd, cache.wsl_distro.as_deref())),
+                "session_uri": format!("vscode://anthropic.claude-code/open?session={}", uri::encode(&s.id)),
             })
         })
         .collect()
@@ -1555,6 +1559,24 @@ async fn linear_mine(Ax(app): Ax<Shared>) -> ApiResult {
         "issues": issues,
         "truncated": truncated,
     })))
+}
+
+/// Every open issue in scope, assigned or not (decision 71).
+async fn linear_open(Ax(app): Ax<Shared>) -> ApiResult {
+    let scope = open_linear(&app);
+    let (issues, truncated) = linear::open_issues(&linear_accounts()?, scope.as_ref()).await?;
+    Ok(Json(json!({
+        "scope": scope.as_ref().map(|b| b.project_name.clone()),
+        "issues": issues,
+        "truncated": truncated,
+    })))
+}
+
+/// An issue's team's states by key, for an issue with no card yet (decision 71).
+async fn linear_issue_states(Path(key): Path<String>) -> ApiResult {
+    let accounts = linear_accounts()?;
+    let issue = linear::find_issue(&accounts, key.trim(), now_ms()).await?.ok_or_else(|| missing(format!("no issue {key}")))?;
+    Ok(Json(json!({ "states": linear::states(&accounts, &issue).await? })))
 }
 
 #[derive(Deserialize)]
@@ -3271,6 +3293,9 @@ mod tests {
         assert_eq!(row["session_uri"], "vscode://anthropic.claude-code/open?session=abc-123");
         assert_eq!(row["folder_uri"], "vscode://vscode-remote/wsl+Ubuntu/w/fw-abc-1?windowId=_blank");
         assert_eq!(row["last_reply"], "Here is the summary.");
+        let listed = &v["sessions"][0];
+        assert_eq!(listed["folder_uri"], row["folder_uri"], "the session list carries the links too (decision 71)");
+        assert_eq!(listed["session_uri"], row["session_uri"]);
     }
 
     #[test]

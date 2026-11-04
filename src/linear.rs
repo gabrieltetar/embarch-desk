@@ -225,6 +225,7 @@ fn issue_rows(acct: &Account, nodes: &Value) -> Vec<Value> {
             json!({
                 "workspace": acct.label, "key": n["identifier"], "title": n["title"],
                 "state": n["state"]["name"], "url": n["url"], "updated": n["updatedAt"],
+                "project": n["project"]["name"],
             })
         })
         .collect()
@@ -248,21 +249,42 @@ pub(crate) fn scope_filter(b: &LinearBinding) -> (&'static str, &str) {
 }
 
 const OPEN_STATES: &str = "state: { type: { nin: [\"completed\", \"canceled\"] } }";
-const ROW_FIELDS: &str = "nodes { identifier title url updatedAt state { name } }";
+const ROW_FIELDS: &str = "nodes { identifier title url updatedAt state { name } project { name } }";
 
-/// Most open assigned issues read per workspace (spec.md §4).
+/// Most open issues read per workspace (spec.md §4).
 pub const MINE_CAP: usize = 500;
 
 /// Open issues assigned to the user — in the open desk's Linear project when
 /// one is open, else in every connected workspace — and whether `MINE_CAP`
 /// cut any workspace's list.
 pub async fn my_issues(accounts: &[Account], scope: Option<&LinearBinding>) -> Result<(Vec<Value>, bool)> {
+    open_rows(accounts, scope, true).await
+}
+
+/// Every open issue, whoever it is assigned to, in the same scope and under
+/// the same cap (decision 71).
+pub async fn open_issues(accounts: &[Account], scope: Option<&LinearBinding>) -> Result<(Vec<Value>, bool)> {
+    open_rows(accounts, scope, false).await
+}
+
+/// The query for one page of open issues, and whose list it reads.
+fn open_query(decl: &str, filter: &str, mine: bool) -> String {
+    let args = format!("first: 50, after: $a, orderBy: updatedAt, filter: {{ {filter} }}");
+    let body = format!("{ROW_FIELDS} pageInfo {{ hasNextPage endCursor }}");
+    if mine {
+        format!("query{decl} {{ viewer {{ assignedIssues({args}) {{ {body} }} }} }}")
+    } else {
+        format!("query{decl} {{ issues({args}) {{ {body} }} }}")
+    }
+}
+
+async fn open_rows(accounts: &[Account], scope: Option<&LinearBinding>, mine: bool) -> Result<(Vec<Value>, bool)> {
     let mut out = vec![];
     let mut truncated = false;
     for acct in in_scope(accounts, scope) {
         if acct.mcp.is_some() {
             let (rows, cut) =
-                crate::connectors::take_capped(MINE_CAP, |after: Option<String>| linear_mcp::assigned_page(acct, scope, after)).await?;
+                crate::connectors::take_capped(MINE_CAP, |after: Option<String>| linear_mcp::open_page(acct, scope, mine, after)).await?;
             out.extend(rows);
             truncated |= cut;
             continue;
@@ -274,17 +296,14 @@ pub async fn my_issues(accounts: &[Account], scope: Option<&LinearBinding>) -> R
             }
             None => ("($a: String)", OPEN_STATES.to_string(), json!({})),
         };
-        let q = format!(
-            "query{decl} {{ viewer {{ assignedIssues(first: 50, after: $a, orderBy: updatedAt, filter: {{ {filter} }}) \
-             {{ {ROW_FIELDS} pageInfo {{ hasNextPage endCursor }} }} }} }}"
-        );
+        let q = open_query(decl, &filter, mine);
         let q = q.as_str();
         let vars = &vars;
         let (rows, cut) = crate::connectors::take_capped(MINE_CAP, |after: Option<String>| async move {
             let mut v = vars.clone();
             v["a"] = json!(after);
             let d = gql(acct, q, v).await?;
-            Ok(issue_page(acct, &d["viewer"]["assignedIssues"]))
+            Ok(issue_page(acct, if mine { &d["viewer"]["assignedIssues"] } else { &d["issues"] }))
         })
         .await?;
         out.extend(rows);
@@ -293,7 +312,7 @@ pub async fn my_issues(accounts: &[Account], scope: Option<&LinearBinding>) -> R
     Ok((out, truncated))
 }
 
-/// One page of `assignedIssues` as rows, and the cursor of the next.
+/// One page of issues as rows, and the cursor of the next.
 fn issue_page(acct: &Account, page: &Value) -> (Vec<Value>, Option<String>) {
     let next = if page["pageInfo"]["hasNextPage"] == true { page["pageInfo"]["endCursor"].as_str().map(str::to_string) } else { None };
     (issue_rows(acct, &page["nodes"]), next)
@@ -503,6 +522,22 @@ pub fn start_state(states: &[Value], current_type: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_names_its_project_and_the_open_query_is_not_limited_to_the_viewer() {
+        let acct = Account::new("personal", "t");
+        let nodes = json!([
+            { "identifier": "EMB-1", "title": "T", "url": "u", "updatedAt": "d", "state": { "name": "Todo" }, "project": { "name": "embarch-ui" } },
+            { "identifier": "EMB-2", "title": "T", "url": "u", "updatedAt": "d", "state": { "name": "Todo" }, "project": null },
+        ]);
+        let rows = issue_rows(&acct, &nodes);
+        assert_eq!(rows[0]["project"], "embarch-ui");
+        assert!(rows[1]["project"].is_null());
+        let all = open_query("($a: String)", OPEN_STATES, false);
+        assert!(all.contains("{ issues(") && !all.contains("viewer"), "{all}");
+        let mine = open_query("($a: String)", OPEN_STATES, true);
+        assert!(mine.contains("viewer { assignedIssues("), "{mine}");
+    }
 
     #[tokio::test]
     async fn assigned_issues_page_on_the_cursor_until_the_cap() {

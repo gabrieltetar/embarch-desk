@@ -357,14 +357,14 @@ fn detail_from(acct: &Account, i: &Value, c: &Value) -> Value {
 
 /// A page as big as the GraphQL side's.
 const PAGE: usize = 50;
-const ROW_FIELDS: [&str; 5] = ["title", "url", "status", "statusType", "updatedAt"];
+const ROW_FIELDS: [&str; 6] = ["title", "url", "status", "statusType", "updatedAt", "project"];
 /// What GraphQL's open-issue filter leaves out; the server has no "not in" filter.
 const CLOSED: [&str; 3] = ["completed", "canceled", "duplicate"];
 
 fn row(acct: &Account, i: &Value) -> Value {
     json!({
         "workspace": acct.label, "key": i["id"], "title": i["title"],
-        "state": i["status"], "url": i["url"], "updated": i["updatedAt"],
+        "state": i["status"], "url": i["url"], "updated": i["updatedAt"], "project": i["project"],
     })
 }
 
@@ -387,9 +387,12 @@ fn scoped(mut args: Value, scope: Option<&LinearBinding>, after: Option<String>)
     args
 }
 
-/// One page of the open issues assigned to the user, and the next page's cursor.
-pub async fn assigned_page(acct: &Account, scope: Option<&LinearBinding>, after: Option<String>) -> Result<(Vec<Value>, Option<String>)> {
-    let args = json!({ "assignee": "me", "limit": PAGE, "orderBy": "updatedAt", "fields": ROW_FIELDS });
+/// One page of open issues, the user's or everyone's, and the next page's cursor.
+pub async fn open_page(acct: &Account, scope: Option<&LinearBinding>, mine: bool, after: Option<String>) -> Result<(Vec<Value>, Option<String>)> {
+    let mut args = json!({ "limit": PAGE, "orderBy": "updatedAt", "fields": ROW_FIELDS });
+    if mine {
+        args["assignee"] = json!("me");
+    }
     let v = call(acct, "list_issues", scoped(args, scope, after)).await?;
     Ok((open_rows(acct, &v), next_cursor(&v)))
 }
