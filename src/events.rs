@@ -7,7 +7,7 @@
 //!   item whose issue key the branch carries, and tells the session its desk
 //!   id — the tools need it, and nothing else identifies a session to them.
 //! - **UserPromptSubmit** on a session with no work item asks, every prompt,
-//!   until it is answered (proposal decision 7).
+//!   until it is answered (proposal decision 7), unless time is off (decision 72).
 //! - **PostToolUse** turns a `git commit` into a tile line, an
 //!   `embarch-api` build, flash or study into bench activity, and a write
 //!   to a Claude Code memory file into the item's memory note.
@@ -112,6 +112,16 @@ pub fn ask_text(state: &State, session_id: &str, now: i64, window_days: i64) -> 
          Then call the `desk_set_work_item` tool with session_id `{session_id}` and the answer \
          (a new standalone item also needs its desk — ask which). If the user says this is not \
          tracked work, call it with untracked: true. Ask again on every prompt until it is answered."
+    )
+}
+
+/// What a session on no work item hears on a desk with time off: the id its
+/// tools need, and no question.
+fn unasked_text(session_id: &str) -> String {
+    format!(
+        "EmbArch Desk: this session's desk session id is `{session_id}`. It is on no work item, and \
+         that is fine: do not ask the user for one. If the user names an issue or an item, call the \
+         `desk_set_work_item` tool with this session_id."
     )
 }
 
@@ -262,7 +272,9 @@ pub fn apply(
     }
     let main = match (ev.hook_event_name.as_str(), item) {
         ("SessionStart", Some(i)) => Some(assigned_text(state, &ev.session_id, &i)),
-        ("SessionStart" | "UserPromptSubmit", None) => Some(ask_text(state, &ev.session_id, now, window_days)),
+        // Asking exists so time has somewhere to land (decision 72).
+        ("SessionStart" | "UserPromptSubmit", None) if time_on => Some(ask_text(state, &ev.session_id, now, window_days)),
+        ("SessionStart", None) => Some(unasked_text(&ev.session_id)),
         _ => None,
     };
     let switch = (ev.hook_event_name == "SessionStart").then(|| switch_text(state, &ev.session_id)).flatten();
@@ -611,6 +623,21 @@ mod tests {
         apply(&mut st, &ev("UserPromptSubmit", "d", "/w/r"), D0 + H, &UtcDays, &git, 7);
         let s = &st.sessions["d"];
         assert!(s.busy && s.spans.is_empty(), "state moves, no time is made");
+    }
+
+    #[test]
+    fn a_desk_with_time_off_never_asks_and_still_tells_a_session_its_item() {
+        let mut st = State::default();
+        st.settings.time = false;
+        let git = FakeGit::default();
+        let start = apply(&mut st, &ev("SessionStart", "q", "/w/r"), D0, &UtcDays, &git, 7).unwrap();
+        assert!(start.contains("`q`") && start.contains("do not ask") && !start.contains("Ask again"), "{start}");
+        assert!(apply(&mut st, &ev("UserPromptSubmit", "q", "/w/r"), D0, &UtcDays, &git, 7).is_none(), "a prompt hears nothing");
+        assert!(st.sessions["q"].item_id.is_none() && !st.sessions["q"].ignored, "it stays listed, with no item");
+        let w = st.create_item("x", None, D0);
+        st.assign_session("q", &w, D0, &UtcDays, &git);
+        let told = apply(&mut st, &ev("SessionStart", "q", "/w/r"), D0 + H, &UtcDays, &git, 7).unwrap();
+        assert!(told.contains(&w), "{told}");
     }
 
     #[test]
