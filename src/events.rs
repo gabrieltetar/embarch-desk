@@ -166,6 +166,7 @@ pub fn apply(
         return None;
     }
     let ignore = state.ignore.clone();
+    let time_on = state.settings.time;
     let desk_here = state.desk_for_path(&ev.cwd);
     let sess = state.sessions.entry(ev.session_id.clone()).or_insert_with(|| {
         let mut s = Session::new(&ev.session_id, &ev.cwd, now);
@@ -240,7 +241,9 @@ pub fn apply(
         sess.last_ms = sess.last_ms.max(now);
         return None;
     }
-    store::record_activity(sess, now, days);
+    if time_on {
+        store::record_activity(sess, now, days);
+    }
     let cwd = if ev.cwd.is_empty() { sess.cwd.clone() } else { ev.cwd.clone() };
 
     if sess.item_id.is_none() {
@@ -597,6 +600,17 @@ mod tests {
         apply(&mut st, &ev("SessionStart", "f", "/g/embarch/x"), D0, &UtcDays, &git, 7);
         apply(&mut st, &ev("UserPromptSubmit", "f", "/g/embarch/x"), D0 + H, &UtcDays, &git, 7);
         assert!(!st.sessions["f"].busy && st.sessions["f"].last_ms == D0);
+    }
+
+    #[test]
+    fn a_desk_with_time_off_keeps_session_state_but_makes_no_spans() {
+        let mut st = State::default();
+        st.settings.time = false;
+        let git = FakeGit::default();
+        apply(&mut st, &ev("SessionStart", "d", "/w/r"), D0, &UtcDays, &git, 7);
+        apply(&mut st, &ev("UserPromptSubmit", "d", "/w/r"), D0 + H, &UtcDays, &git, 7);
+        let s = &st.sessions["d"];
+        assert!(s.busy && s.spans.is_empty(), "state moves, no time is made");
     }
 
     #[test]

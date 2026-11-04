@@ -295,7 +295,7 @@ impl DeskMcp {
         }
     }
 
-    #[tool(description = "Propose a comment on a Linear issue. Nothing is posted: the draft waits on the user's Desk tab, where they edit it if they want and press Send. Tell the user it is waiting there.")]
+    #[tool(description = "Propose a comment on a Linear issue. On a work desk nothing is posted: the draft waits on the user's Desk tab, where they edit it if they want and press Send, so tell the user it is waiting there. A desk set to write directly posts it at once and the reply says so.")]
     async fn linear_draft_comment(&self, Parameters(p): Parameters<CommentDraftParams>) -> Result<CallToolResult, McpError> {
         let body = json!({ "kind": "linear_comment", "issue_key": p.issue_key, "body": p.body, "session_id": p.session_id });
         match self.client.post("/drafts", body).await {
@@ -304,7 +304,7 @@ impl DeskMcp {
         }
     }
 
-    #[tool(description = "Propose a new Linear issue. Nothing is created: the draft waits on the user's Desk tab for their Send. If this session's work item has no issue yet, the new issue is attached to it once sent.")]
+    #[tool(description = "Propose a new Linear issue. On a work desk nothing is created: the draft waits on the user's Desk tab for their Send (a desk set to write directly creates it at once and the reply says so). If this session's work item has no issue yet, the new issue is attached to it once sent.")]
     async fn linear_draft_issue(&self, Parameters(p): Parameters<IssueDraftParams>) -> Result<CallToolResult, McpError> {
         let body = json!({ "kind": "linear_issue", "team_key": p.team_key, "title": p.title, "body": p.description, "session_id": p.session_id });
         match self.client.post("/drafts", body).await {

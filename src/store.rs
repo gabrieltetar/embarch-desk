@@ -103,6 +103,16 @@ pub struct Settings {
     /// before it existed included.
     #[serde(default = "on")]
     pub promptu: bool,
+    /// Capture time: spans, tiles, the hand and the manual timer. On by
+    /// default, a state written before it existed included. A desk with no
+    /// Harvest (the dev desk) turns it off.
+    #[serde(default = "on")]
+    pub time: bool,
+    /// The agent issue and comment tools send straight away instead of
+    /// leaving a draft for the user's Send. Off by default: the drafts-only
+    /// rule is for work workspaces, and this is for a personal one.
+    #[serde(default)]
+    pub direct_writes: bool,
 }
 
 fn on() -> bool {
@@ -111,7 +121,7 @@ fn on() -> bool {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { chat_panel: false, promptu: true }
+        Settings { chat_panel: false, promptu: true, time: true, direct_writes: false }
     }
 }
 
@@ -1137,12 +1147,13 @@ impl State {
         if !self.items.contains_key(item_id) {
             return false;
         }
+        let time_on = self.settings.time;
         let Some(sess) = self.sessions.get_mut(session_id) else {
             return false;
         };
         sess.ignored = false;
         let switching = sess.item_id.as_deref().is_some_and(|cur| cur != item_id);
-        if switching {
+        if switching && time_on {
             record_activity(sess, now, days);
         }
         for sp in sess.spans.iter_mut().filter(|sp| sp.item_id.is_none()) {

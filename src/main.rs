@@ -79,9 +79,36 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ServiceAction {
-    Install,
-    Uninstall,
-    Status,
+    /// Install the service. With `--instance NAME`, a second desk beside the
+    /// first: `embarch-desk-NAME.service`, its own port, config and data
+    /// folders, and a login and `gh` folder of its own.
+    Install {
+        #[arg(long)]
+        instance: Option<String>,
+        /// The instance's port (required with --instance).
+        #[arg(long)]
+        port: Option<u16>,
+        /// CLAUDE_CONFIG_DIR for the `claude -p` calls the desk makes.
+        #[arg(long)]
+        claude_config_dir: Option<String>,
+        /// GH_CONFIG_DIR for the `gh` calls the desk makes.
+        #[arg(long)]
+        gh_config_dir: Option<String>,
+        /// Capture no time: no tiles, no hand, no timer.
+        #[arg(long)]
+        no_time: bool,
+        /// Agent issue and comment tools send at once instead of drafting.
+        #[arg(long)]
+        direct_writes: bool,
+    },
+    Uninstall {
+        #[arg(long)]
+        instance: Option<String>,
+    },
+    Status {
+        #[arg(long)]
+        instance: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -99,9 +126,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Service { action } => match action {
-            ServiceAction::Install => service::install(),
-            ServiceAction::Uninstall => service::uninstall(),
-            ServiceAction::Status => service::status(),
+            ServiceAction::Install { instance, port, claude_config_dir, gh_config_dir, no_time, direct_writes } => {
+                service::install(service::Instance::new(instance, port, claude_config_dir, gh_config_dir, no_time, direct_writes)?)
+            }
+            ServiceAction::Uninstall { instance } => service::uninstall(instance.as_deref()),
+            ServiceAction::Status { instance } => service::status(instance.as_deref()),
         },
         Cmd::Mcp => runtime()?.block_on(mcp::serve()),
         Cmd::Serve => runtime()?.block_on(serve()),
@@ -224,6 +253,20 @@ async fn serve() -> Result<()> {
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "embarch_desk=info".into()),
     ).init();
     let db = db::open_default()?;
+    // An instance's unit states its settings, so a fresh data folder comes up
+    // right and a changed unit takes effect on restart.
+    for (var, apply) in [
+        ("EMBARCH_DESK_TIME", (|st: &mut store::State, on| st.settings.time = on) as fn(&mut store::State, bool)),
+        ("EMBARCH_DESK_DIRECT_WRITES", |st, on| st.settings.direct_writes = on),
+    ] {
+        if let Some(on) = std::env::var(var).ok().and_then(|v| match v.as_str() {
+            "1" | "on" => Some(true),
+            "0" | "off" => Some(false),
+            _ => None,
+        }) {
+            db.write(|st| apply(st, on));
+        }
+    }
     let refs = refs::Store::open(db.dir());
     let app = Arc::new(server::App {
         db,

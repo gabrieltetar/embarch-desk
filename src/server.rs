@@ -1661,6 +1661,13 @@ async fn create_draft(Ax(app): Ax<Shared>, Json(b): Json<NewDraft>) -> ApiResult
         );
         id
     });
+    // A desk set to write directly sends what the agent proposed at once;
+    // any other desk leaves it waiting (the invariant: no agent tool sends
+    // a draft unless the desk's owner turned that on).
+    if app.db.read(|st| st.settings.direct_writes) {
+        let Json(sent) = send_draft(Ax(app), Path(id.clone())).await?;
+        return Ok(Json(json!({ "draft_id": id, "status": "sent", "url": sent["url"] })));
+    }
     Ok(Json(json!({ "draft_id": id, "status": "waiting for the user's Send on the Desk tab; nothing was posted" })))
 }
 
@@ -1787,6 +1794,9 @@ struct TimerBody {
 /// The manual timer, for work away from Claude Code — what harvest:track
 /// covered (decision 31).
 async fn timer_start(Ax(app): Ax<Shared>, Json(b): Json<TimerBody>) -> ApiResult {
+    if !app.db.read(|st| st.settings.time) {
+        return Err(bad("this desk captures no time"));
+    }
     let item_id = match clean(&b.item_id) {
         Some(i) => i,
         None => ensure_item(&app, b.new_title.as_deref(), b.issue_key.as_deref(), b.desk.as_deref()).await?,
@@ -2322,6 +2332,10 @@ struct SettingsPatch {
     chat_panel: Option<bool>,
     #[serde(default)]
     promptu: Option<bool>,
+    #[serde(default)]
+    time: Option<bool>,
+    #[serde(default)]
+    direct_writes: Option<bool>,
 }
 
 async fn put_settings(Ax(app): Ax<Shared>, Json(b): Json<SettingsPatch>) -> ApiResult {
@@ -2331,6 +2345,12 @@ async fn put_settings(Ax(app): Ax<Shared>, Json(b): Json<SettingsPatch>) -> ApiR
         }
         if let Some(on) = b.promptu {
             st.settings.promptu = on;
+        }
+        if let Some(on) = b.time {
+            st.settings.time = on;
+        }
+        if let Some(on) = b.direct_writes {
+            st.settings.direct_writes = on;
         }
         st.settings.clone()
     });
@@ -3223,6 +3243,19 @@ mod tests {
         let Ok(Json(v)) = put(json!({"chat_panel": true})).await else { panic!("put") };
         assert_eq!((v["chat_panel"].as_bool(), v["promptu"].as_bool()), (Some(true), Some(false)), "a patch leaves the other setting alone");
         assert!(!app.db.read(|st| st.settings.promptu));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_time_and_direct_write_settings_default_to_the_work_desks_behaviour_and_refuse_a_timer_when_off() {
+        let (app, dir) = scratch_app();
+        let Ok(Json(v)) = get_settings(Ax(app.clone())).await else { panic!("settings") };
+        assert_eq!((v["time"].as_bool(), v["direct_writes"].as_bool()), (Some(true), Some(false)));
+        let put = |b: Value| put_settings(Ax(app.clone()), Json(serde_json::from_value(b).unwrap()));
+        let Ok(Json(v)) = put(json!({"time": false, "direct_writes": true})).await else { panic!("put") };
+        assert_eq!((v["time"].as_bool(), v["promptu"].as_bool(), v["direct_writes"].as_bool()), (Some(false), Some(true), Some(true)));
+        let body = serde_json::from_value(json!({"new_title": "x"})).unwrap();
+        assert!(timer_start(Ax(app.clone()), Json(body)).await.is_err(), "no timer on a desk that captures no time");
         std::fs::remove_dir_all(dir).ok();
     }
 
