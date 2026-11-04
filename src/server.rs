@@ -144,6 +144,7 @@ pub fn router(app: Shared) -> Router {
         .route("/harvest/entry/{account}/{id}", axum::routing::patch(edit_entry).delete(remove_entry))
         .route("/pickup", get(pickup))
         .route("/items/{id}/start", post(start_work))
+        .route("/items/{id}/repos", post(add_repo))
         .route("/items/{id}/brief", get(item_brief))
         .route("/items/{id}/notes", get(item_notes))
         .route("/mailbox", get(get_mailbox).post(post_mailbox))
@@ -2155,6 +2156,12 @@ fn main_clone(st: &State, item: &store::WorkItem) -> Option<String> {
         .or_else(|| item.desk_id.as_ref().and_then(|k| st.desks.get(k)).and_then(|d| d.firmware_repos.first().cloned()))
 }
 
+/// Where Start work's worktree comes from.
+enum StartFrom {
+    Clone(std::path::PathBuf),
+    Suite(crate::suite::Suite, String),
+}
+
 async fn start_work(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     let now = now_ms();
     let (issue, main) = app
@@ -2162,7 +2169,12 @@ async fn start_work(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
         .read(|st| st.items.get(&id).map(|i| (i.issue.clone(), main_clone(st, i))))
         .ok_or_else(|| missing("no such work item"))?;
     let issue = issue.ok_or_else(|| bad("Start work needs a Linear issue on the card"))?;
-    let main = main.ok_or_else(|| ApiError(StatusCode::CONFLICT, "no repo to start from: pick the card's repo, or give its desk a firmware repo".into()))?;
+    let suite = crate::suite::Suite::from_env();
+    // A suite takes its repo from the issue's Project, once that is fresh.
+    let main = match &suite {
+        Some(_) => None,
+        None => Some(main.ok_or_else(|| ApiError(StatusCode::CONFLICT, "no repo to start from: pick the card's repo, or give its desk a firmware repo".into()))?),
+    };
     let accounts = linear_accounts()?;
     // Fresh from Linear: its branch name and state may have changed.
     let issue = linear::find_issue(&accounts, &issue.key, now).await?.unwrap_or(issue);
@@ -2170,6 +2182,15 @@ async fn start_work(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
         issue.key.to_ascii_lowercase()
     } else {
         issue.branch_name.clone()
+    };
+    // Refused here, so a Project with no repo leaves the issue where it was.
+    let source = match (suite, main) {
+        (Some(s), _) => {
+            let repo = s.repo_for_project(&issue.project_name).map_err(|e| ApiError(StatusCode::CONFLICT, format!("{}: {e:#}", issue.key)))?;
+            StartFrom::Suite(s, repo)
+        }
+        (None, Some(main)) => StartFrom::Clone(std::path::PathBuf::from(main)),
+        (None, None) => unreachable!("a desk with no suite has its clone by now"),
     };
     let mut warnings: Vec<String> = vec![];
     let mut moved_to = None;
@@ -2189,11 +2210,13 @@ async fn start_work(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     }
     let key = issue.key.clone();
     let br = branch.clone();
-    let main_path = std::path::PathBuf::from(&main);
-    let prepared = tokio::task::spawn_blocking(move || {
-        let p = crate::worktree::prepare(&main_path, &key, &br)?;
-        crate::worktree::set_auto_mode(&p.path)?;
-        Ok::<_, anyhow::Error>(p)
+    let prepared = tokio::task::spawn_blocking(move || match source {
+        StartFrom::Suite(s, repo) => s.start(&key, &repo, &br),
+        StartFrom::Clone(main) => {
+            let p = crate::worktree::prepare(&main, &key, &br)?;
+            crate::worktree::set_auto_mode(&p.path)?;
+            Ok::<_, anyhow::Error>(p)
+        }
     })
     .await
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
@@ -2241,6 +2264,43 @@ async fn start_work(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     Ok(Json(out))
 }
 
+#[derive(Deserialize)]
+struct AddRepo {
+    repo: String,
+}
+
+/// Give another repo in a suite a worktree on this item's branch, replacing
+/// its symlink in the issue's folder (decision 70).
+async fn add_repo(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<AddRepo>) -> ApiResult {
+    let conflict = |m: String| ApiError(StatusCode::CONFLICT, m);
+    let suite = crate::suite::Suite::from_env().ok_or_else(|| conflict("this desk has no suite layout".into()))?;
+    let (issue, started) = app
+        .db
+        .read(|st| st.items.get(&id).map(|i| (i.issue.clone(), i.repo_path.clone())))
+        .ok_or_else(|| missing("no such work item"))?;
+    let issue = issue.ok_or_else(|| bad("adding a repo needs a Linear issue on the card"))?;
+    let dir = suite.issue_dir(&issue.key).map_err(|e| bad(format!("{e:#}")))?;
+    let started = started
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.starts_with(&dir) && p.is_dir())
+        .ok_or_else(|| conflict(format!("{} has no folder here yet: Start work first", issue.key)))?;
+    let repo = b.repo.trim().to_string();
+    let key = issue.key.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let branch = crate::worktree::current_branch(&started)?;
+        suite.add_repo(&key, &repo, &branch)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| conflict(format!("{e:#}")))?;
+    Ok(Json(json!({
+        "worktree": prepared.path.display().to_string(),
+        "branch": prepared.branch,
+        "how": prepared.how,
+        "warnings": prepared.warnings,
+    })))
+}
+
 fn start_entry(item_id: &str, folder: &str, prompt: &str) -> MailboxEntry {
     MailboxEntry {
         id: String::new(),
@@ -2269,25 +2329,26 @@ struct NewMail {
     folder: String,
 }
 
-/// Leave a focus — bring up a session's thread — for the window whose folder
-/// matches. It expires as a launch claim does. A start is left by Start
-/// work alone, with the prompt the desk writes: a route taking a caller's
-/// prompt would let any page that reaches the desk run one in auto mode.
+/// Leave a focus (bring up a session's thread) or an open (start a chat on no
+/// work item, untracked) for the window whose folder matches. It expires as
+/// a launch claim does. A start is left by Start work alone, with the prompt
+/// the desk writes: a route taking a caller's prompt would let any page that
+/// reaches the desk run one in auto mode. An open carries no prompt, so it
+/// can only ever bring up an empty chat.
 async fn post_mailbox(Ax(app): Ax<Shared>, Json(b): Json<NewMail>) -> ApiResult {
     let folder = b.folder.trim();
     if !folder.starts_with('/') {
         return Err(bad("folder must be an absolute path"));
     }
-    let session_id = clean(&b.session_id);
-    match b.kind.as_str() {
-        "focus" if session_id.is_none() => return Err(bad("a focus needs session_id")),
-        "focus" => {}
+    let session_id = match b.kind.as_str() {
+        "focus" => Some(clean(&b.session_id).ok_or_else(|| bad("a focus needs session_id"))?),
+        "open" => None,
         "start" => return Err(bad("a start is left by Start work (POST /items/{id}/start), not posted")),
-        k => return Err(bad(format!("unknown kind {k:?}; focus"))),
-    }
+        k => return Err(bad(format!("unknown kind {k:?}; focus or open"))),
+    };
     let entry = MailboxEntry {
         id: String::new(),
-        kind: "focus".into(),
+        kind: b.kind.clone(),
         item_id: None,
         session_id,
         folder: folder.to_string(),
@@ -2297,7 +2358,12 @@ async fn post_mailbox(Ax(app): Ax<Shared>, Json(b): Json<NewMail>) -> ApiResult 
         taken_ms: None,
     };
     let id = app.db.write(|st| st.post_mail(entry, now_ms()));
-    Ok(Json(json!({ "id": id })))
+    let mut out = json!({ "id": id });
+    // The window to take it may not be open yet.
+    if b.kind == "open" {
+        out["folder_uri"] = json!(uri::folder_uri(folder, app.wsl_distro.as_deref()));
+    }
+    Ok(Json(out))
 }
 
 #[derive(Deserialize)]
@@ -3401,6 +3467,23 @@ mod tests {
         let m = app.db.read(|st| st.mailbox[0].clone());
         assert_eq!((v["id"].as_str(), m.kind.as_str(), m.session_id.as_deref(), m.prompt), (Some(m.id.as_str()), "focus", Some("s"), None));
         assert!(post(json!({"kind": "focus", "folder": "/w/fw-abc-1"})).await.is_err(), "a focus needs its session");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_open_names_a_folder_and_carries_no_item_or_prompt() {
+        let (app, dir) = scratch_app();
+        let w = app.db.write(|st| st.create_item("x", None, D0));
+        let post = |b: Value| post_mailbox(Ax(app.clone()), Json(serde_json::from_value(b).unwrap()));
+        let Ok(Json(v)) = post(json!({"kind": "open", "folder": "/w/suite", "item_id": w, "session_id": "s", "prompt": "run this"})).await else { panic!("an open is taken") };
+        let m = app.db.read(|st| st.mailbox[0].clone());
+        assert_eq!((m.kind.as_str(), m.folder.as_str()), ("open", "/w/suite"));
+        assert_eq!((m.item_id, m.session_id, m.prompt), (None, None, None), "a caller supplies only the folder");
+        assert!(v["folder_uri"].as_str().unwrap().contains("suite"), "{v}");
+        assert!(post(json!({"kind": "open", "folder": "relative"})).await.is_err());
+        // A second press before the window takes the first is one chat.
+        let Ok(Json(again)) = post(json!({"kind": "open", "folder": "/w/suite"})).await else { panic!() };
+        assert_eq!(app.db.read(|st| st.mailbox.iter().map(|m| m.id.clone()).collect::<Vec<_>>()), vec![again["id"].as_str().unwrap().to_string()]);
         std::fs::remove_dir_all(dir).ok();
     }
 

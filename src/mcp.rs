@@ -52,6 +52,14 @@ pub struct SetWorkItemParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct AddRepoParams {
+    /// The desk session id from this session's context.
+    pub session_id: String,
+    /// The clone's folder name in the suite, such as `embarch-api`.
+    pub repo: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct LineParams {
     /// The desk session id given in this session's context.
     pub session_id: String,
@@ -190,6 +198,23 @@ impl DeskMcp {
     async fn desk_set_work_item(&self, Parameters(p): Parameters<SetWorkItemParams>) -> Result<CallToolResult, McpError> {
         let body = json!({ "item_id": p.item_id, "issue_key": p.issue_key, "new_title": p.new_title, "desk": p.desk, "untracked": p.untracked });
         match self.client.post(&format!("/sessions/{}/assign", p.session_id), body).await {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "On a suite desk, give another repo a worktree on this session's branch, replacing its symlink in the issue's folder: use this before changing a repo that is still a symlink, and never edit through the symlink, which is the main clone. Repo is a clone's folder name, such as embarch-api. Answers with the worktree's path. Use the desk session id from this session's context.")]
+    async fn desk_add_repo(&self, Parameters(p): Parameters<AddRepoParams>) -> Result<CallToolResult, McpError> {
+        let sess = match self.client.get(&format!("/sessions/{}", p.session_id)).await {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        let Some(item) = sess["work_item"]["id"].as_str() else {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                "This session is not on a work item yet. Ask the user which one it is and call desk_set_work_item.",
+            )]));
+        };
+        match self.client.post(&format!("/items/{item}/repos"), json!({ "repo": p.repo })).await {
             Ok(v) => ok(v),
             Err(e) => err(e),
         }
@@ -399,5 +424,7 @@ mod tests {
         let line = serde_json::to_value(&tool("desk_add_line").input_schema).unwrap();
         assert!(line["properties"]["kind"].is_object(), "{line}");
         assert_eq!(line["required"], json!(["session_id", "text"]));
+        let add = serde_json::to_value(&tool("desk_add_repo").input_schema).unwrap();
+        assert_eq!(add["required"], json!(["session_id", "repo"]));
     }
 }

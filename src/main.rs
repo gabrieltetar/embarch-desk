@@ -22,6 +22,7 @@ mod refs;
 mod server;
 mod service;
 mod store;
+mod suite;
 mod uri;
 mod worktree;
 
@@ -100,6 +101,13 @@ enum ServiceAction {
         /// Agent issue and comment tools send at once instead of drafting.
         #[arg(long)]
         direct_writes: bool,
+        /// The folder of a suite's sibling clones: Start work makes a folder
+        /// per issue there, picking the repo by the issue's Project.
+        #[arg(long)]
+        suite_root: Option<String>,
+        /// The repo in that folder every issue also gets a worktree of.
+        #[arg(long, requires = "suite_root")]
+        suite_docs: Option<String>,
     },
     Uninstall {
         #[arg(long)]
@@ -126,8 +134,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Service { action } => match action {
-            ServiceAction::Install { instance, port, claude_config_dir, gh_config_dir, no_time, direct_writes } => {
-                service::install(service::Instance::new(instance, port, claude_config_dir, gh_config_dir, no_time, direct_writes)?)
+            ServiceAction::Install { instance, port, claude_config_dir, gh_config_dir, no_time, direct_writes, suite_root, suite_docs } => {
+                service::install(service::Instance::new(instance, port, claude_config_dir, gh_config_dir, no_time, direct_writes, (suite_root, suite_docs))?)
             }
             ServiceAction::Uninstall { instance } => service::uninstall(instance.as_deref()),
             ServiceAction::Status { instance } => service::status(instance.as_deref()),

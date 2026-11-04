@@ -24,6 +24,8 @@ pub struct Instance {
     pub gh_config_dir: Option<String>,
     pub time: bool,
     pub direct_writes: bool,
+    pub suite_root: Option<String>,
+    pub suite_docs: Option<String>,
 }
 
 impl Instance {
@@ -35,11 +37,12 @@ impl Instance {
         gh_config_dir: Option<String>,
         no_time: bool,
         direct_writes: bool,
+        (suite_root, suite_docs): (Option<String>, Option<String>),
     ) -> Result<Option<Instance>> {
         let Some(name) = name else {
             ensure!(
-                port.is_none() && claude_config_dir.is_none() && gh_config_dir.is_none() && !no_time && !direct_writes,
-                "--port, --claude-config-dir, --gh-config-dir, --no-time and --direct-writes need --instance NAME"
+                port.is_none() && claude_config_dir.is_none() && gh_config_dir.is_none() && !no_time && !direct_writes && suite_root.is_none(),
+                "--port, --claude-config-dir, --gh-config-dir, --no-time, --direct-writes and --suite-root need --instance NAME"
             );
             return Ok(None);
         };
@@ -55,6 +58,8 @@ impl Instance {
             gh_config_dir,
             time: !no_time,
             direct_writes,
+            suite_root,
+            suite_docs,
         }))
     }
 
@@ -128,6 +133,12 @@ pub fn unit_text(exe: &str, path_env: &str, instance: Option<&Instance>) -> Stri
         }
         if let Some(d) = &i.gh_config_dir {
             vars.push(("GH_CONFIG_DIR", d.clone()));
+        }
+        if let Some(d) = &i.suite_root {
+            vars.push(("EMBARCH_DESK_SUITE_ROOT", d.clone()));
+        }
+        if let Some(d) = &i.suite_docs {
+            vars.push(("EMBARCH_DESK_SUITE_DOCS", d.clone()));
         }
         env.extend(vars.into_iter().map(|(k, v)| quoted(&format!("{k}={v}"))));
     }
@@ -220,6 +231,8 @@ mod tests {
             gh_config_dir: Some("/h/.config/gh-personal".into()),
             time: false,
             direct_writes: true,
+            suite_root: Some("/h/suite".into()),
+            suite_docs: Some("docs".into()),
         };
         let u = super::unit_text("/h/bin/embarch-desk", "/usr/bin", Some(&i));
         for want in [
@@ -230,6 +243,8 @@ mod tests {
             "Environment=\"EMBARCH_DESK_DIRECT_WRITES=on\"\n",
             "Environment=\"CLAUDE_CONFIG_DIR=/h/.claude-personal\"\n",
             "Environment=\"GH_CONFIG_DIR=/h/.config/gh-personal\"\n",
+            "Environment=\"EMBARCH_DESK_SUITE_ROOT=/h/suite\"\n",
+            "Environment=\"EMBARCH_DESK_SUITE_DOCS=docs\"\n",
         ] {
             assert!(u.contains(want), "missing {want}");
         }
@@ -238,12 +253,13 @@ mod tests {
 
     #[test]
     fn an_instance_needs_a_sane_name_and_a_port_of_its_own() {
-        let new = |n: &str, p: Option<u16>| super::Instance::new(Some(n.into()), p, None, None, false, false);
+        let new = |n: &str, p: Option<u16>| super::Instance::new(Some(n.into()), p, None, None, false, false, (None, None));
         assert!(new("dev", Some(4892)).is_ok());
         assert!(new("Dev/..", Some(4892)).is_err());
         assert!(new("dev", None).is_err());
         assert!(new("dev", Some(4891)).is_err());
-        assert!(super::Instance::new(None, Some(4892), None, None, false, false).is_err());
-        assert!(super::Instance::new(None, None, None, None, false, false).unwrap().is_none());
+        assert!(super::Instance::new(None, Some(4892), None, None, false, false, (None, None)).is_err());
+        assert!(super::Instance::new(None, None, None, None, false, false, (None, None)).unwrap().is_none());
+        assert!(super::Instance::new(None, None, None, None, false, false, (Some("/s".into()), None)).is_err());
     }
 }

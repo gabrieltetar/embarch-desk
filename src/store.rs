@@ -131,7 +131,8 @@ impl Default for Settings {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MailboxEntry {
     pub id: String,
-    /// `start` (a chat on an item, with a prompt) or `focus` (a session).
+    /// `start` (a chat on an item, with a prompt), `focus` (a session) or
+    /// `open` (an untracked chat, with no item and no prompt).
     pub kind: String,
     #[serde(default)]
     pub item_id: Option<String>,
@@ -1093,6 +1094,10 @@ impl State {
         entry.folder = norm_folder(&entry.folder);
         if entry.kind == "start" {
             self.mailbox.retain(|m| m.kind != "start" || m.taken_ms.is_some() || m.item_id != entry.item_id || m.folder != entry.folder);
+        }
+        // A second press before the window takes the first is one chat.
+        if entry.kind == "open" {
+            self.mailbox.retain(|m| m.kind != "open" || m.taken_ms.is_some() || m.folder != entry.folder);
         }
         entry.created_ms = now;
         entry.expires_ms = now + LAUNCH_CLAIM_MS;

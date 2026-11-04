@@ -2,7 +2,8 @@
 //! beside the main clone, on Linear's branch for the issue — checked out if
 //! it exists locally or on the remote, else branched from the fresh remote
 //! default branch. A branch already checked out in some worktree is that
-//! worktree, reused rather than refused.
+//! worktree, reused rather than refused. A suite puts the worktree somewhere
+//! else (`suite.rs`), and everything below `prepare` is shared with it.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -54,6 +55,12 @@ pub struct Prepared {
 /// Make (or find) the issue's worktree. Fetching is attempted and its
 /// failure is a warning, not a stop: the local refs still give a worktree.
 pub fn prepare(main_clone: &Path, issue_key: &str, branch: &str) -> Result<Prepared> {
+    prepare_at(main_clone, &worktree_path(main_clone, issue_key), branch)
+}
+
+/// The same at a given path. A symlink there gives way to the worktree, its
+/// target untouched: anything else there is someone's work.
+pub fn prepare_at(main_clone: &Path, path: &Path, branch: &str) -> Result<Prepared> {
     let mut warnings = vec![];
     if !main_clone.join(".git").exists() {
         bail!("{} is not a git clone", main_clone.display());
@@ -61,8 +68,9 @@ pub fn prepare(main_clone: &Path, issue_key: &str, branch: &str) -> Result<Prepa
     if let Some(p) = checked_out_at(main_clone, branch)? {
         return Ok(Prepared { path: p, branch: branch.into(), how: "reused".into(), warnings });
     }
-    let path = worktree_path(main_clone, issue_key);
-    if path.exists() {
+    let existing = path.symlink_metadata().ok();
+    let is_link = existing.as_ref().is_some_and(|m| m.file_type().is_symlink());
+    if existing.is_some() && !is_link {
         // A folder of that name that is not on the branch is someone's work:
         // never touched, named instead.
         bail!("{} already exists and is not on {branch}", path.display());
@@ -70,6 +78,9 @@ pub fn prepare(main_clone: &Path, issue_key: &str, branch: &str) -> Result<Prepa
     let remote = remote_of(main_clone);
     if let Err(e) = git(main_clone, &["fetch", "--quiet", &remote]) {
         warnings.push(format!("could not fetch {remote}, using local refs: {e:#}"));
+    }
+    if is_link {
+        std::fs::remove_file(path).with_context(|| format!("removing the link at {}", path.display()))?;
     }
     let p = path.to_string_lossy().into_owned();
     let how = if has_ref(main_clone, &format!("refs/heads/{branch}")) {
@@ -87,7 +98,21 @@ pub fn prepare(main_clone: &Path, issue_key: &str, branch: &str) -> Result<Prepa
         git(main_clone, &["worktree", "add", "--no-track", "-b", branch, &p, &base])?;
         format!("new from {base}")
     };
-    Ok(Prepared { path, branch: branch.into(), how, warnings })
+    Ok(Prepared { path: path.to_path_buf(), branch: branch.into(), how, warnings })
+}
+
+/// Forget worktrees whose folders are gone.
+pub fn prune(main_clone: &Path) -> Result<()> {
+    git(main_clone, &["worktree", "prune"]).map(|_| ())
+}
+
+/// The branch a worktree is on; a detached one has none to share.
+pub fn current_branch(worktree: &Path) -> Result<String> {
+    let branch = git(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if branch == "HEAD" {
+        bail!("{} is on no branch", worktree.display());
+    }
+    Ok(branch)
 }
 
 /// The remote a clone works against: the one its checked-out branch tracks,
@@ -111,6 +136,25 @@ fn remote_of(main_clone: &Path) -> String {
 /// Sessions the desk opens run in auto mode: a local settings file in the
 /// worktree, kept out of git through the repo's shared `info/exclude`.
 pub fn set_auto_mode(worktree: &Path) -> Result<()> {
+    edit_permissions(worktree, |perms| {
+        perms.entry("defaultMode").or_insert_with(|| serde_json::json!("auto"));
+    })
+}
+
+/// Let a session in the worktree reach `dir` as well, through the same file.
+pub fn add_directory(worktree: &Path, dir: &Path) -> Result<()> {
+    let dir = dir.to_string_lossy().into_owned();
+    edit_permissions(worktree, |perms| {
+        let list = perms.entry("additionalDirectories").or_insert_with(|| serde_json::json!([]));
+        if let Some(list) = list.as_array_mut() {
+            if !list.iter().any(|d| d.as_str() == Some(dir.as_str())) {
+                list.push(serde_json::json!(dir));
+            }
+        }
+    })
+}
+
+fn edit_permissions(worktree: &Path, edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>)) -> Result<()> {
     let dir = worktree.join(".claude");
     std::fs::create_dir_all(&dir)?;
     let file = dir.join("settings.local.json");
@@ -123,7 +167,7 @@ pub fn set_auto_mode(worktree: &Path) -> Result<()> {
     }
     let perms = v.as_object_mut().expect("object").entry("permissions").or_insert_with(|| serde_json::json!({}));
     if let Some(p) = perms.as_object_mut() {
-        p.entry("defaultMode").or_insert_with(|| serde_json::json!("auto"));
+        edit(p);
     }
     std::fs::write(&file, serde_json::to_string_pretty(&v)? + "\n")?;
     let common = git(worktree, &["rev-parse", "--git-common-dir"])?;
