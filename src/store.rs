@@ -309,6 +309,11 @@ pub struct Session {
     pub item_id: Option<String>,
     #[serde(default)]
     pub ignored: bool,
+    /// Left out of the desk's session list for every reader, as a machine's
+    /// session is not a chat anyone has: a fleet's listener marks its own
+    /// (decision 73). Implies `ignored`.
+    #[serde(default)]
+    pub hidden: bool,
     pub started_ms: i64,
     pub last_ms: i64,
     #[serde(default)]
@@ -351,6 +356,7 @@ impl Session {
             desk_id: None,
             item_id: None,
             ignored: false,
+            hidden: false,
             started_ms: now,
             last_ms: now,
             spans: vec![],
@@ -1157,6 +1163,7 @@ impl State {
             return false;
         };
         sess.ignored = false;
+        sess.hidden = false;
         let switching = sess.item_id.as_deref().is_some_and(|cur| cur != item_id);
         if switching && time_on {
             record_activity(sess, now, days);
@@ -1360,6 +1367,15 @@ impl State {
             s.ended = true;
         }
         Some(t)
+    }
+
+    /// Untrack a session and leave it out of the session list as well.
+    pub fn hide_session(&mut self, session_id: &str) -> bool {
+        let found = self.untrack_session(session_id);
+        if let Some(s) = self.sessions.get_mut(session_id) {
+            s.hidden = true;
+        }
+        found
     }
 
     pub fn untrack_session(&mut self, session_id: &str) -> bool {

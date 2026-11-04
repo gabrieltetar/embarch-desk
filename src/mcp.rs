@@ -49,6 +49,9 @@ pub struct SetWorkItemParams {
     /// True when the user says this session is not tracked work: it stops counting and stops being asked.
     #[serde(default)]
     pub untracked: bool,
+    /// True for a machine's session, such as a fleet's listener: untracked, and left off the desk's session list.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -131,6 +134,9 @@ pub struct IssueDraftParams {
     #[serde(default)]
     pub team_key: Option<String>,
     pub title: String,
+    /// The name of the Linear Project the issue goes in. Needs team_key.
+    #[serde(default)]
+    pub project: Option<String>,
     /// The description, in Markdown.
     #[serde(default)]
     pub description: String,
@@ -196,7 +202,7 @@ impl DeskMcp {
 
     #[tool(description = "Put this session on a work item, after the user said which one: an existing item_id, a Linear issue_key (its card is found or created), or new_title for a standalone item. untracked: true when the user says this is not tracked work. Time the session already ran up moves onto the item.")]
     async fn desk_set_work_item(&self, Parameters(p): Parameters<SetWorkItemParams>) -> Result<CallToolResult, McpError> {
-        let body = json!({ "item_id": p.item_id, "issue_key": p.issue_key, "new_title": p.new_title, "desk": p.desk, "untracked": p.untracked });
+        let body = json!({ "item_id": p.item_id, "issue_key": p.issue_key, "new_title": p.new_title, "desk": p.desk, "untracked": p.untracked, "hidden": p.hidden });
         match self.client.post(&format!("/sessions/{}/assign", p.session_id), body).await {
             Ok(v) => ok(v),
             Err(e) => err(e),
@@ -331,7 +337,7 @@ impl DeskMcp {
 
     #[tool(description = "Propose a new Linear issue. On a work desk nothing is created: the draft waits on the user's Desk tab for their Send (a desk set to write directly creates it at once and the reply says so). If this session's work item has no issue yet, the new issue is attached to it once sent.")]
     async fn linear_draft_issue(&self, Parameters(p): Parameters<IssueDraftParams>) -> Result<CallToolResult, McpError> {
-        let body = json!({ "kind": "linear_issue", "team_key": p.team_key, "title": p.title, "body": p.description, "session_id": p.session_id });
+        let body = json!({ "kind": "linear_issue", "team_key": p.team_key, "title": p.title, "body": p.description, "session_id": p.session_id, "project": p.project });
         match self.client.post("/drafts", body).await {
             Ok(v) => ok(v),
             Err(e) => err(e),

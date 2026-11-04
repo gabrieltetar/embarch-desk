@@ -372,13 +372,15 @@ fn session_name(cache: &Cache, s: &store::Session) -> String {
 
 /// Every live session the desk tracks, on a card or not, for the panel's
 /// thread list (chat proposal decisions 9, 20, 32): sessions under an
-/// ignored path — the fleet — stay out; one the user untracked shows as such.
+/// ignored path or marked hidden — the fleet — stay out; one the user untracked
+/// shows as such.
 fn view_sessions(st: &State, cache: &Cache, now: i64) -> Vec<Value> {
     let mut rows: Vec<&store::Session> = st
         .sessions
         .values()
         .filter(|s| !State::is_timer_session(&s.id))
         .filter(|s| !s.ignored || !store::is_ignored(&s.cwd, &st.ignore))
+        .filter(|s| !s.hidden)
         .filter(|s| cache.agents.contains_key(&s.id) || now - s.last_ms < 30 * 60_000)
         .collect();
     rows.sort_by_key(|s| std::cmp::Reverse(s.last_ms));
@@ -791,6 +793,9 @@ struct Assign {
     desk: Option<String>,
     #[serde(default)]
     untracked: bool,
+    /// Untracked and off the session list too (decision 73).
+    #[serde(default)]
+    hidden: bool,
     /// `embarch-chat` when the panel runs the session (chat proposal 10).
     #[serde(default)]
     client: Option<String>,
@@ -805,6 +810,10 @@ async fn assign_session(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): J
             s.client = client;
         }
     });
+    if b.hidden {
+        app.db.write(|st| st.hide_session(&sid));
+        return Ok(Json(json!({ "untracked": true, "hidden": true })));
+    }
     if b.untracked {
         app.db.write(|st| st.untrack_session(&sid));
         return Ok(Json(json!({ "untracked": true })));
@@ -1628,6 +1637,23 @@ struct NewDraft {
     body: String,
     #[serde(default)]
     session_id: Option<String>,
+    /// The name of the Project a new issue goes in, in `team_key`'s team.
+    #[serde(default)]
+    project: Option<String>,
+}
+
+/// The id of the Project called `name` in team `team_key`, from
+/// `linear::projects`' rows; otherwise a message naming what the team has.
+fn project_id_named(projects: &[Value], team_key: &str, name: &str) -> Result<String, String> {
+    let in_team = |p: &&Value| {
+        p["teams"].as_array().into_iter().flatten().any(|t| t["key"].as_str().is_some_and(|k| k.eq_ignore_ascii_case(team_key)))
+    };
+    let mine: Vec<&Value> = projects.iter().filter(in_team).collect();
+    if let Some(id) = mine.iter().find(|p| p["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name))).and_then(|p| p["id"].as_str()) {
+        return Ok(id.to_string());
+    }
+    let names: Vec<&str> = mine.iter().filter_map(|p| p["name"].as_str()).collect();
+    Err(format!("team {team_key} has no Project {name:?}; it has: {}", names.join(", ")))
 }
 
 fn clean(s: &Option<String>) -> Option<String> {
@@ -1649,6 +1675,15 @@ async fn create_draft(Ax(app): Ax<Shared>, Json(b): Json<NewDraft>) -> ApiResult
     };
     let team_key = named_team.or_else(|| desk_linear.as_ref().filter(|_| b.kind == "linear_issue").map(|l| l.team_key.clone()).filter(|k| !k.is_empty()));
     let title = clean(&b.title);
+    // A Project named outright wins over the open desk's, and needs a team to look in.
+    let project_id = match clean(&b.project).filter(|_| b.kind == "linear_issue") {
+        Some(name) => {
+            let Some(team) = team_key.as_deref() else { return Err(bad("a project needs a team_key")) };
+            let projects = linear::projects(&linear_accounts()?).await?;
+            Some(project_id_named(&projects, team, &name).map_err(bad)?)
+        }
+        None => project_id,
+    };
     match b.kind.as_str() {
         "linear_comment" if issue_key.is_none() => return Err(bad("a comment draft needs issue_key")),
         "linear_issue" if team_key.is_none() || title.is_none() => {
@@ -2870,6 +2905,19 @@ mod tests {
     use super::*;
     use crate::store::testing::UtcDays;
 
+    #[test]
+    fn a_named_project_resolves_in_its_team_and_a_wrong_name_lists_the_team() {
+        let rows = vec![
+            json!({ "id": "p1", "name": "embarch-ui", "teams": [{ "key": "EMB" }] }),
+            json!({ "id": "p2", "name": "embarch-core", "teams": [{ "key": "EMB" }] }),
+            json!({ "id": "p3", "name": "embarch-ui", "teams": [{ "key": "OTHER" }] }),
+        ];
+        assert_eq!(project_id_named(&rows, "emb", "EMBARCH-UI").unwrap(), "p1");
+        assert_eq!(project_id_named(&rows, "OTHER", "embarch-ui").unwrap(), "p3");
+        let e = project_id_named(&rows, "EMB", "nope").unwrap_err();
+        assert!(e.contains("embarch-core") && !e.contains("OTHER"), "{e}");
+    }
+
     const D0: i64 = 1_792_627_200_000;
     const H: i64 = 3_600_000;
 
@@ -3449,7 +3497,12 @@ mod tests {
         mine.last_ms = D0 + H;
         let mut old = crate::store::testing::session("old");
         old.last_ms = D0 - 2 * H;
-        for s in [chat, fleet, mine, old] {
+        let mut listener = crate::store::testing::session("listener");
+        listener.cwd = "/elsewhere".into();
+        listener.ignored = true;
+        listener.hidden = true;
+        listener.last_ms = D0 + H;
+        for s in [chat, fleet, mine, old, listener] {
             st.sessions.insert(s.id.clone(), s);
         }
         let v = view_json(&st, &Cache::default(), D0 + H + 1, 7, None, &UtcDays);
