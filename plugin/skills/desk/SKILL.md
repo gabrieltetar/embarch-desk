@@ -1,6 +1,6 @@
 ---
 name: desk
-description: How a session works with the EmbArch desk — the one access point to Linear and Harvest — answering "which work item is this?", pulling everything about the work item, reading and moving Linear issues, proposing comments and issues as drafts, taking notes on the work item, tracking time away from Claude, and what never to do (log or approve time). Use whenever a task touches Linear, Harvest or time tracking, or the session context mentions the EmbArch Desk or a desk session id.
+description: How a session works with the EmbArch desk — the one access point to Linear and Harvest — answering "which work item is this?", pulling everything about the work item, reading and moving Linear issues, proposing comments and issues as drafts, taking notes on the work item, keeping the desk's standing notes, tracking time away from Claude, and what never to do (log or approve time). Use whenever a task touches Linear, Harvest or time tracking, or the session context mentions the EmbArch Desk or a desk session id.
 ---
 
 # Working with the EmbArch desk
@@ -34,6 +34,14 @@ The work item is where the work's knowledge gathers. **`desk_work_item` returns 
 - `todo` — something left to do: "The retry path still lacks a test."
 
 Commits and Claude Code memory files are added automatically — a write to `~/.claude/projects/*/memory/` becomes the item's memory note, its versions kept — so do not repeat them. **What goes to Harvest is the summary of that day's notes.**
+
+## Desk notes
+
+A desk can hold **standing notes**: working agreements for every session in its repos, such as "in repo X, the only build that matters is app Y on board Z" or "file F is another engineer's; report findings, never open a fix branch". The context lists them when the session starts, and `desk_work_item` repeats them. **Follow them; if one conflicts with what the user asks now, ask.** Do not copy them into memory files or work-item notes.
+
+- **When the user sets such a rule** (always, never, from now on, in this repo), or agrees when you ask whether something should hold for every session here, add it with `desk_add_desk_note`. One rule per note, at most 500 characters; a desk holds 4,000.
+- **Never progress, findings or task state**: those are `desk_add_line`. A desk note never reaches Harvest.
+- There is no tool to edit or delete one: the user does that on the Desk tab.
 
 ## Harvest and time
 
