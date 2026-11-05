@@ -600,9 +600,9 @@ pub struct More {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Draft {
     pub id: String,
-    /// `linear_comment` or `linear_issue`.
+    /// `linear_comment`, `linear_issue` or `linear_edit` (decision 75).
     pub kind: String,
-    /// The issue a comment answers.
+    /// The issue a comment answers, or an edit changes.
     #[serde(default)]
     pub issue_key: Option<String>,
     /// The team a new issue goes to.
@@ -621,6 +621,17 @@ pub struct Draft {
     /// The Linear project a new issue is filed into (the open desk's).
     #[serde(default)]
     pub project_id: Option<String>,
+    /// The comment a comment draft replies under: its thread's head (75).
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    /// Replies posted under a comment draft once it is sent, in order: one
+    /// thread, sent by one Send (75).
+    #[serde(default)]
+    pub replies: Vec<String>,
+    /// The description an edit was drafted against. Send refuses when the
+    /// issue's description has changed since (75).
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

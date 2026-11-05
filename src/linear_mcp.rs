@@ -338,7 +338,7 @@ fn detail_from(acct: &Account, i: &Value, c: &Value) -> Value {
         .as_array()
         .into_iter()
         .flatten()
-        .map(|c| json!({ "author": c["author"]["name"], "at": c["createdAt"], "body": c["body"] }))
+        .map(|c| json!({ "id": c["id"], "parent": parent_of(c), "author": c["author"]["name"], "at": c["createdAt"], "body": c["body"] }))
         .rev()
         .collect();
     let key = i["id"].as_str().unwrap_or_default();
@@ -462,12 +462,35 @@ pub async fn search(acct: &Account, query: &str, scope: Option<&LinearBinding>) 
     Ok(v["issues"].as_array().into_iter().flatten().map(|i| row(acct, i)).collect())
 }
 
-/// Post a comment, answering its link; `None` when this workspace has no such issue.
-pub async fn comment(acct: &Account, key: &str, body: &str) -> Result<Option<String>> {
-    let Some(v) = call_on_issue(acct, "save_comment", json!({ "issueId": key, "body": body })).await? else {
+/// The comment a listed comment replies under, as the server spells it.
+fn parent_of(c: &Value) -> Value {
+    [&c["parentId"], &c["parent"]["id"], &c["parent"]].into_iter().find(|v| v.is_string()).cloned().unwrap_or(Value::Null)
+}
+
+/// Post a comment, under `parent` when it replies in a thread, answering its
+/// id and link; `None` when this workspace has no such issue.
+pub async fn comment(acct: &Account, key: &str, body: &str, parent: Option<&str>) -> Result<Option<(String, String)>> {
+    // A reply names only its parent: the server ignores the issue then.
+    let args = match parent {
+        Some(p) => json!({ "parentId": p, "body": body }),
+        None => json!({ "issueId": key, "body": body }),
+    };
+    let Some(v) = call_on_issue(acct, "save_comment", args).await? else {
         return Ok(None);
     };
-    Ok(Some(v["url"].as_str().or(v["comment"]["url"].as_str()).unwrap_or_default().to_string()))
+    let field = |f: &str| v[f].as_str().or(v["comment"][f].as_str()).unwrap_or_default().to_string();
+    Ok(Some((field("id"), field("url"))))
+}
+
+/// Change an issue's title, description or both, answering its link; `None`
+/// when this workspace has no such issue.
+pub async fn edit_issue(acct: &Account, key: &str, title: Option<&str>, description: Option<&str>) -> Result<Option<String>> {
+    let mut args = crate::linear::edit_input(title, description);
+    args["id"] = json!(key);
+    let Some(v) = call_on_issue(acct, "save_issue", args).await? else {
+        return Ok(None);
+    };
+    Ok(Some(v["url"].as_str().or(v["issue"]["url"].as_str()).unwrap_or_default().to_string()))
 }
 
 /// The id of this workspace's team with that key, if it has one.
@@ -541,6 +564,17 @@ mod tests {
         assert_eq!((i.state_name.as_str(), i.state_type.as_str(), i.team_id.as_str()), ("Todo", "unstarted", "t1"));
         assert_eq!((i.project_id.as_str(), i.branch_name.as_str(), i.refreshed_ms), ("p1", "me/abc-94-mac", 7));
         assert!(issue_from(&acct(), &json!("Could not find"), 7).is_none());
+    }
+
+    #[test]
+    fn a_listed_comment_names_its_thread_however_the_server_spells_it() {
+        assert_eq!(parent_of(&json!({"parentId": "c1"})), json!("c1"));
+        assert_eq!(parent_of(&json!({"parent": {"id": "c1"}})), json!("c1"));
+        assert_eq!(parent_of(&json!({"parent": "c1"})), json!("c1"));
+        assert_eq!(parent_of(&json!({"parentId": null})), Value::Null);
+        let c = json!({"comments": [{"id": "c2", "parentId": "c1", "author": {"name": "G"}, "createdAt": "2", "body": "r"}]});
+        let v = detail_from(&acct(), &json!({"id": "ABC-1"}), &c);
+        assert_eq!((v["comments"][0]["id"].as_str(), v["comments"][0]["parent"].as_str()), (Some("c2"), Some("c1")));
     }
 
     #[test]

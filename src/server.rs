@@ -1675,6 +1675,12 @@ struct NewDraft {
     /// The name of the Project a new issue goes in, in `team_key`'s team.
     #[serde(default)]
     project: Option<String>,
+    /// The comment a comment draft replies under (decision 75).
+    #[serde(default)]
+    reply_to: Option<String>,
+    /// Replies posted under a comment draft, in order, by the same Send (75).
+    #[serde(default)]
+    replies: Vec<String>,
 }
 
 /// The id of the Project called `name` in team `team_key`, from
@@ -1720,16 +1726,32 @@ async fn create_draft(Ax(app): Ax<Shared>, Json(b): Json<NewDraft>) -> ApiResult
         None => project_id,
     };
     match b.kind.as_str() {
-        "linear_comment" if issue_key.is_none() => return Err(bad("a comment draft needs issue_key")),
+        "linear_comment" | "linear_edit" if issue_key.is_none() => return Err(bad(format!("a {} draft needs issue_key", b.kind))),
         "linear_issue" if team_key.is_none() || title.is_none() => {
             return Err(bad("an issue draft needs a title, and a team_key when no desk is open"))
         }
-        "linear_comment" | "linear_issue" => {}
-        k => return Err(bad(format!("unknown draft kind {k:?}; linear_comment or linear_issue"))),
+        "linear_edit" if title.is_none() && b.body.trim().is_empty() => {
+            return Err(bad("an edit draft needs a new title, a new description or both"))
+        }
+        "linear_comment" | "linear_issue" | "linear_edit" => {}
+        k => return Err(bad(format!("unknown draft kind {k:?}; linear_comment, linear_issue or linear_edit"))),
     }
     if b.body.trim().is_empty() && b.kind == "linear_comment" {
         return Err(bad("an empty comment"));
     }
+    let reply_to = clean(&b.reply_to);
+    if b.kind != "linear_comment" && (reply_to.is_some() || !b.replies.is_empty()) {
+        return Err(bad("only a comment draft takes reply_to or replies"));
+    }
+    if b.replies.iter().any(|r| r.trim().is_empty()) {
+        return Err(bad("an empty reply"));
+    }
+    // An edit remembers the description it was drafted against, so a Send
+    // after someone else changed the issue cannot overwrite their change.
+    let base = match (b.kind.as_str(), issue_key.as_deref()) {
+        ("linear_edit", Some(k)) => Some(described(&linear::read_issue(&linear_accounts()?, k).await?)),
+        _ => None,
+    };
     let id = app.db.write(|st| {
         let item_id = issue_key
             .as_deref()
@@ -1750,6 +1772,9 @@ async fn create_draft(Ax(app): Ax<Shared>, Json(b): Json<NewDraft>) -> ApiResult
                 status: "open".into(),
                 url: None,
                 project_id,
+                reply_to,
+                replies: b.replies.iter().map(|r| r.trim().to_string()).collect(),
+                base,
             },
         );
         id
@@ -1759,7 +1784,11 @@ async fn create_draft(Ax(app): Ax<Shared>, Json(b): Json<NewDraft>) -> ApiResult
     // a draft unless the desk's owner turned that on).
     if app.db.read(|st| st.settings.direct_writes) {
         let Json(sent) = send_draft(Ax(app), Path(id.clone())).await?;
-        return Ok(Json(json!({ "draft_id": id, "status": "sent", "url": sent["url"] })));
+        let mut v = json!({ "draft_id": id, "status": "sent", "url": sent["url"] });
+        if let Some(c) = sent.get("comment_id") {
+            v["comment_id"] = c.clone();
+        }
+        return Ok(Json(v));
     }
     Ok(Json(json!({ "draft_id": id, "status": "waiting for the user's Send on the Desk tab; nothing was posted" })))
 }
@@ -1770,6 +1799,13 @@ struct DraftPatch {
     title: Option<String>,
     #[serde(default)]
     body: Option<String>,
+    #[serde(default)]
+    replies: Option<Vec<String>>,
+}
+
+/// An issue's description as `read_issue` gives it, none read as empty.
+fn described(issue: &Value) -> String {
+    issue["description"].as_str().unwrap_or_default().trim_end().to_string()
 }
 
 async fn patch_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<DraftPatch>) -> ApiResult {
@@ -1780,6 +1816,10 @@ async fn patch_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<
         }
         if let Some(body) = b.body {
             d.body = body;
+        }
+        if let Some(replies) = b.replies {
+            // A reply emptied on the tab is one the user took out of the thread.
+            d.replies = replies.into_iter().map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect();
         }
         Ok::<_, ApiError>(())
     })?;
@@ -1794,8 +1834,40 @@ async fn send_draft(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
         .read(|st| st.drafts.get(&id).filter(|d| d.status == "open").cloned())
         .ok_or_else(|| missing("no open draft with that id"))?;
     let accounts = linear_accounts()?;
+    let key = d.issue_key.as_deref().unwrap_or_default();
+    let mut comment_id = None;
     let url = match d.kind.as_str() {
-        "linear_comment" => linear::post_comment(&accounts, d.issue_key.as_deref().unwrap_or_default(), &d.body).await?,
+        "linear_comment" => {
+            let (head, url) = send_thread(&app, &accounts, &d).await?;
+            comment_id = Some(head);
+            url
+        }
+        "linear_edit" => {
+            if let Some(base) = &d.base {
+                let now = described(&linear::read_issue(&accounts, key).await?);
+                if &now != base {
+                    return Err(ApiError(
+                        StatusCode::CONFLICT,
+                        format!("{key}'s description changed after this edit was drafted; discard it and draft again from the current text"),
+                    ));
+                }
+            }
+            let title = d.title.as_deref().map(str::trim).filter(|t| !t.is_empty());
+            let body = Some(d.body.as_str()).filter(|b| !b.trim().is_empty());
+            let url = linear::edit_issue(&accounts, key, title, body).await?;
+            // The card shows the issue's title as Linear now has it.
+            if title.is_some() {
+                if let Ok(Some(issue)) = linear::find_issue(&accounts, key, now_ms()).await {
+                    app.db.write(|st| {
+                        for i in st.items.values_mut().filter(|i| i.issue.as_ref().is_some_and(|x| x.key == issue.key)) {
+                            i.title = issue.title.clone();
+                            i.issue = Some(issue.clone());
+                        }
+                    });
+                }
+            }
+            url
+        }
         _ => {
             let (key, url) = linear::create_issue(
                 &accounts,
@@ -1825,7 +1897,37 @@ async fn send_draft(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
             x.url = Some(url.clone());
         }
     });
-    Ok(Json(json!({ "url": url })))
+    let mut v = json!({ "url": url });
+    if let Some(c) = comment_id {
+        v["comment_id"] = json!(c);
+    }
+    Ok(Json(v))
+}
+
+/// A comment draft's head, then each reply under it (or under the thread it
+/// answers), answering the head's id and link. A thread cut short keeps what
+/// was not posted as the draft, replying in the same thread, so the next
+/// Send finishes it rather than posting the head twice.
+async fn send_thread(app: &Shared, accounts: &[crate::connectors::Account], d: &store::Draft) -> Result<(String, String), ApiError> {
+    let key = d.issue_key.as_deref().unwrap_or_default();
+    let (head, url) = linear::post_comment(accounts, key, &d.body, d.reply_to.as_deref()).await?;
+    let parent = d.reply_to.clone().unwrap_or_else(|| head.clone());
+    for (n, reply) in d.replies.iter().enumerate() {
+        if let Err(e) = linear::post_comment(accounts, key, reply, Some(&parent)).await {
+            app.db.write(|st| {
+                if let Some(x) = st.drafts.get_mut(&d.id) {
+                    x.reply_to = Some(parent.clone());
+                    x.body = reply.clone();
+                    x.replies = d.replies[n + 1..].to_vec();
+                }
+            });
+            return Err(ApiError(
+                StatusCode::BAD_GATEWAY,
+                format!("posted {} of {} comments on {key}; the rest stay as this draft, replying in the same thread: {e:#}", n + 1, d.replies.len() + 1),
+            ));
+        }
+    }
+    Ok((head, url))
 }
 
 async fn discard_draft(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
@@ -3053,7 +3155,7 @@ mod tests {
             st.drafts.insert(id.into(), store::Draft {
                 id: id.into(), kind: "linear_comment".into(), issue_key: Some("ABC-1".into()), team_key: None,
                 title: None, body: "x".into(), item_id: None, created_ms: D0, status: status.into(), url: None,
-                project_id: None,
+                project_id: None, reply_to: None, replies: vec![], base: None,
             });
         }
         st.start_timer(&a, D0 + H, &UtcDays);
@@ -3622,6 +3724,33 @@ mod tests {
             model: String::new(),
         });
         (app, dir)
+    }
+
+    /// The shapes decision 75 adds, checked before anything reaches Linear.
+    #[tokio::test]
+    async fn an_edit_needs_a_key_and_a_change_and_only_a_comment_takes_a_thread() {
+        let (app, dir) = scratch_app();
+        let draft = |b: Value| create_draft(Ax(app.clone()), Json(serde_json::from_value(b).unwrap()));
+        let refused = |r: ApiResult| match r { Err(ApiError(c, m)) => (c, m), Ok(_) => panic!("accepted") };
+        let (c, m) = refused(draft(json!({"kind": "linear_edit", "body": "x"})).await);
+        assert_eq!(c, StatusCode::BAD_REQUEST);
+        assert!(m.contains("needs issue_key"), "{m}");
+        let (_, m) = refused(draft(json!({"kind": "linear_edit", "issue_key": "ABC-1", "body": "  "})).await);
+        assert!(m.contains("a new title, a new description or both"), "{m}");
+        let (_, m) = refused(draft(json!({"kind": "linear_issue", "team_key": "ABC", "title": "t", "body": "b", "replies": ["r"]})).await);
+        assert!(m.contains("only a comment draft"), "{m}");
+        let (_, m) = refused(draft(json!({"kind": "linear_comment", "issue_key": "ABC-1", "body": "b", "replies": ["r", " "]})).await);
+        assert!(m.contains("an empty reply"), "{m}");
+        let Ok(Json(v)) = draft(json!({"kind": "linear_comment", "issue_key": "abc-1", "body": "head",
+                                        "reply_to": "c9", "replies": [" one ", "two"]})).await else { panic!("comment") };
+        let id = v["draft_id"].as_str().unwrap().to_string();
+        let d = app.db.read(|st| st.drafts[&id].clone());
+        assert_eq!((d.issue_key.as_deref(), d.reply_to.as_deref(), d.status.as_str()), (Some("ABC-1"), Some("c9"), "open"));
+        assert_eq!(d.replies, vec!["one", "two"]);
+        let patch = |b: Value| patch_draft(Ax(app.clone()), Path(id.clone()), Json(serde_json::from_value(b).unwrap()));
+        assert!(patch(json!({"replies": ["two", "  "]})).await.is_ok());
+        assert_eq!(app.db.read(|st| st.drafts[&id].replies.clone()), vec!["two"], "a reply emptied on the tab leaves the thread");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]

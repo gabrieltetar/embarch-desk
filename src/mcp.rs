@@ -133,6 +133,27 @@ pub struct CommentDraftParams {
     pub issue_key: String,
     /// The comment, in Markdown, as it should be posted.
     pub body: String,
+    /// The id of a comment on the issue (from linear_get_issue) this one answers: it is posted as a reply in that comment's thread.
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    /// More comments, posted in order as replies under this one by the same Send: a message too long for one comment, split into a thread.
+    #[serde(default)]
+    pub replies: Vec<String>,
+    /// The desk session id from this session's context, so the draft shows on its card.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct EditDraftParams {
+    /// The issue to change.
+    pub issue_key: String,
+    /// The new title. Omit it to keep the current one.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The whole new description, in Markdown; it replaces the current one. Omit it to keep the current one.
+    #[serde(default)]
+    pub description: Option<String>,
     /// The desk session id from this session's context, so the draft shows on its card.
     #[serde(default)]
     pub session_id: Option<String>,
@@ -326,7 +347,7 @@ impl DeskMcp {
 
 #[tool_router(router = linear_router, vis = "pub")]
 impl DeskMcp {
-    #[tool(description = "Read a Linear issue: title, state, team, project, assignee, labels, description and its latest comments. Works across every connected Linear workspace.")]
+    #[tool(description = "Read a Linear issue: title, state, team, project, assignee, labels, description and its latest comments, each with its id and the id of the comment it replies under. Works across every connected Linear workspace.")]
     async fn linear_get_issue(&self, Parameters(p): Parameters<KeyParams>) -> Result<CallToolResult, McpError> {
         let key = crate::uri::encode(p.key.trim());
         match self.client.get(&format!("/linear/issue/{key}")).await {
@@ -359,9 +380,20 @@ impl DeskMcp {
         }
     }
 
-    #[tool(description = "Propose a comment on a Linear issue. On a work desk nothing is posted: the draft waits on the user's Desk tab, where they edit it if they want and press Send, so tell the user it is waiting there. A desk set to write directly posts it at once and the reply says so.")]
+    #[tool(description = "Propose a comment on a Linear issue, or a thread of them (replies), or a reply in an existing thread (reply_to). On a work desk nothing is posted: the draft waits on the user's Desk tab, where they edit it if they want and press Send, so tell the user it is waiting there. A desk set to write directly posts it at once and the reply says so.")]
     async fn linear_draft_comment(&self, Parameters(p): Parameters<CommentDraftParams>) -> Result<CallToolResult, McpError> {
-        let body = json!({ "kind": "linear_comment", "issue_key": p.issue_key, "body": p.body, "session_id": p.session_id });
+        let body = json!({ "kind": "linear_comment", "issue_key": p.issue_key, "body": p.body, "reply_to": p.reply_to,
+                           "replies": p.replies, "session_id": p.session_id });
+        match self.client.post("/drafts", body).await {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "Propose a change to a Linear issue's title, description or both; a description given replaces the whole current one, so read the issue first and send it complete. On a work desk nothing changes until the user's Send on the Desk tab (a desk set to write directly applies it at once and the reply says so). The Send is refused if someone changed the description after the draft was made.")]
+    async fn linear_draft_edit(&self, Parameters(p): Parameters<EditDraftParams>) -> Result<CallToolResult, McpError> {
+        let body = json!({ "kind": "linear_edit", "issue_key": p.issue_key, "title": p.title,
+                           "body": p.description.unwrap_or_default(), "session_id": p.session_id });
         match self.client.post("/drafts", body).await {
             Ok(v) => ok(v),
             Err(e) => err(e),
@@ -433,8 +465,8 @@ impl ServerHandler for DeskMcp {
             "embarch-desk: the one access point to Linear and Harvest, and the work item this session's \
              time and notes belong to. desk_work_item returns everything the desk holds about the session's \
              item. Read Linear with linear_get_issue, linear_my_issues and linear_search; \
-             move a status with linear_set_status; propose a comment or an issue with linear_draft_comment or \
-             linear_draft_issue — they wait for the user's Send on the Desk tab. Read Harvest with \
+             move a status with linear_set_status; propose a comment, an issue or a change to one with linear_draft_comment, \
+             linear_draft_issue or linear_draft_edit — they wait for the user's Send on the Desk tab. Read Harvest with \
              harvest_entries and harvest_projects; time is never logged from a session: add notes with \
              desk_add_line and the user sends the tile. A rule the user sets for every session in this desk's \
              repos (always, never, from now on, in this repo) is a desk note, added with desk_add_desk_note, \

@@ -174,7 +174,7 @@ async fn gql_detail(acct: &Account, key: &str) -> Result<Option<Value>> {
     let q = "query($id: String!) { issue(id: $id) { id identifier title url description priorityLabel \
              createdAt updatedAt state { id name type } team { id key name } assignee { name } \
              project { name } labels { nodes { name } } \
-             comments(first: 25) { nodes { body createdAt user { name } } } } }";
+             comments(first: 25) { nodes { id body createdAt user { name } parent { id } } } } }";
     match gql(acct, q, json!({ "id": key })).await {
         Ok(d) if d["issue"].is_object() => Ok(Some(detail_from(acct, &d["issue"]))),
         Ok(_) => Ok(None),
@@ -201,7 +201,7 @@ fn detail_from(acct: &Account, i: &Value) -> Value {
         .as_array()
         .into_iter()
         .flatten()
-        .map(|c| json!({ "author": c["user"]["name"], "at": c["createdAt"], "body": c["body"] }))
+        .map(|c| json!({ "id": c["id"], "parent": c["parent"]["id"], "author": c["user"]["name"], "at": c["createdAt"], "body": c["body"] }))
         .rev()
         .collect();
     json!({
@@ -435,36 +435,89 @@ pub async fn set_state_by_name(accounts: &[Account], key: &str, name: &str, now:
     set_state(accounts, &issue, st["id"].as_str().unwrap_or_default(), now).await
 }
 
-/// Post an approved comment. Only the Desk tab's Send reaches this.
-pub async fn post_comment(accounts: &[Account], key: &str, body: &str) -> Result<String> {
+/// Post an approved comment, under `parent` when it replies in a thread,
+/// answering its id and link. Only the Desk tab's Send reaches this.
+pub async fn post_comment(accounts: &[Account], key: &str, body: &str, parent: Option<&str>) -> Result<(String, String)> {
     first_with(accounts, key, |acct| async move {
         if acct.mcp.is_some() {
-            linear_mcp::comment(acct, key, body).await
+            linear_mcp::comment(acct, key, body, parent).await
         } else {
-            gql_comment(acct, key, body).await
+            gql_comment(acct, key, body, parent).await
+        }
+    })
+    .await
+}
+
+/// The issue's id in this workspace; `None` when it has no such key.
+async fn gql_issue_id(acct: &Account, key: &str) -> Result<Option<Value>> {
+    match gql(acct, "query($id: String!) { issue(id: $id) { id } }", json!({ "id": key })).await {
+        Ok(d) if d["issue"].is_object() => Ok(Some(d["issue"]["id"].clone())),
+        Ok(_) => Ok(None),
+        Err(e) if not_found(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `None` when this workspace has no such key.
+async fn gql_comment(acct: &Account, key: &str, body: &str, parent: Option<&str>) -> Result<Option<(String, String)>> {
+    let Some(id) = gql_issue_id(acct, key).await? else { return Ok(None) };
+    // Only the fields this comment sets, as an edit sends.
+    let mut input = json!({ "issueId": id, "body": body });
+    if let Some(p) = parent {
+        input["parentId"] = json!(p);
+    }
+    let d = gql(
+        acct,
+        "mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id url } } }",
+        json!({ "input": input }),
+    )
+    .await?;
+    if d["commentCreate"]["success"].as_bool() != Some(true) {
+        bail!("Linear refused the comment");
+    }
+    let c = &d["commentCreate"]["comment"];
+    Ok(Some((c["id"].as_str().unwrap_or_default().to_string(), c["url"].as_str().unwrap_or_default().to_string())))
+}
+
+/// Change an approved issue's title, description or both, answering its
+/// link. `None` leaves that field as it is. Only the Desk tab's Send, or a
+/// desk set to write directly, reaches this (decision 75).
+pub async fn edit_issue(accounts: &[Account], key: &str, title: Option<&str>, description: Option<&str>) -> Result<String> {
+    first_with(accounts, key, |acct| async move {
+        if acct.mcp.is_some() {
+            linear_mcp::edit_issue(acct, key, title, description).await
+        } else {
+            gql_edit(acct, key, title, description).await
         }
     })
     .await
 }
 
 /// `None` when this workspace has no such key.
-async fn gql_comment(acct: &Account, key: &str, body: &str) -> Result<Option<String>> {
-    let id = match gql(acct, "query($id: String!) { issue(id: $id) { id } }", json!({ "id": key })).await {
-        Ok(d) if d["issue"].is_object() => d["issue"]["id"].clone(),
-        Ok(_) => return Ok(None),
-        Err(e) if not_found(&e) => return Ok(None),
-        Err(e) => return Err(e),
-    };
+async fn gql_edit(acct: &Account, key: &str, title: Option<&str>, description: Option<&str>) -> Result<Option<String>> {
+    let Some(id) = gql_issue_id(acct, key).await? else { return Ok(None) };
     let d = gql(
         acct,
-        "mutation($id: String!, $b: String!) { commentCreate(input: { issueId: $id, body: $b }) { success comment { url } } }",
-        json!({ "id": id, "b": body }),
+        "mutation($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success issue { url } } }",
+        json!({ "id": id, "input": edit_input(title, description) }),
     )
     .await?;
-    if d["commentCreate"]["success"].as_bool() != Some(true) {
-        bail!("Linear refused the comment");
+    if d["issueUpdate"]["success"].as_bool() != Some(true) {
+        bail!("Linear refused the edit to {key}");
     }
-    Ok(Some(d["commentCreate"]["comment"]["url"].as_str().unwrap_or_default().to_string()))
+    Ok(Some(d["issueUpdate"]["issue"]["url"].as_str().unwrap_or_default().to_string()))
+}
+
+/// The fields an edit sets; one it leaves alone is absent, never null.
+pub(crate) fn edit_input(title: Option<&str>, description: Option<&str>) -> Value {
+    let mut input = json!({});
+    if let Some(t) = title {
+        input["title"] = json!(t);
+    }
+    if let Some(d) = description {
+        input["description"] = json!(d);
+    }
+    input
 }
 
 /// Create an approved issue in the team with this key, in whichever
@@ -597,5 +650,22 @@ mod tests {
         let i = issue_from(&acct, &v, 5).unwrap();
         assert_eq!((i.key.as_str(), i.state_name.as_str(), i.account.as_str()), ("ABC-123", "In Progress", "work"));
         assert!(issue_from(&acct, &Value::Null, 5).is_none());
+    }
+
+    #[test]
+    fn an_edit_sets_only_the_fields_it_names_and_a_comment_carries_its_thread() {
+        assert_eq!(edit_input(Some("T"), None), json!({"title": "T"}), "a field left alone is absent, never null");
+        assert_eq!(edit_input(None, Some("D")), json!({"description": "D"}));
+        assert_eq!(edit_input(Some("T"), Some("D")), json!({"title": "T", "description": "D"}));
+        let i = json!({
+            "identifier": "ABC-1", "description": "d",
+            "comments": {"nodes": [
+                {"id": "c2", "body": "reply", "createdAt": "2", "user": {"name": "G"}, "parent": {"id": "c1"}},
+                {"id": "c1", "body": "head", "createdAt": "1", "user": {"name": "G"}, "parent": null}
+            ]}
+        });
+        let v = detail_from(&Account::new("work", "t"), &i);
+        assert_eq!((v["comments"][0]["id"].as_str(), v["comments"][0]["parent"].as_str()), (Some("c1"), None));
+        assert_eq!((v["comments"][1]["id"].as_str(), v["comments"][1]["parent"].as_str()), (Some("c2"), Some("c1")));
     }
 }

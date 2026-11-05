@@ -17,9 +17,12 @@ One desk per project — a Linear project (or a whole team), a Harvest project a
 
 ## Linear
 
-- Read with `linear_get_issue` (description and latest comments), `linear_my_issues`, `linear_search`.
+- Read with `linear_get_issue` (description and latest comments, each with its `id` and the `parent` it replies under), `linear_my_issues`, `linear_search`.
 - Move a status with `linear_set_status` — it goes straight through.
-- **Write prose only as a draft**: `linear_draft_comment`, `linear_draft_issue`. Nothing is posted; the draft waits on the user's Desk tab for their Send. Write it the way it should be posted, then tell the user it is waiting there. If a voice or review skill applies to text going out under the user's name, follow it before drafting.
+- **Write prose only as a draft**: `linear_draft_comment`, `linear_draft_issue`, `linear_draft_edit`. Nothing is posted; the draft waits on the user's Desk tab for their Send. Write it the way it should be posted, then tell the user it is waiting there. If a voice or review skill applies to text going out under the user's name, follow it before drafting.
+- **An edit replaces the whole description**: read the issue first and send it complete. Its Send is refused if the description changed after you drafted; draft again from the current text.
+- **A long comment is a thread**: the point in `body`, detail in `replies`, posted under it by the same Send. Answer someone's comment with `reply_to` set to its `id`.
+- **An issue in the EmbArch workspace (team `EMB`)** takes the shape `embarch-doc/LINEAR-PROTOCOL.md` gives it, and goes through `embarch-doc/scripts/fleet-linear.py`, not these tools.
 
 ## Notes on the work item
 
