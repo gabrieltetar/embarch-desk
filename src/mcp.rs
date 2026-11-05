@@ -2,7 +2,8 @@
 //!
 //! Agents manage work items — look up what a session is on, put it on one,
 //! create or link one, add a note to it, pull everything the desk holds
-//! about it (`desk_work_item`). **No tool approves, discards
+//! about it (`desk_work_item`) — and add a standing note to the session's
+//! desk (`desk_add_desk_note`, decision 74). **No tool approves, discards
 //! or archives anything**: ✓, ✕ and archive are the user's, on the Desk tab.
 //!
 //! Claude Code gives an MCP server no session identity, so every
@@ -71,6 +72,14 @@ pub struct LineParams {
     /// done (the default: a piece of work finished), finding (something learned), decision (a choice made, and why), handoff (what the next session needs to know), todo (something left to do).
     #[serde(default)]
     pub kind: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DeskNoteParams {
+    /// The desk session id given in this session's context.
+    pub session_id: String,
+    /// One standing rule, as every future session in this desk's repos should read it: at most 500 characters.
+    pub text: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -229,6 +238,14 @@ impl DeskMcp {
     #[tool(description = "Add a note to this session's work item: one short line, unasked, whenever something worth keeping happens — kind done (the default) for a piece of work finished without a commit, finding, decision, handoff or todo. Too many rather than too few; the user cuts. Commits and memory-file writes are added automatically; do not repeat them. The day's notes become the Harvest note.")]
     async fn desk_add_line(&self, Parameters(p): Parameters<LineParams>) -> Result<CallToolResult, McpError> {
         match self.client.post(&format!("/sessions/{}/line", p.session_id), json!({ "text": p.text, "kind": p.kind })).await {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "Add a standing note to the desk this session belongs to: a working agreement that should hold for every future session in this desk's repos — the user said always, never, from now on or in this repo, or agreed when you asked. Never progress, findings or task state (that is desk_add_line). Never part of Harvest. One rule per note, at most 500 characters; a desk holds 4,000.")]
+    async fn desk_add_desk_note(&self, Parameters(p): Parameters<DeskNoteParams>) -> Result<CallToolResult, McpError> {
+        match self.client.post(&format!("/sessions/{}/desk-note", p.session_id), json!({ "text": p.text })).await {
             Ok(v) => ok(v),
             Err(e) => err(e),
         }
@@ -403,7 +420,9 @@ impl ServerHandler for DeskMcp {
              move a status with linear_set_status; propose a comment or an issue with linear_draft_comment or \
              linear_draft_issue — they wait for the user's Send on the Desk tab. Read Harvest with \
              harvest_entries and harvest_projects; time is never logged from a session: add notes with \
-             desk_add_line and the user sends the tile. desk_timer_start/stop track work away from Claude. \
+             desk_add_line and the user sends the tile. A rule the user sets for every session in this desk's \
+             repos (always, never, from now on, in this repo) is a desk note, added with desk_add_desk_note, \
+             never a line. desk_timer_start/stop track work away from Claude. \
              The session's context carries its desk session id; when the desk asks which work item a session \
              is on, ask the user and call desk_set_work_item.",
         )
@@ -422,7 +441,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_pull_is_a_session_tool_and_a_note_takes_a_kind() {
+    fn the_pull_is_a_session_tool_a_note_takes_a_kind_and_a_desk_note_its_session_and_text() {
         let tools = DeskMcp::tool_router().list_all();
         let tool = |name: &str| tools.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("no tool {name}"));
         let pull = serde_json::to_value(&tool("desk_work_item").input_schema).unwrap();
@@ -432,5 +451,8 @@ mod tests {
         assert_eq!(line["required"], json!(["session_id", "text"]));
         let add = serde_json::to_value(&tool("desk_add_repo").input_schema).unwrap();
         assert_eq!(add["required"], json!(["session_id", "repo"]));
+        let desk_note = tool("desk_add_desk_note");
+        assert_eq!(serde_json::to_value(&desk_note.input_schema).unwrap()["required"], json!(["session_id", "text"]));
+        assert!(desk_note.description.as_deref().unwrap_or_default().contains("Never part of Harvest"));
     }
 }

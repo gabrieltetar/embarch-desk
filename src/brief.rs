@@ -5,11 +5,15 @@
 //! (about 4K tokens). Nothing is pasted into a session up front; it calls
 //! `desk_work_item` for this.
 //!
+//! The item's desk's standing notes come first (decision 74), the same list
+//! a session hears at its start, for one whose start hook was lost.
+//!
 //! The notes get what the rest leaves: each memory file's newest state and
 //! the latest lines, a third of it kept for the lines so a large memory
 //! file cannot crowd them out. What does not fit is counted, and
 //! `GET /items/{id}/notes` has every note.
 
+use crate::events::desk_note_list;
 use crate::server::{session_state, Cache};
 use crate::store::{Days, Line, State};
 use serde_json::{json, Value};
@@ -86,6 +90,17 @@ pub fn render(st: &State, cache: &Cache, item_id: &str, issue: Option<&Value>, i
     if !facts.is_empty() {
         head.push_str(&format!("{}\n", facts.join(" · ")));
     }
+
+    // The desk's standing notes, which the session also heard at its start
+    // (decision 74): here for a session whose start hook was lost.
+    let desk_notes = match item.desk_id.as_ref().and_then(|k| st.desks.get(k)) {
+        Some(d) if !st.desk_notes_of(&d.id).is_empty() => format!(
+            "\n## Desk notes\nStanding notes for the desk \"{}\", kept by the user on the Desk tab for every session in its repos; follow them.\n{}\n",
+            d.name,
+            desk_note_list(st.desk_notes_of(&d.id))
+        ),
+        _ => String::new(),
+    };
 
     let mut issue_s = String::new();
     if item.issue.is_some() {
@@ -169,7 +184,7 @@ pub fn render(st: &State, cache: &Cache, item_id: &str, issue: Option<&Value>, i
     }
 
     // The notes take what is left.
-    let fixed = len(&head) + len(&issue_s) + len(&prs) + len(&sess) + len(&bench);
+    let fixed = len(&head) + len(&desk_notes) + len(&issue_s) + len(&prs) + len(&sess) + len(&bench);
     let notes_head = "\n## Notes, newest first\n";
     let budget = BRIEF_MAX.saturating_sub(fixed + len(notes_head) + 200);
     let all = st.item_notes(item_id);
@@ -217,7 +232,7 @@ pub fn render(st: &State, cache: &Cache, item_id: &str, issue: Option<&Value>, i
         notes.push_str(&format!("- … {omitted} older note{} not shown; the Desk card lists every note\n", if omitted == 1 { "" } else { "s" }));
     }
 
-    let text = format!("{head}{issue_s}{prs}{sess}{notes}{bench}");
+    let text = format!("{head}{desk_notes}{issue_s}{prs}{sess}{notes}{bench}");
     Some(cut(&text, BRIEF_MAX))
 }
 
@@ -287,6 +302,21 @@ mod tests {
         assert!(t.contains("Memory file f3.md"), "the newest memory file makes it in");
         assert!(t.contains("older notes not shown"));
         assert!(t.contains("## Bench"), "the cut falls on the notes, not on what follows");
+    }
+
+    #[test]
+    fn the_brief_carries_its_desks_notes_ahead_of_the_issue_and_a_desk_with_none_adds_nothing() {
+        let mut st = State::default();
+        let w = item(&mut st);
+        let k = st.put_desk(crate::store::Desk { name: "Alpha".into(), ..Default::default() }, D0);
+        st.items.get_mut(&w).unwrap().desk_id = Some(k.clone());
+        let before = render(&st, &Cache::default(), &w, None, None, &UtcDays).unwrap();
+        assert!(!before.contains("Desk notes"), "{before}");
+        st.add_desk_note(&k, "in repo X, only app Y on board Z matters", "user", None, D0).unwrap();
+        let t = render(&st, &Cache::default(), &w, None, None, &UtcDays).unwrap();
+        assert!(t.contains("\n## Desk notes\nStanding notes for the desk \"Alpha\", kept by the user on the Desk tab for every session in its repos; follow them.\n- in repo X, only app Y on board Z matters\n"), "{t}");
+        assert!(t.find("## Desk notes").unwrap() < t.find("## Issue").unwrap());
+        assert!(!t.contains("[user] in repo X"), "a desk note is not one of the item's notes");
     }
 
     #[test]

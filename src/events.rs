@@ -5,7 +5,8 @@
 //!
 //! - **SessionStart** claims a pending "open in VS Code" launch, or a work
 //!   item whose issue key the branch carries, and tells the session its desk
-//!   id — the tools need it, and nothing else identifies a session to them.
+//!   id — the tools need it, and nothing else identifies a session to them —
+//!   and its desk's standing notes (decision 74).
 //! - **UserPromptSubmit** on a session with no work item asks, every prompt,
 //!   until it is answered (proposal decision 7), unless time is off (decision 72).
 //! - **PostToolUse** turns a `git commit` into a tile line, an
@@ -13,9 +14,10 @@
 //!   to a Claude Code memory file into the item's memory note.
 //!
 //! A session under an ignored path is dropped at the door: no time, no
-//! question, no context. One the user untracked moves only its state.
+//! question, no context. One the user untracked moves only its state, and
+//! hears only its desk's notes at its start.
 
-use crate::store::{self, BenchEvent, Days, Git, Line, Session, State};
+use crate::store::{self, BenchEvent, Days, DeskNote, Git, Line, Session, State};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -163,6 +165,30 @@ fn switch_text(state: &State, session_id: &str) -> Option<String> {
     ))
 }
 
+/// A desk's notes as a list, one `- ` line each; a note's own line breaks
+/// stay inside its item.
+pub fn desk_note_list(notes: &[DeskNote]) -> String {
+    notes.iter().map(|n| format!("- {}", n.text.lines().collect::<Vec<_>>().join("\n  "))).collect::<Vec<_>>().join("\n")
+}
+
+/// The standing notes of the desk a starting session belongs to (decision
+/// 74), resolved now rather than when it first appeared; none when that
+/// desk has none.
+pub fn desk_notes_text(state: &State, session_id: &str, cwd: &str) -> Option<String> {
+    let desk = state.session_desk(session_id, cwd)?;
+    let notes = state.desk_notes_of(&desk);
+    if notes.is_empty() {
+        return None;
+    }
+    let name = state.desks.get(&desk).map_or(desk.as_str(), |d| d.name.as_str());
+    Some(format!(
+        "EmbArch Desk: standing notes for the desk \"{name}\", kept by the user on the Desk tab for every \
+         session in this desk's repos. Follow them; if one conflicts with what the user asks now, ask. Do not \
+         copy them into memory files or work-item notes.\n{}",
+        desk_note_list(notes)
+    ))
+}
+
 /// Apply one hook event. Returns the context to inject into the session, if any.
 pub fn apply(
     state: &mut State,
@@ -244,17 +270,19 @@ pub fn apply(
     if sess.ended {
         sess.busy = false;
     }
+    let cwd = if ev.cwd.is_empty() { sess.cwd.clone() } else { ev.cwd.clone() };
+    let start = ev.hook_event_name == "SessionStart";
     // One the user untracked still shows its state in the panel's thread
     // list (chat proposal decisions 9, 20); it makes no time and is never
-    // asked.
+    // asked, but still hears its desk's standing notes (decision 74). A
+    // hidden one hears nothing.
     if sess.ignored {
         sess.last_ms = sess.last_ms.max(now);
-        return None;
+        return start.then(|| desk_notes_text(state, &ev.session_id, &cwd)).flatten();
     }
     if time_on {
         store::record_activity(sess, now, days);
     }
-    let cwd = if ev.cwd.is_empty() { sess.cwd.clone() } else { ev.cwd.clone() };
 
     if sess.item_id.is_none() {
         claim(state, &ev.session_id, &cwd, now, days, git);
@@ -277,11 +305,10 @@ pub fn apply(
         ("SessionStart", None) => Some(unasked_text(&ev.session_id)),
         _ => None,
     };
-    let switch = (ev.hook_event_name == "SessionStart").then(|| switch_text(state, &ev.session_id)).flatten();
-    match (main, switch) {
-        (Some(m), Some(s)) => Some(format!("{m}\n\n{s}")),
-        (m, s) => m.or(s),
-    }
+    let switch = start.then(|| switch_text(state, &ev.session_id)).flatten();
+    let notes = start.then(|| desk_notes_text(state, &ev.session_id, &cwd)).flatten();
+    let parts: Vec<String> = [main, switch, notes].into_iter().flatten().collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 /// A session with no work item takes one if the card's launch is waiting
@@ -638,6 +665,82 @@ mod tests {
         st.assign_session("q", &w, D0, &UtcDays, &git);
         let told = apply(&mut st, &ev("SessionStart", "q", "/w/r"), D0 + H, &UtcDays, &git, 7).unwrap();
         assert!(told.contains(&w), "{told}");
+    }
+
+    fn desk_with_notes(st: &mut State) -> String {
+        let k = st.put_desk(crate::store::Desk { name: "Alpha".into(), firmware_repos: vec!["/w/x".into()], ..Default::default() }, D0);
+        st.add_desk_note(&k, "in repo X, only app Y on board Z matters", "user", None, D0).unwrap();
+        st.add_desk_note(&k, "file F is another engineer's:\nreport findings, never open a fix branch", "agent", Some("s0"), D0).unwrap();
+        k
+    }
+
+    const NOTES_HEAD: &str = "EmbArch Desk: standing notes for the desk \"Alpha\"";
+
+    #[test]
+    fn a_session_starting_in_the_desks_folder_hears_its_notes_and_a_prompt_does_not() {
+        let mut st = State::default();
+        desk_with_notes(&mut st);
+        let git = FakeGit::default();
+        let out = apply(&mut st, &ev("SessionStart", "s", "/w/x/app"), D0, &UtcDays, &git, 7).unwrap();
+        let (ask, notes) = out.split_once("\n\nEmbArch Desk: standing notes").unwrap_or_else(|| panic!("{out}"));
+        assert!(ask.contains("desk_set_work_item"), "the notes come after what the session is told already");
+        assert!(notes.ends_with(
+            "for the desk \"Alpha\", kept by the user on the Desk tab for every session in this desk's repos. Follow them; \
+             if one conflicts with what the user asks now, ask. Do not copy them into memory files or work-item notes.\n\
+             - in repo X, only app Y on board Z matters\n\
+             - file F is another engineer's:\n  report findings, never open a fix branch"
+        ), "{notes}");
+        let prompt = apply(&mut st, &ev("UserPromptSubmit", "s", "/w/x/app"), D0 + 1, &UtcDays, &git, 7).unwrap();
+        assert!(!prompt.contains(NOTES_HEAD), "SessionStart only: {prompt}");
+        // A resume, a clear and a compact each arrive as a SessionStart too.
+        let again = apply(&mut st, &ev("SessionStart", "s", "/w/x/app"), D0 + 2, &UtcDays, &git, 7).unwrap();
+        assert!(again.contains(NOTES_HEAD), "{again}");
+    }
+
+    #[test]
+    fn a_session_outside_the_desks_folders_hears_its_notes_through_its_work_item() {
+        let mut st = State::default();
+        let k = desk_with_notes(&mut st);
+        let w = st.create_item("x", None, D0);
+        st.items.get_mut(&w).unwrap().desk_id = Some(k);
+        st.pending_launches.push(PendingLaunch { item_id: w.clone(), repo: "/w/other".into(), expires_ms: D0 + H });
+        let out = apply(&mut st, &ev("SessionStart", "s", "/w/other"), D0, &UtcDays, &FakeGit::default(), 7).unwrap();
+        assert_eq!(st.sessions["s"].desk_id, None, "its first event found no desk for its folder");
+        assert!(out.contains(&w) && out.contains(NOTES_HEAD), "{out}");
+    }
+
+    #[test]
+    fn an_untracked_session_hears_its_desks_notes_and_a_hidden_or_ignored_one_nothing() {
+        let mut st = State { ignore: vec!["/w/x/vendor".into()], ..Default::default() };
+        desk_with_notes(&mut st);
+        let git = FakeGit::default();
+        for sid in ["u", "h"] {
+            apply(&mut st, &ev("SessionStart", sid, "/w/x"), D0, &UtcDays, &git, 7);
+        }
+        st.untrack_session("u");
+        st.hide_session("h");
+        let u = apply(&mut st, &ev("SessionStart", "u", "/w/x"), D0 + 1, &UtcDays, &git, 7).unwrap();
+        assert!(u.starts_with(NOTES_HEAD) && !u.contains("desk_set_work_item"), "{u}");
+        assert!(apply(&mut st, &ev("UserPromptSubmit", "u", "/w/x"), D0 + 2, &UtcDays, &git, 7).is_none());
+        assert!(apply(&mut st, &ev("SessionStart", "h", "/w/x"), D0 + 1, &UtcDays, &git, 7).is_none());
+        assert!(apply(&mut st, &ev("SessionStart", "i", "/w/x/vendor"), D0, &UtcDays, &git, 7).is_none());
+    }
+
+    #[test]
+    fn a_desk_with_no_notes_adds_nothing_to_the_start() {
+        let mut st = State::default();
+        let k = desk_with_notes(&mut st);
+        let ids: Vec<String> = st.desk_notes_of(&k).iter().map(|n| n.id.clone()).collect();
+        for id in ids {
+            st.delete_desk_note(&k, &id).unwrap();
+        }
+        st.open_desk = Some(k);
+        let git = FakeGit::default();
+        let out = apply(&mut st, &ev("SessionStart", "s", "/w/x"), D0, &UtcDays, &git, 7).unwrap();
+        assert!(!out.contains("standing notes"), "{out}");
+        let mut bare = State::default();
+        let before = apply(&mut bare, &ev("SessionStart", "s", "/w/x"), D0, &UtcDays, &git, 7).unwrap();
+        assert_eq!(out, before, "the start reads as it did before desk notes");
     }
 
     #[test]
