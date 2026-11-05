@@ -112,6 +112,7 @@ pub fn router(app: Shared) -> Router {
         .route("/sessions/{sid}", get(get_session))
         .route("/sessions/{sid}/assign", post(assign_session))
         .route("/sessions/{sid}/line", post(session_line))
+        .route("/sessions/{sid}/desk-note", post(session_desk_note))
         .route("/tiles/{id}", axum::routing::patch(patch_tile))
         .route("/tiles/{id}/line", post(tile_line))
         .route("/tiles/{id}/polish", post(polish_tile))
@@ -139,6 +140,8 @@ pub fn router(app: Shared) -> Router {
         .route("/timer/stop", post(timer_stop))
         .route("/desks", get(list_desks).post(put_desk))
         .route("/desks/{id}", delete(delete_desk))
+        .route("/desks/{id}/notes", get(list_desk_notes).post(add_desk_note))
+        .route("/desks/{id}/notes/{nid}", axum::routing::patch(edit_desk_note).delete(remove_desk_note))
         .route("/open", get(get_open).post(set_open))
         .route("/day/{date}", get(day))
         .route("/linear/projects", get(linear_projects))
@@ -497,6 +500,11 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, desk: Op
         "hand": hand,
         "desks": st.desks.values().collect::<Vec<_>>(),
         "open_desk": st.open_desk.as_ref().and_then(|k| st.desks.get(k)),
+        "desk_notes": scope.as_ref().filter(|k| st.desks.contains_key(*k)).map(|k| {
+            let mut v = desk_notes_body(st, k);
+            v["desk_id"] = json!(k);
+            v
+        }),
         "day": day_json(st, &today, now),
         "timer": st.timer.as_ref().map(|t| json!({
             "item_id": t.item_id,
@@ -768,6 +776,7 @@ async fn get_session(Ax(app): Ax<Shared>, Path(sid): Path<String>) -> ApiResult 
     let v = app.db.read(|st| {
         st.sessions.get(&sid).map(|s| {
             let item = s.item_id.as_ref().and_then(|i| st.items.get(i));
+            let desk = st.session_desk(&s.id, &s.cwd);
             json!({
                 "session_id": s.id,
                 "cwd": s.cwd,
@@ -775,6 +784,8 @@ async fn get_session(Ax(app): Ax<Shared>, Path(sid): Path<String>) -> ApiResult 
                 "client": s.client,
                 "work_item": item.map(|i| json!({ "id": i.id, "title": i.title, "issue": i.issue, "repo_path": i.repo_path })),
                 "today_tile": s.item_id.as_ref().map(|i| tile_json(st, i, &today)),
+                "desk_id": desk,
+                "desk_notes": desk.as_deref().map(|k| st.desk_notes_of(k)).unwrap_or_default(),
             })
         })
     });
@@ -872,6 +883,26 @@ async fn session_line(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): Jso
         }
     });
     landed.map(Json).ok_or_else(|| missing("the desk has not seen this session"))
+}
+
+/// An agent's standing note on the desk its session belongs to now
+/// (decision 74), behind `desk_add_desk_note`. Written at once: the user
+/// edits or deletes it on the Desk tab.
+async fn session_desk_note(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): Json<DeskNoteBody>) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let now = now_ms();
+    let out = app.db.update(|st| {
+        let r = (|| {
+            let cwd = st.sessions.get(&sid).map(|s| s.cwd.clone()).ok_or_else(|| missing("the desk has not seen this session"))?;
+            let desk = st.session_desk(&sid, &cwd).ok_or_else(|| {
+                bad("this session belongs to no desk: no desk's repos hold its folder, and its work item, if any, has no desk")
+            })?;
+            let note = st.add_desk_note(&desk, &b.text, "agent", Some(&sid), now).map_err(desk_note_error)?;
+            Ok::<_, ApiError>(json!({ "desk_id": desk, "note": note }))
+        })();
+        let stored = r.is_ok();
+        (r, stored)
+    })?;
+    Ok((StatusCode::CREATED, Json(out)))
 }
 
 // ---------------------------------------------------------------- tiles
@@ -1970,21 +2001,78 @@ async fn put_desk(Ax(app): Ax<Shared>, Json(b): Json<DeskBody>) -> ApiResult {
 }
 
 async fn delete_desk(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
-    let found = app.db.write(|st| {
-        let found = st.desks.remove(&id).is_some();
-        for i in st.items.values_mut().filter(|i| i.desk_id.as_deref() == Some(id.as_str())) {
-            i.desk_id = None;
-        }
-        if st.open_desk.as_deref() == Some(id.as_str()) {
-            st.open_desk = None;
-        }
-        found
-    });
+    let found = app.db.write(|st| st.delete_desk(&id));
     if !found {
         return Err(missing("no such desk"));
     }
     publish_open(&app);
     Ok(Json(json!({ "ok": true })))
+}
+
+// Desk notes (decision 74): standing working agreements on a whole desk,
+// heard by every session in its repos at its start. Never a tile line, never
+// part of a Harvest note.
+
+#[derive(Deserialize)]
+struct DeskNoteBody {
+    /// Absent reads as empty, which is refused like blank text.
+    #[serde(default)]
+    text: String,
+}
+
+fn desk_note_error(e: store::DeskNoteError) -> ApiError {
+    match e {
+        store::DeskNoteError::Unknown(m) => missing(m),
+        store::DeskNoteError::Refused(m) => bad(m),
+    }
+}
+
+/// A desk's notes, oldest first, with the room they use.
+fn desk_notes_body(st: &State, desk_id: &str) -> Value {
+    json!({
+        "notes": st.desk_notes_of(desk_id),
+        "used_chars": st.desk_notes_used(desk_id),
+        "max_chars": store::DESK_NOTES_MAX_CHARS,
+        "max_note_chars": store::DESK_NOTE_MAX_CHARS,
+    })
+}
+
+async fn list_desk_notes(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
+    app.db.read(|st| match st.desks.contains_key(&id) {
+        true => Ok(Json(desk_notes_body(st, &id))),
+        false => Err(missing(format!("no desk {id}"))),
+    })
+}
+
+/// The user's note, from the Desk tab.
+async fn add_desk_note(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<DeskNoteBody>) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let now = now_ms();
+    let note = app.db.update(|st| {
+        let r = st.add_desk_note(&id, &b.text, "user", None, now);
+        let stored = r.is_ok();
+        (r, stored)
+    });
+    Ok((StatusCode::CREATED, Json(json!({ "note": note.map_err(desk_note_error)? }))))
+}
+
+async fn edit_desk_note(Ax(app): Ax<Shared>, Path((id, nid)): Path<(String, String)>, Json(b): Json<DeskNoteBody>) -> ApiResult {
+    let now = now_ms();
+    let note = app.db.update(|st| {
+        let r = st.edit_desk_note(&id, &nid, &b.text, now);
+        let stored = r.is_ok();
+        (r, stored)
+    });
+    Ok(Json(json!({ "note": note.map_err(desk_note_error)? })))
+}
+
+async fn remove_desk_note(Ax(app): Ax<Shared>, Path((id, nid)): Path<(String, String)>) -> Result<StatusCode, ApiError> {
+    app.db.update(|st| {
+        let r = st.delete_desk_note(&id, &nid);
+        let removed = r.is_ok();
+        (r, removed)
+    })
+    .map_err(desk_note_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_open(Ax(app): Ax<Shared>) -> ApiResult {
@@ -3944,6 +4032,150 @@ mod tests {
             assert!(!note["id"].as_str().unwrap().is_empty());
             assert_eq!(line["ms"], D0 + H, "kept for the clients that read it");
         }
+    }
+
+    /// A route's answer as a client reads it: the status and the JSON body,
+    /// null when there is none.
+    async fn answer(route: impl std::future::Future<Output = impl IntoResponse>) -> (StatusCode, Value) {
+        let resp = route.await.into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    fn text(t: &str) -> Json<DeskNoteBody> {
+        Json(DeskNoteBody { text: t.into() })
+    }
+
+    #[tokio::test]
+    async fn a_desks_notes_are_added_listed_edited_and_deleted_and_an_unknown_id_is_404() {
+        let (app, dir) = scratch_app();
+        let k = app.db.write(|st| st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0));
+        let (code, added) = answer(add_desk_note(Ax(app.clone()), Path(k.clone()), text("  only app Y matters "))).await;
+        assert_eq!(code, StatusCode::CREATED);
+        let note = added["note"].clone();
+        assert_eq!((note["text"].as_str(), note["source"].as_str(), note.get("session_id")), (Some("only app Y matters"), Some("user"), None));
+        let nid = note["id"].as_str().unwrap().to_string();
+        assert!(nid.starts_with("kn"), "{nid}");
+        let listed = answer(list_desk_notes(Ax(app.clone()), Path(k.clone()))).await;
+        assert_eq!(listed, (StatusCode::OK, json!({ "notes": [note], "used_chars": 18, "max_chars": 4000, "max_note_chars": 500 })));
+        let (code, edited) = answer(edit_desk_note(Ax(app.clone()), Path((k.clone(), nid.clone())), text("only app Y on board Z matters"))).await;
+        assert_eq!((code, edited["note"]["text"].as_str()), (StatusCode::OK, Some("only app Y on board Z matters")));
+        assert_eq!((&edited["note"]["id"], &edited["note"]["created_ms"]), (&note["id"], &note["created_ms"]));
+        let edit = |d: &str, n: &str, t: &str| edit_desk_note(Ax(app.clone()), Path((d.to_string(), n.to_string())), text(t));
+        assert_eq!(answer(edit(&k, "kn404", "x")).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(answer(edit("k404", &nid, "x")).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(answer(edit(&k, &nid, "   ")).await.0, StatusCode::BAD_REQUEST, "empty after trim");
+        assert_eq!(answer(add_desk_note(Ax(app.clone()), Path("k404".into()), text("x"))).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(answer(list_desk_notes(Ax(app.clone()), Path("k404".into()))).await.0, StatusCode::NOT_FOUND);
+        let remove = |d: &str, n: &str| remove_desk_note(Ax(app.clone()), Path((d.to_string(), n.to_string())));
+        assert_eq!(answer(remove("k404", &nid)).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(answer(remove(&k, &nid)).await, (StatusCode::NO_CONTENT, Value::Null));
+        assert_eq!(answer(remove(&k, &nid)).await.0, StatusCode::NOT_FOUND, "once");
+        assert!(app.db.read(|st| st.desk_notes.is_empty()));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_note_over_500_characters_or_a_desk_over_4000_is_refused_with_400_and_nothing_is_stored() {
+        let (app, dir) = scratch_app();
+        let k = app.db.write(|st| st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0));
+        let add = |t: String| add_desk_note(Ax(app.clone()), Path(k.clone()), text(&t));
+        let unsaved = || {
+            app.db.flush().unwrap();
+            std::fs::remove_file(dir.join("state.json")).is_err()
+        };
+        unsaved();
+        let (code, e) = answer(add("x".repeat(501))).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(e["error"].as_str().unwrap().contains("at most 500 characters"), "{e}");
+        assert!(app.db.read(|st| st.desk_notes.is_empty()) && unsaved(), "a refusal is not a write");
+        for i in 0..8 {
+            assert_eq!(answer(add(format!("{i}").repeat(500))).await.0, StatusCode::CREATED);
+        }
+        unsaved();
+        let (code, e) = answer(add("one more".into())).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(e["error"].as_str().unwrap().contains("at most 4000 characters"), "{e}");
+        let first = app.db.read(|st| st.desk_notes_of(&k)[0].id.clone());
+        let edit = |t: String| edit_desk_note(Ax(app.clone()), Path((k.clone(), first.clone())), text(&t));
+        assert_eq!(answer(edit("y".repeat(501))).await.0, StatusCode::BAD_REQUEST);
+        assert!(unsaved());
+        assert_eq!(app.db.read(|st| (st.desk_notes_of(&k).len(), st.desk_notes_used(&k), st.desk_notes_of(&k)[0].text.clone())), (8, 4000, "0".repeat(500)));
+        assert_eq!(answer(edit("y".repeat(500))).await.0, StatusCode::OK, "an edit within its own room fits a full desk");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_agents_desk_note_names_its_session_and_an_unknown_session_or_one_with_no_desk_is_refused() {
+        let (app, dir) = scratch_app();
+        let k = app.db.write(|st| {
+            st.sessions.insert("s".into(), store::Session::new("s", "/w/x/app", D0));
+            st.sessions.insert("lost".into(), store::Session::new("lost", "/w/elsewhere", D0));
+            st.put_desk(store::Desk { name: "Alpha".into(), firmware_repos: vec!["/w/x".into()], ..Default::default() }, D0)
+        });
+        let post = |sid: &str, t: &str| session_desk_note(Ax(app.clone()), Path(sid.to_string()), text(t));
+        let (code, v) = answer(post("s", "never open a fix branch for file F")).await;
+        assert_eq!(code, StatusCode::CREATED);
+        assert_eq!((v["desk_id"].as_str(), v["note"]["source"].as_str(), v["note"]["session_id"].as_str()), (Some(k.as_str()), Some("agent"), Some("s")));
+        let kept: store::DeskNote = serde_json::from_value(v["note"].clone()).unwrap();
+        assert_eq!(app.db.read(|st| st.desk_notes_of(&k).to_vec()), [kept]);
+        assert_eq!(answer(post("nobody", "x")).await.0, StatusCode::NOT_FOUND);
+        let (code, e) = answer(post("lost", "x")).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(e["error"].as_str().unwrap().contains("belongs to no desk"), "{e}");
+        assert_eq!(answer(post("s", " ")).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(app.db.read(|st| st.desk_notes_of(&k).len()), 1);
+
+        let Ok(Json(s)) = get_session(Ax(app.clone()), Path("s".into())).await else { panic!("s is known") };
+        assert_eq!((&s["desk_id"], &s["desk_notes"]), (&json!(k), &json!([v["note"]])));
+        let Ok(Json(lost)) = get_session(Ax(app.clone()), Path("lost".into())).await else { panic!("lost is known") };
+        assert_eq!((&lost["desk_id"], &lost["desk_notes"]), (&Value::Null, &json!([])));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_view_carries_the_viewed_desks_notes_and_null_with_no_desk_open() {
+        let mut st = State::default();
+        let a = st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0);
+        let b = st.put_desk(store::Desk { name: "Beta".into(), ..Default::default() }, D0);
+        let n = st.add_desk_note(&a, "only app Y matters", "user", None, D0).unwrap();
+        let v = view_json(&st, &Cache::default(), D0 + H, 7, None, &UtcDays);
+        assert_eq!(v["desk_notes"], Value::Null, "no desk open");
+        st.open_desk = Some(a.clone());
+        let v = view_json(&st, &Cache::default(), D0 + H, 7, None, &UtcDays);
+        assert_eq!(v["desk_notes"], json!({ "desk_id": a, "notes": [n], "used_chars": 18, "max_chars": 4000, "max_note_chars": 500 }));
+        let other = view_json(&st, &Cache::default(), D0 + H, 7, Some(&b), &UtcDays);
+        assert_eq!(other["desk_notes"], json!({ "desk_id": b, "notes": [], "used_chars": 0, "max_chars": 4000, "max_note_chars": 500 }));
+    }
+
+    #[test]
+    fn a_desk_note_never_reaches_the_days_notes_the_polish_the_approve_note_the_day_list_or_a_tile() {
+        let mut st = State::default();
+        let k = st.put_desk(store::Desk { name: "Alpha".into(), firmware_repos: vec!["/w/x".into()], ..Default::default() }, D0);
+        let w = st.create_item("Loader", None, D0);
+        st.items.get_mut(&w).unwrap().desk_id = Some(k.clone());
+        let mut s = crate::store::testing::session("s");
+        s.item_id = Some(w.clone());
+        crate::store::record_activity(&mut s, D0 + H, &UtcDays);
+        crate::store::record_activity(&mut s, D0 + 2 * H, &UtcDays);
+        st.sessions.insert("s".into(), s);
+        st.add_line(&w, "2026-10-22", "flashed the loader", "agent", D0 + H);
+        st.add_desk_note(&k, "only app Y on board Z matters", "agent", Some("s"), D0 + H).unwrap();
+        st.add_desk_note(&k, "never branch for file F", "user", None, D0 + H).unwrap();
+        st.open_desk = Some(k.clone());
+        let leaks = |s: &str| s.contains("board Z") || s.contains("file F");
+        let day = st.day_notes(&w, "2026-10-22", &UtcDays);
+        assert_eq!(day.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["flashed the loader"]);
+        assert!(!leaks(&polish_prompt("Loader", "2026-10-22", 1.0, &day, &[], &[])));
+        assert_eq!(approve_fallback_note(&st, &w, "2026-10-22"), "flashed the loader");
+        assert!(st.tiles.values().flat_map(|t| &t.lines).chain(st.notes.values().flatten()).all(|l| !leaks(&l.text)));
+        let v = view_json(&st, &Cache::default(), D0 + 3 * H, 7, None, &UtcDays);
+        for part in ["cards", "hand", "day"] {
+            assert!(!leaks(&v[part].to_string()), "{part}: {}", v[part]);
+        }
+        assert!(!leaks(&day_json(&st, "2026-10-22", D0 + 3 * H).to_string()));
+        assert!(leaks(&v["desk_notes"].to_string()), "only the desk's own strip carries them");
     }
 
     #[test]

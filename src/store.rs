@@ -88,6 +88,12 @@ pub struct State {
     pub mailbox: Vec<MailboxEntry>,
     #[serde(default)]
     pub settings: Settings,
+    /// Standing notes on a whole desk, by desk id (decision 74): working
+    /// agreements every session in the desk's repos hears at its start.
+    /// Kept outside `Desk`, which the desk form rebuilds and `open-desk.json`
+    /// publishes, and outside `notes` and `tiles`, which Harvest reads.
+    #[serde(default)]
+    pub desk_notes: BTreeMap<String, Vec<DeskNote>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -232,6 +238,38 @@ pub struct Desk {
     pub bench: Option<String>,
     #[serde(default)]
     pub created_ms: i64,
+}
+
+/// A desk note is one rule; a longer one is refused, never cut.
+pub const DESK_NOTE_MAX_CHARS: usize = 500;
+/// What a desk's notes hold together, since every session in its repos
+/// carries them from its start.
+pub const DESK_NOTES_MAX_CHARS: usize = 4_000;
+
+/// A standing note on a whole desk (decision 74): "in repo X, the only build
+/// that matters is app Y on board Z". Every session in the desk's repos
+/// hears it at its start; it is never a tile line and never reaches Harvest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeskNote {
+    /// `kn<N>`, unique across every desk.
+    pub id: String,
+    pub text: String,
+    /// `user` (the Desk tab) or `agent` (the MCP tool).
+    pub source: String,
+    /// The session whose agent wrote it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+}
+
+/// Why a desk note was not written. Nothing is stored either way.
+#[derive(Debug, PartialEq)]
+pub enum DeskNoteError {
+    /// No such desk, or no such note on it.
+    Unknown(String),
+    /// Empty, or past [`DESK_NOTE_MAX_CHARS`] or [`DESK_NOTES_MAX_CHARS`].
+    Refused(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1245,6 +1283,126 @@ impl State {
         id
     }
 
+    /// Remove a desk: its items keep no desk, it is no longer open, and its
+    /// notes go with it. False when there was no such desk.
+    pub fn delete_desk(&mut self, id: &str) -> bool {
+        let found = self.desks.remove(id).is_some();
+        for i in self.items.values_mut().filter(|i| i.desk_id.as_deref() == Some(id)) {
+            i.desk_id = None;
+        }
+        if self.open_desk.as_deref() == Some(id) {
+            self.open_desk = None;
+        }
+        self.desk_notes.remove(id);
+        found
+    }
+
+    /// The desk a session belongs to now (decision 74): the one whose repo
+    /// holds `cwd`, else its work item's. Read at each use rather than from
+    /// [`Session::desk_id`], which its first event set. A hidden session,
+    /// and one stopped at the door for its ignored path, belong to none.
+    pub fn session_desk(&self, session_id: &str, cwd: &str) -> Option<String> {
+        let sess = self.sessions.get(session_id)?;
+        if sess.hidden || (sess.ignored && is_ignored(&sess.cwd, &self.ignore)) {
+            return None;
+        }
+        self.desk_for_path(cwd)
+            .or_else(|| sess.item_id.as_ref().and_then(|i| self.items.get(i)).and_then(|w| w.desk_id.clone()))
+            .filter(|k| self.desks.contains_key(k))
+    }
+
+    /// A desk's notes, oldest first.
+    pub fn desk_notes_of(&self, desk_id: &str) -> &[DeskNote] {
+        self.desk_notes.get(desk_id).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// The characters a desk's notes hold together, against
+    /// [`DESK_NOTES_MAX_CHARS`].
+    pub fn desk_notes_used(&self, desk_id: &str) -> usize {
+        self.desk_notes_of(desk_id).iter().map(|n| n.text.chars().count()).sum()
+    }
+
+    /// A desk note's text, trimmed, or why it is refused: empty, longer than
+    /// [`DESK_NOTE_MAX_CHARS`], or taking the desk past
+    /// [`DESK_NOTES_MAX_CHARS`] with the note it replaces, if any, left out.
+    fn desk_note_text(&self, desk_id: &str, text: &str, replacing: Option<&str>) -> Result<String, DeskNoteError> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(DeskNoteError::Refused("a desk note needs text".into()));
+        }
+        let n = text.chars().count();
+        if n > DESK_NOTE_MAX_CHARS {
+            return Err(DeskNoteError::Refused(format!(
+                "a desk note is at most {DESK_NOTE_MAX_CHARS} characters, and this one has {n}: keep it to one rule"
+            )));
+        }
+        let others: usize = self
+            .desk_notes_of(desk_id)
+            .iter()
+            .filter(|x| Some(x.id.as_str()) != replacing)
+            .map(|x| x.text.chars().count())
+            .sum();
+        if others + n > DESK_NOTES_MAX_CHARS {
+            return Err(DeskNoteError::Refused(format!(
+                "a desk's notes hold at most {DESK_NOTES_MAX_CHARS} characters together, and this would make {}: \
+                 shorten or delete one on the Desk tab first",
+                others + n
+            )));
+        }
+        Ok(text.to_string())
+    }
+
+    /// Add a note to a desk, from the Desk tab (`user`) or an agent's tool
+    /// (`agent`, naming its session).
+    pub fn add_desk_note(&mut self, desk_id: &str, text: &str, source: &str, session_id: Option<&str>, now: i64) -> Result<DeskNote, DeskNoteError> {
+        if !self.desks.contains_key(desk_id) {
+            return Err(DeskNoteError::Unknown(format!("no desk {desk_id}")));
+        }
+        let text = self.desk_note_text(desk_id, text, None)?;
+        let note = DeskNote {
+            id: self.new_id("kn"),
+            text,
+            source: source.to_string(),
+            session_id: session_id.map(str::to_string),
+            created_ms: now,
+            updated_ms: now,
+        };
+        let notes = self.desk_notes.entry(desk_id.to_string()).or_default();
+        notes.push(note.clone());
+        notes.sort_by_key(|n| n.created_ms);
+        Ok(note)
+    }
+
+    /// Replace a desk note's text; it keeps its place, source and session.
+    pub fn edit_desk_note(&mut self, desk_id: &str, note_id: &str, text: &str, now: i64) -> Result<DeskNote, DeskNoteError> {
+        let pos = self.desk_note_pos(desk_id, note_id)?;
+        let text = self.desk_note_text(desk_id, text, Some(note_id))?;
+        let note = &mut self.desk_notes.get_mut(desk_id).expect("found above")[pos];
+        note.text = text;
+        note.updated_ms = now;
+        Ok(note.clone())
+    }
+
+    pub fn delete_desk_note(&mut self, desk_id: &str, note_id: &str) -> Result<(), DeskNoteError> {
+        let pos = self.desk_note_pos(desk_id, note_id)?;
+        let notes = self.desk_notes.get_mut(desk_id).expect("found above");
+        notes.remove(pos);
+        if notes.is_empty() {
+            self.desk_notes.remove(desk_id);
+        }
+        Ok(())
+    }
+
+    fn desk_note_pos(&self, desk_id: &str, note_id: &str) -> Result<usize, DeskNoteError> {
+        if !self.desks.contains_key(desk_id) {
+            return Err(DeskNoteError::Unknown(format!("no desk {desk_id}")));
+        }
+        self.desk_notes_of(desk_id)
+            .iter()
+            .position(|n| n.id == note_id)
+            .ok_or_else(|| DeskNoteError::Unknown(format!("no note {note_id} on desk {desk_id}")))
+    }
+
     /// The work item an entry belongs to: the card carrying the issue its
     /// note names.
     pub fn item_for_entry(&self, e: &LoggedEntry) -> Option<String> {
@@ -2004,5 +2162,94 @@ mod tests {
         t.acted_ms = Some(D0 + 5 * H);
         assert_eq!(st.prune(D0 + 9 * DAY).0.len(), 1);
         assert_eq!(st.notes_ms(&w), Some(D0 + 9 * DAY));
+    }
+
+    fn alpha(st: &mut State) -> String {
+        st.put_desk(Desk { name: "Alpha".into(), firmware_repos: vec!["/w/x".into()], ..Default::default() }, D0)
+    }
+
+    #[test]
+    fn a_desk_note_survives_a_save_and_load_and_an_old_state_file_without_any_loads() {
+        let mut st = State::default();
+        let k = alpha(&mut st);
+        let user = st.add_desk_note(&k, "  in repo X, only app Y on board Z matters  ", "user", None, D0).unwrap();
+        let agent = st.add_desk_note(&k, "file F is another engineer's: report, never branch", "agent", Some("s1"), D0 + H).unwrap();
+        assert_eq!((user.id.as_str(), user.text.as_str()), ("kn2", "in repo X, only app Y on board Z matters"));
+        let saved = serde_json::to_value(&st).unwrap();
+        assert!(saved["desk_notes"][&k][0].get("session_id").is_none(), "no session, no field: {saved}");
+        assert_eq!(saved["desk_notes"][&k][1]["session_id"], "s1");
+        let again: State = serde_json::from_value(saved).unwrap();
+        assert_eq!(again.desk_notes_of(&k), [user, agent]);
+        assert_eq!(again.desk_notes_used(&k), 40 + 50);
+
+        let old = serde_json::json!({ "next_id": 1, "desks": { "k1": { "id": "k1", "name": "Alpha" } } });
+        let old: State = serde_json::from_value(old).unwrap();
+        assert!(old.desk_notes.is_empty() && old.desk_notes_of("k1").is_empty());
+    }
+
+    #[test]
+    fn a_desk_note_is_refused_when_empty_too_long_or_past_the_desks_room_and_nothing_is_stored() {
+        let mut st = State::default();
+        let k = alpha(&mut st);
+        let refused = |r: Result<DeskNote, DeskNoteError>| matches!(r, Err(DeskNoteError::Refused(_)));
+        assert!(refused(st.add_desk_note(&k, "   ", "user", None, D0)));
+        assert!(st.add_desk_note(&k, &"é".repeat(DESK_NOTE_MAX_CHARS), "user", None, D0).is_ok(), "characters, not bytes");
+        let Err(DeskNoteError::Refused(m)) = st.add_desk_note(&k, &"x".repeat(DESK_NOTE_MAX_CHARS + 1), "user", None, D0) else { panic!() };
+        assert!(m.contains("500") && m.contains("501"), "{m}");
+        for _ in 0..7 {
+            st.add_desk_note(&k, &"x".repeat(DESK_NOTE_MAX_CHARS), "user", None, D0).unwrap();
+        }
+        assert_eq!(st.desk_notes_used(&k), DESK_NOTES_MAX_CHARS);
+        let Err(DeskNoteError::Refused(m)) = st.add_desk_note(&k, "one more", "user", None, D0) else { panic!() };
+        assert!(m.contains("4000") && m.contains("4008"), "{m}");
+        let first = st.desk_notes_of(&k)[0].id.clone();
+        assert!(st.edit_desk_note(&k, &first, "shorter", D0 + H).is_ok(), "an edit counts the room its old text frees");
+        assert!(refused(st.edit_desk_note(&k, &first, &"y".repeat(DESK_NOTE_MAX_CHARS + 1), D0 + H)));
+        assert_eq!(st.desk_notes_of(&k).len(), 8);
+        assert_eq!(st.desk_notes_of(&k)[0].text, "shorter");
+        assert_eq!(st.add_desk_note("k404", "x", "user", None, D0), Err(DeskNoteError::Unknown("no desk k404".into())));
+    }
+
+    #[test]
+    fn deleting_a_desk_drops_its_notes_and_saving_its_form_keeps_them() {
+        let mut st = State::default();
+        let k = alpha(&mut st);
+        let b = st.put_desk(Desk { name: "Beta".into(), ..Default::default() }, D0);
+        st.add_desk_note(&k, "only app Y matters", "user", None, D0).unwrap();
+        st.add_desk_note(&b, "never touch board Z", "user", None, D0).unwrap();
+        // The form sends the whole desk back, and the route rebuilds it.
+        st.put_desk(Desk { id: k.clone(), name: "Alpha renamed".into(), firmware_repos: vec!["/w/x".into()], ..Default::default() }, D0 + H);
+        assert_eq!(st.desk_notes_of(&k)[0].text, "only app Y matters");
+        let w = st.create_item("x", None, D0);
+        st.items.get_mut(&w).unwrap().desk_id = Some(k.clone());
+        st.open_desk = Some(k.clone());
+        assert!(st.delete_desk(&k));
+        assert!(st.desk_notes_of(&k).is_empty() && !st.desk_notes.contains_key(&k));
+        assert_eq!((st.items[&w].desk_id.as_ref(), st.open_desk.as_ref()), (None, None));
+        assert_eq!(st.desk_notes_of(&b).len(), 1, "another desk's notes stay");
+        assert!(!st.delete_desk(&k));
+    }
+
+    #[test]
+    fn a_session_belongs_to_the_desk_holding_its_folder_else_its_items_and_never_when_hidden_or_ignored() {
+        let mut st = State { ignore: vec!["/g/embarch".into()], ..Default::default() };
+        let k = alpha(&mut st);
+        let b = st.put_desk(Desk { name: "Beta".into(), firmware_repos: vec!["/w/b".into()], ..Default::default() }, D0);
+        let w = st.create_item("on beta", None, D0);
+        st.items.get_mut(&w).unwrap().desk_id = Some(b.clone());
+        let mut s = Session::new("s", "/w/x/app", D0);
+        s.item_id = Some(w.clone());
+        st.sessions.insert("s".into(), s);
+        assert_eq!(st.session_desk("s", "/w/x/app").as_deref(), Some(k.as_str()), "the folder first");
+        assert_eq!(st.session_desk("s", "/w/elsewhere").as_deref(), Some(b.as_str()), "else the item's");
+        st.untrack_session("s");
+        assert_eq!(st.session_desk("s", "/w/x").as_deref(), Some(k.as_str()), "an untracked session keeps its desk");
+        st.hide_session("s");
+        assert_eq!(st.session_desk("s", "/w/x"), None);
+        let mut f = Session::new("f", "/g/embarch/x", D0);
+        f.ignored = true;
+        st.sessions.insert("f".into(), f);
+        assert_eq!(st.session_desk("f", "/w/x"), None);
+        assert_eq!(st.session_desk("nobody", "/w/x"), None);
     }
 }
