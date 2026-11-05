@@ -776,7 +776,7 @@ async fn get_session(Ax(app): Ax<Shared>, Path(sid): Path<String>) -> ApiResult 
     let v = app.db.read(|st| {
         st.sessions.get(&sid).map(|s| {
             let item = s.item_id.as_ref().and_then(|i| st.items.get(i));
-            let desk = st.session_desk(&s.id, &s.cwd);
+            let desk = st.notes_desk(&s.id);
             json!({
                 "session_id": s.id,
                 "cwd": s.cwd,
@@ -885,15 +885,19 @@ async fn session_line(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): Jso
     landed.map(Json).ok_or_else(|| missing("the desk has not seen this session"))
 }
 
-/// An agent's standing note on the desk its session belongs to now
-/// (decision 74), behind `desk_add_desk_note`. Written at once: the user
-/// edits or deletes it on the Desk tab.
+/// An agent's standing note on the desk whose notes its session's last start
+/// gave it, else the one it belongs to now (decision 74), behind
+/// `desk_add_desk_note`. Written at once: the user edits or deletes it on the
+/// Desk tab.
 async fn session_desk_note(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): Json<DeskNoteBody>) -> Result<(StatusCode, Json<Value>), ApiError> {
     let now = now_ms();
     let out = app.db.update(|st| {
         let r = (|| {
-            let cwd = st.sessions.get(&sid).map(|s| s.cwd.clone()).ok_or_else(|| missing("the desk has not seen this session"))?;
-            let desk = st.session_desk(&sid, &cwd).ok_or_else(|| {
+            let sess = st.sessions.get(&sid).ok_or_else(|| missing("the desk has not seen this session"))?;
+            if st.shut_out(sess) {
+                return Err(bad("a hidden session, or one under an ignored path, belongs to no desk and adds no desk notes"));
+            }
+            let desk = st.notes_desk(&sid).ok_or_else(|| {
                 bad("this session belongs to no desk: no desk's repos hold its folder, and its work item, if any, has no desk")
             })?;
             let note = st.add_desk_note(&desk, &b.text, "agent", Some(&sid), now).map_err(desk_note_error)?;
@@ -4058,7 +4062,7 @@ mod tests {
         let nid = note["id"].as_str().unwrap().to_string();
         assert!(nid.starts_with("kn"), "{nid}");
         let listed = answer(list_desk_notes(Ax(app.clone()), Path(k.clone()))).await;
-        assert_eq!(listed, (StatusCode::OK, json!({ "notes": [note], "used_chars": 18, "max_chars": 4000, "max_note_chars": 500 })));
+        assert_eq!(listed, (StatusCode::OK, json!({ "notes": [note], "used_chars": 21, "max_chars": 4000, "max_note_chars": 500 })));
         let (code, edited) = answer(edit_desk_note(Ax(app.clone()), Path((k.clone(), nid.clone())), text("only app Y on board Z matters"))).await;
         assert_eq!((code, edited["note"]["text"].as_str()), (StatusCode::OK, Some("only app Y on board Z matters")));
         assert_eq!((&edited["note"]["id"], &edited["note"]["created_ms"]), (&note["id"], &note["created_ms"]));
@@ -4090,18 +4094,19 @@ mod tests {
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert!(e["error"].as_str().unwrap().contains("at most 500 characters"), "{e}");
         assert!(app.db.read(|st| st.desk_notes.is_empty()) && unsaved(), "a refusal is not a write");
-        for i in 0..8 {
+        // Each takes 503 as a session hears it: `- `, the text, a line break.
+        for i in 0..7 {
             assert_eq!(answer(add(format!("{i}").repeat(500))).await.0, StatusCode::CREATED);
         }
         unsaved();
-        let (code, e) = answer(add("one more".into())).await;
+        let (code, e) = answer(add("7".repeat(500))).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
-        assert!(e["error"].as_str().unwrap().contains("at most 4000 characters"), "{e}");
+        assert!(e["error"].as_str().unwrap().contains("at most 4000 characters as a session reads them, and this would make 4024"), "{e}");
         let first = app.db.read(|st| st.desk_notes_of(&k)[0].id.clone());
         let edit = |t: String| edit_desk_note(Ax(app.clone()), Path((k.clone(), first.clone())), text(&t));
         assert_eq!(answer(edit("y".repeat(501))).await.0, StatusCode::BAD_REQUEST);
         assert!(unsaved());
-        assert_eq!(app.db.read(|st| (st.desk_notes_of(&k).len(), st.desk_notes_used(&k), st.desk_notes_of(&k)[0].text.clone())), (8, 4000, "0".repeat(500)));
+        assert_eq!(app.db.read(|st| (st.desk_notes_of(&k).len(), st.desk_notes_used(&k), st.desk_notes_of(&k)[0].text.clone())), (7, 7 * 503, "0".repeat(500)));
         assert_eq!(answer(edit("y".repeat(500))).await.0, StatusCode::OK, "an edit within its own room fits a full desk");
         std::fs::remove_dir_all(dir).ok();
     }
@@ -4134,6 +4139,34 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    #[tokio::test]
+    async fn an_agents_note_goes_to_the_desk_its_last_start_named_and_a_hidden_session_is_told_why_it_has_none() {
+        let (app, dir) = scratch_app();
+        let (a, b) = app.db.write(|st| {
+            let a = st.put_desk(store::Desk { name: "Alpha".into(), firmware_repos: vec!["/w/x".into()], ..Default::default() }, D0);
+            let b = st.put_desk(store::Desk { name: "Beta".into(), firmware_repos: vec!["/w/b".into()], ..Default::default() }, D0);
+            // First seen in Alpha's repo; its last start was in Beta's.
+            let mut s = store::Session::new("s", "/w/x", D0);
+            s.start_desk = Some(b.clone());
+            st.sessions.insert("s".into(), s);
+            st.sessions.insert("h".into(), store::Session::new("h", "/w/x", D0));
+            st.hide_session("h");
+            (a, b)
+        });
+        let post = |sid: &str, t: &str| session_desk_note(Ax(app.clone()), Path(sid.to_string()), text(t));
+        let (code, v) = answer(post("s", "on board Q, flash over SWD only")).await;
+        assert_eq!((code, v["desk_id"].as_str()), (StatusCode::CREATED, Some(b.as_str())));
+        assert!(app.db.read(|st| st.desk_notes_of(&a).is_empty()));
+        let Ok(Json(s)) = get_session(Ax(app.clone()), Path("s".into())).await else { panic!("s is known") };
+        assert_eq!((&s["desk_id"], &s["desk_notes"]), (&json!(b), &json!([v["note"]])));
+        let (code, e) = answer(post("h", "x")).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(e["error"].as_str().unwrap().starts_with("a hidden session, or one under an ignored path"), "{e}");
+        let Ok(Json(h)) = get_session(Ax(app.clone()), Path("h".into())).await else { panic!("h is known") };
+        assert_eq!((&h["desk_id"], &h["desk_notes"]), (&Value::Null, &json!([])));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn the_view_carries_the_viewed_desks_notes_and_null_with_no_desk_open() {
         let mut st = State::default();
@@ -4144,7 +4177,7 @@ mod tests {
         assert_eq!(v["desk_notes"], Value::Null, "no desk open");
         st.open_desk = Some(a.clone());
         let v = view_json(&st, &Cache::default(), D0 + H, 7, None, &UtcDays);
-        assert_eq!(v["desk_notes"], json!({ "desk_id": a, "notes": [n], "used_chars": 18, "max_chars": 4000, "max_note_chars": 500 }));
+        assert_eq!(v["desk_notes"], json!({ "desk_id": a, "notes": [n], "used_chars": 21, "max_chars": 4000, "max_note_chars": 500 }));
         let other = view_json(&st, &Cache::default(), D0 + H, 7, Some(&b), &UtcDays);
         assert_eq!(other["desk_notes"], json!({ "desk_id": b, "notes": [], "used_chars": 0, "max_chars": 4000, "max_note_chars": 500 }));
     }

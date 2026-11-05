@@ -240,11 +240,16 @@ pub struct Desk {
     pub created_ms: i64,
 }
 
-/// A desk note is one rule; a longer one is refused, never cut.
+/// A desk note is one rule; a longer one is refused, never cut. Counted as a
+/// session reads the note: each line break 3, for the indent that keeps the
+/// next line inside its item.
 pub const DESK_NOTE_MAX_CHARS: usize = 500;
-/// What a desk's notes hold together, since every session in its repos
-/// carries them from its start.
+/// The longest the list of a desk's notes may be as a session hears it, every
+/// item's `- `, indents, agent mark and line break counted, since every
+/// session in its repos carries it from its start.
 pub const DESK_NOTES_MAX_CHARS: usize = 4_000;
+/// What marks a note an agent wrote, in the list a session hears.
+pub const DESK_NOTE_AGENT_MARK: &str = " (added by an agent)";
 
 /// A standing note on a whole desk (decision 74): "in repo X, the only build
 /// that matters is app Y on board Z". Every session in the desk's repos
@@ -261,6 +266,39 @@ pub struct DeskNote {
     pub session_id: Option<String>,
     pub created_ms: i64,
     pub updated_ms: i64,
+}
+
+impl DeskNote {
+    /// The note as one item of the list a session hears: `- `, its text with
+    /// each later line indented under it, and an agent's marked.
+    pub fn item(&self) -> String {
+        let mut out = format!("- {}", self.text.replace('\n', "\n  "));
+        if self.source == "agent" {
+            out.push_str(DESK_NOTE_AGENT_MARK);
+        }
+        out
+    }
+
+    /// What the note takes of its desk's [`DESK_NOTES_MAX_CHARS`]: its item
+    /// and the line break after it.
+    pub fn cost(&self) -> usize {
+        self.item().chars().count() + 1
+    }
+}
+
+/// A desk's notes as the list a session hears, one item each. Never longer
+/// than [`DESK_NOTES_MAX_CHARS`], since that is what the cap counts.
+pub fn desk_note_list(notes: &[DeskNote]) -> String {
+    notes.iter().map(DeskNote::item).collect::<Vec<_>>().join("\n")
+}
+
+/// A desk note's text as it is kept: `\n` line endings, no blank line and no
+/// trailing blanks, trimmed. A note is one rule, and an empty line would only
+/// cost room in every session's start.
+pub fn clean_desk_note(text: &str) -> String {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
+    lines.join("\n").trim().to_string()
 }
 
 /// Why a desk note was not written. Nothing is stored either way.
@@ -384,6 +422,10 @@ pub struct Session {
     /// the panel's chats.
     #[serde(default)]
     pub client: Option<String>,
+    /// The desk whose notes its last SessionStart gave it (decision 74), so
+    /// what it reads back and an agent's note go to the desk it was told of.
+    #[serde(default)]
+    pub start_desk: Option<String>,
 }
 
 impl Session {
@@ -407,6 +449,7 @@ impl Session {
             waiting: None,
             busy: false,
             client: None,
+            start_desk: None,
         }
     }
 }
@@ -1303,7 +1346,7 @@ impl State {
     /// and one stopped at the door for its ignored path, belong to none.
     pub fn session_desk(&self, session_id: &str, cwd: &str) -> Option<String> {
         let sess = self.sessions.get(session_id)?;
-        if sess.hidden || (sess.ignored && is_ignored(&sess.cwd, &self.ignore)) {
+        if self.shut_out(sess) {
             return None;
         }
         self.desk_for_path(cwd)
@@ -1311,45 +1354,61 @@ impl State {
             .filter(|k| self.desks.contains_key(k))
     }
 
+    /// A hidden session, or one stopped at the door for its ignored path:
+    /// it belongs to no desk and hears no desk notes.
+    pub fn shut_out(&self, sess: &Session) -> bool {
+        sess.hidden || (sess.ignored && is_ignored(&sess.cwd, &self.ignore))
+    }
+
+    /// The desk a session goes by for its notes: the one whose notes its last
+    /// SessionStart gave it, else, with none recorded, the one it belongs to
+    /// now. What `GET /sessions/{sid}` reads back and where an agent's note
+    /// goes, so neither names a desk the session was not told of.
+    pub fn notes_desk(&self, session_id: &str) -> Option<String> {
+        let sess = self.sessions.get(session_id)?;
+        if self.shut_out(sess) {
+            return None;
+        }
+        sess.start_desk
+            .clone()
+            .filter(|k| self.desks.contains_key(k))
+            .or_else(|| self.session_desk(session_id, &sess.cwd))
+    }
+
     /// A desk's notes, oldest first.
     pub fn desk_notes_of(&self, desk_id: &str) -> &[DeskNote] {
         self.desk_notes.get(desk_id).map(Vec::as_slice).unwrap_or_default()
     }
 
-    /// The characters a desk's notes hold together, against
-    /// [`DESK_NOTES_MAX_CHARS`].
+    /// What a desk's notes take of [`DESK_NOTES_MAX_CHARS`]: the list a
+    /// session hears, and the line break after it.
     pub fn desk_notes_used(&self, desk_id: &str) -> usize {
-        self.desk_notes_of(desk_id).iter().map(|n| n.text.chars().count()).sum()
+        self.desk_notes_of(desk_id).iter().map(DeskNote::cost).sum()
     }
 
-    /// A desk note's text, trimmed, or why it is refused: empty, longer than
-    /// [`DESK_NOTE_MAX_CHARS`], or taking the desk past
-    /// [`DESK_NOTES_MAX_CHARS`] with the note it replaces, if any, left out.
-    fn desk_note_text(&self, desk_id: &str, text: &str, replacing: Option<&str>) -> Result<String, DeskNoteError> {
-        let text = text.trim();
-        if text.is_empty() {
+    /// Why `note` cannot stand on the desk, if it cannot: empty, longer than
+    /// [`DESK_NOTE_MAX_CHARS`] as a session reads it, or taking the desk's
+    /// list past [`DESK_NOTES_MAX_CHARS`] with the note of its id left out.
+    fn check_desk_note(&self, desk_id: &str, note: &DeskNote) -> Result<(), DeskNoteError> {
+        if note.text.is_empty() {
             return Err(DeskNoteError::Refused("a desk note needs text".into()));
         }
-        let n = text.chars().count();
+        let n = note.text.chars().count() + 2 * note.text.matches('\n').count();
         if n > DESK_NOTE_MAX_CHARS {
             return Err(DeskNoteError::Refused(format!(
-                "a desk note is at most {DESK_NOTE_MAX_CHARS} characters, and this one has {n}: keep it to one rule"
+                "a desk note is at most {DESK_NOTE_MAX_CHARS} characters, a line break counting 3, and this one has {n}: \
+                 keep it to one rule"
             )));
         }
-        let others: usize = self
-            .desk_notes_of(desk_id)
-            .iter()
-            .filter(|x| Some(x.id.as_str()) != replacing)
-            .map(|x| x.text.chars().count())
-            .sum();
-        if others + n > DESK_NOTES_MAX_CHARS {
+        let others: usize = self.desk_notes_of(desk_id).iter().filter(|x| x.id != note.id).map(DeskNote::cost).sum();
+        if others + note.cost() > DESK_NOTES_MAX_CHARS {
             return Err(DeskNoteError::Refused(format!(
-                "a desk's notes hold at most {DESK_NOTES_MAX_CHARS} characters together, and this would make {}: \
-                 shorten or delete one on the Desk tab first",
-                others + n
+                "a desk's notes hold at most {DESK_NOTES_MAX_CHARS} characters as a session reads them, and this would \
+                 make {}: shorten or delete one on the Desk tab first",
+                others + note.cost()
             )));
         }
-        Ok(text.to_string())
+        Ok(())
     }
 
     /// Add a note to a desk, from the Desk tab (`user`) or an agent's tool
@@ -1358,15 +1417,16 @@ impl State {
         if !self.desks.contains_key(desk_id) {
             return Err(DeskNoteError::Unknown(format!("no desk {desk_id}")));
         }
-        let text = self.desk_note_text(desk_id, text, None)?;
-        let note = DeskNote {
-            id: self.new_id("kn"),
-            text,
+        let mut note = DeskNote {
+            id: String::new(),
+            text: clean_desk_note(text),
             source: source.to_string(),
             session_id: session_id.map(str::to_string),
             created_ms: now,
             updated_ms: now,
         };
+        self.check_desk_note(desk_id, &note)?;
+        note.id = self.new_id("kn");
         let notes = self.desk_notes.entry(desk_id.to_string()).or_default();
         notes.push(note.clone());
         notes.sort_by_key(|n| n.created_ms);
@@ -1376,11 +1436,12 @@ impl State {
     /// Replace a desk note's text; it keeps its place, source and session.
     pub fn edit_desk_note(&mut self, desk_id: &str, note_id: &str, text: &str, now: i64) -> Result<DeskNote, DeskNoteError> {
         let pos = self.desk_note_pos(desk_id, note_id)?;
-        let text = self.desk_note_text(desk_id, text, Some(note_id))?;
-        let note = &mut self.desk_notes.get_mut(desk_id).expect("found above")[pos];
-        note.text = text;
+        let mut note = self.desk_notes_of(desk_id)[pos].clone();
+        note.text = clean_desk_note(text);
         note.updated_ms = now;
-        Ok(note.clone())
+        self.check_desk_note(desk_id, &note)?;
+        self.desk_notes.get_mut(desk_id).expect("found above")[pos] = note.clone();
+        Ok(note)
     }
 
     pub fn delete_desk_note(&mut self, desk_id: &str, note_id: &str) -> Result<(), DeskNoteError> {
@@ -2180,7 +2241,8 @@ mod tests {
         assert_eq!(saved["desk_notes"][&k][1]["session_id"], "s1");
         let again: State = serde_json::from_value(saved).unwrap();
         assert_eq!(again.desk_notes_of(&k), [user, agent]);
-        assert_eq!(again.desk_notes_used(&k), 40 + 50);
+        // Each as a session hears it: `- `, the text, the agent's mark, a line break.
+        assert_eq!(again.desk_notes_used(&k), (2 + 40 + 1) + (2 + 50 + DESK_NOTE_AGENT_MARK.len() + 1));
 
         let old = serde_json::json!({ "next_id": 1, "desks": { "k1": { "id": "k1", "name": "Alpha" } } });
         let old: State = serde_json::from_value(old).unwrap();
@@ -2192,22 +2254,45 @@ mod tests {
         let mut st = State::default();
         let k = alpha(&mut st);
         let refused = |r: Result<DeskNote, DeskNoteError>| matches!(r, Err(DeskNoteError::Refused(_)));
-        assert!(refused(st.add_desk_note(&k, "   ", "user", None, D0)));
+        assert!(refused(st.add_desk_note(&k, " \r\n \n", "user", None, D0)), "blank lines are no text");
         assert!(st.add_desk_note(&k, &"é".repeat(DESK_NOTE_MAX_CHARS), "user", None, D0).is_ok(), "characters, not bytes");
         let Err(DeskNoteError::Refused(m)) = st.add_desk_note(&k, &"x".repeat(DESK_NOTE_MAX_CHARS + 1), "user", None, D0) else { panic!() };
         assert!(m.contains("500") && m.contains("501"), "{m}");
-        for _ in 0..7 {
+        // A 500-character note takes 503 of the desk: `- ` and its line break.
+        for _ in 0..6 {
             st.add_desk_note(&k, &"x".repeat(DESK_NOTE_MAX_CHARS), "user", None, D0).unwrap();
         }
-        assert_eq!(st.desk_notes_used(&k), DESK_NOTES_MAX_CHARS);
-        let Err(DeskNoteError::Refused(m)) = st.add_desk_note(&k, "one more", "user", None, D0) else { panic!() };
-        assert!(m.contains("4000") && m.contains("4008"), "{m}");
+        assert_eq!(st.desk_notes_used(&k), 7 * 503);
+        let Err(DeskNoteError::Refused(m)) = st.add_desk_note(&k, &"x".repeat(DESK_NOTE_MAX_CHARS), "user", None, D0) else { panic!() };
+        assert!(m.contains("4000") && m.contains("4024"), "{m}");
         let first = st.desk_notes_of(&k)[0].id.clone();
         assert!(st.edit_desk_note(&k, &first, "shorter", D0 + H).is_ok(), "an edit counts the room its old text frees");
         assert!(refused(st.edit_desk_note(&k, &first, &"y".repeat(DESK_NOTE_MAX_CHARS + 1), D0 + H)));
-        assert_eq!(st.desk_notes_of(&k).len(), 8);
+        assert_eq!(st.desk_notes_of(&k).len(), 7);
         assert_eq!(st.desk_notes_of(&k)[0].text, "shorter");
         assert_eq!(st.add_desk_note("k404", "x", "user", None, D0), Err(DeskNoteError::Unknown("no desk k404".into())));
+    }
+
+    #[test]
+    fn a_desk_note_counts_as_a_session_hears_it_so_the_list_never_passes_the_cap() {
+        let mut st = State::default();
+        let k = alpha(&mut st);
+        // Kept clean: one kind of line ending, no blank line, no trailing blank.
+        let n = st.add_desk_note(&k, "  rule one:\r\n\r\n\r\n  step a  \rstep b\n\n", "user", None, D0).unwrap();
+        assert_eq!(n.text, "rule one:\n  step a\nstep b");
+        assert_eq!(n.item(), "- rule one:\n    step a\n  step b");
+        // k one-character lines read as 4k - 3 characters, each break indented.
+        let lines = |k: usize| vec!["x"; k].join("\n");
+        assert!(matches!(st.add_desk_note(&k, &lines(126), "user", None, D0), Err(DeskNoteError::Refused(_))), "501 as read");
+        let mut agent = false;
+        while st.add_desk_note(&k, &lines(125), if agent { "agent" } else { "user" }, agent.then_some("s"), D0).is_ok() {
+            agent = !agent;
+        }
+        let list = desk_note_list(st.desk_notes_of(&k));
+        assert!(list.contains("\n  x (added by an agent)\n- x\n  x"), "an agent's note is marked");
+        assert_eq!(list.chars().count() + 1, st.desk_notes_used(&k));
+        assert!(list.chars().count() <= DESK_NOTES_MAX_CHARS);
+        assert!(st.desk_notes_used(&k) + 497 + 3 > DESK_NOTES_MAX_CHARS, "filled until the next one would not fit");
     }
 
     #[test]
@@ -2251,5 +2336,20 @@ mod tests {
         st.sessions.insert("f".into(), f);
         assert_eq!(st.session_desk("f", "/w/x"), None);
         assert_eq!(st.session_desk("nobody", "/w/x"), None);
+    }
+
+    #[test]
+    fn a_sessions_notes_desk_is_the_one_its_last_start_named_else_the_one_it_belongs_to_now() {
+        let mut st = State::default();
+        let a = alpha(&mut st);
+        let b = st.put_desk(Desk { name: "Beta".into(), firmware_repos: vec!["/w/b".into()], ..Default::default() }, D0);
+        st.sessions.insert("s".into(), Session::new("s", "/w/x", D0));
+        assert_eq!(st.notes_desk("s").as_deref(), Some(a.as_str()), "no start yet: its folder's");
+        st.sessions.get_mut("s").unwrap().start_desk = Some(b.clone());
+        assert_eq!(st.notes_desk("s").as_deref(), Some(b.as_str()), "the desk it was told of, not its first folder's");
+        st.delete_desk(&b);
+        assert_eq!(st.notes_desk("s").as_deref(), Some(a.as_str()), "a deleted desk falls back");
+        st.hide_session("s");
+        assert_eq!(st.notes_desk("s"), None);
     }
 }

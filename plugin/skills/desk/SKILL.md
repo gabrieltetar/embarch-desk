@@ -37,9 +37,9 @@ Commits and Claude Code memory files are added automatically — a write to `~/.
 
 ## Desk notes
 
-A desk can hold **standing notes**: working agreements for every session in its repos, such as "in repo X, the only build that matters is app Y on board Z" or "file F is another engineer's; report findings, never open a fix branch". The context lists them when the session starts, and `desk_work_item` repeats them. **Follow them; if one conflicts with what the user asks now, ask.** Do not copy them into memory files or work-item notes.
+A desk can hold **standing notes**: working agreements for every session in its repos, such as "in repo X, the only build that matters is app Y on board Z" or "file F is another engineer's; report findings, never open a fix branch". The context lists them when the session starts, an agent's marked as such, and `desk_work_item` repeats the ones this session was given. **Follow them; if one conflicts with what the user asks now, ask.** Do not copy them into memory files or work-item notes.
 
-- **When the user sets such a rule** (always, never, from now on, in this repo), or agrees when you ask whether something should hold for every session here, add it with `desk_add_desk_note`. One rule per note, at most 500 characters; a desk holds 4,000.
+- **When the user sets such a rule** (always, never, from now on, in this repo), or agrees when you ask whether something should hold for every session here, add it with `desk_add_desk_note`, which puts it on the desk this session was given. One rule per note, at most 500 characters; a desk holds 4,000.
 - **Never progress, findings or task state**: those are `desk_add_line`. A desk note never reaches Harvest.
 - There is no tool to edit or delete one: the user does that on the Desk tab.
 

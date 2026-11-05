@@ -17,7 +17,7 @@
 //! question, no context. One the user untracked moves only its state, and
 //! hears only its desk's notes at its start.
 
-use crate::store::{self, BenchEvent, Days, DeskNote, Git, Line, Session, State};
+use crate::store::{self, BenchEvent, Days, Git, Line, Session, State};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -147,10 +147,11 @@ fn assigned_text(state: &State, session_id: &str, item_id: &str) -> String {
 }
 
 /// When a session starts in one desk's repo while another (or none) is open:
-/// the one-time question, and the rule that its time is its own desk's.
-fn switch_text(state: &State, session_id: &str) -> Option<String> {
-    let sess = state.sessions.get(session_id)?;
-    let own = sess.desk_id.as_ref()?;
+/// the one-time question, and the rule that its time is its own desk's. The
+/// repo is the one it starts in now, whose desk is also the one whose notes
+/// the same start gives it.
+fn switch_text(state: &State, cwd: &str) -> Option<String> {
+    let own = &state.desk_for_path(cwd)?;
     if state.open_desk.as_ref() == Some(own) {
         return None;
     }
@@ -165,28 +166,31 @@ fn switch_text(state: &State, session_id: &str) -> Option<String> {
     ))
 }
 
-/// A desk's notes as a list, one `- ` line each; a note's own line breaks
-/// stay inside its item.
-pub fn desk_note_list(notes: &[DeskNote]) -> String {
-    notes.iter().map(|n| format!("- {}", n.text.lines().collect::<Vec<_>>().join("\n  "))).collect::<Vec<_>>().join("\n")
-}
-
-/// The standing notes of the desk a starting session belongs to (decision
-/// 74), resolved now rather than when it first appeared; none when that
-/// desk has none.
-pub fn desk_notes_text(state: &State, session_id: &str, cwd: &str) -> Option<String> {
-    let desk = state.session_desk(session_id, cwd)?;
-    let notes = state.desk_notes_of(&desk);
+/// A desk's standing notes as a session hears them (decision 74), or none
+/// when it has none.
+pub fn desk_notes_text(state: &State, desk: &str) -> Option<String> {
+    let notes = state.desk_notes_of(desk);
     if notes.is_empty() {
         return None;
     }
-    let name = state.desks.get(&desk).map_or(desk.as_str(), |d| d.name.as_str());
+    let name = state.desks.get(desk).map_or(desk, |d| d.name.as_str());
     Some(format!(
-        "EmbArch Desk: standing notes for the desk \"{name}\", kept by the user on the Desk tab for every \
-         session in this desk's repos. Follow them; if one conflicts with what the user asks now, ask. Do not \
-         copy them into memory files or work-item notes.\n{}",
-        desk_note_list(notes)
+        "EmbArch Desk: standing notes for the desk \"{name}\", which hold for every session in its repos and are \
+         kept on the Desk tab. Follow them; if one conflicts with what the user asks now, ask. Do not copy them into \
+         memory files or work-item notes.\n{}",
+        store::desk_note_list(notes)
     ))
+}
+
+/// A starting session's desk notes: those of the desk it belongs to now,
+/// resolved at this start rather than read from its first event, and
+/// recorded as the desk it was told of.
+fn start_notes(state: &mut State, session_id: &str, cwd: &str) -> Option<String> {
+    let desk = state.session_desk(session_id, cwd);
+    if let Some(s) = state.sessions.get_mut(session_id) {
+        s.start_desk = desk.clone();
+    }
+    desk_notes_text(state, &desk?)
 }
 
 /// Apply one hook event. Returns the context to inject into the session, if any.
@@ -278,7 +282,7 @@ pub fn apply(
     // hidden one hears nothing.
     if sess.ignored {
         sess.last_ms = sess.last_ms.max(now);
-        return start.then(|| desk_notes_text(state, &ev.session_id, &cwd)).flatten();
+        return if start { start_notes(state, &ev.session_id, &cwd) } else { None };
     }
     if time_on {
         store::record_activity(sess, now, days);
@@ -305,8 +309,8 @@ pub fn apply(
         ("SessionStart", None) => Some(unasked_text(&ev.session_id)),
         _ => None,
     };
-    let switch = start.then(|| switch_text(state, &ev.session_id)).flatten();
-    let notes = start.then(|| desk_notes_text(state, &ev.session_id, &cwd)).flatten();
+    let switch = start.then(|| switch_text(state, &cwd)).flatten();
+    let notes = if start { start_notes(state, &ev.session_id, &cwd) } else { None };
     let parts: Vec<String> = [main, switch, notes].into_iter().flatten().collect();
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
@@ -685,11 +689,12 @@ mod tests {
         let (ask, notes) = out.split_once("\n\nEmbArch Desk: standing notes").unwrap_or_else(|| panic!("{out}"));
         assert!(ask.contains("desk_set_work_item"), "the notes come after what the session is told already");
         assert!(notes.ends_with(
-            "for the desk \"Alpha\", kept by the user on the Desk tab for every session in this desk's repos. Follow them; \
+            "for the desk \"Alpha\", which hold for every session in its repos and are kept on the Desk tab. Follow them; \
              if one conflicts with what the user asks now, ask. Do not copy them into memory files or work-item notes.\n\
              - in repo X, only app Y on board Z matters\n\
-             - file F is another engineer's:\n  report findings, never open a fix branch"
+             - file F is another engineer's:\n  report findings, never open a fix branch (added by an agent)"
         ), "{notes}");
+        assert!(!out.contains("by the user"), "an agent wrote one of them");
         let prompt = apply(&mut st, &ev("UserPromptSubmit", "s", "/w/x/app"), D0 + 1, &UtcDays, &git, 7).unwrap();
         assert!(!prompt.contains(NOTES_HEAD), "SessionStart only: {prompt}");
         // A resume, a clear and a compact each arrive as a SessionStart too.
@@ -724,6 +729,39 @@ mod tests {
         assert!(apply(&mut st, &ev("UserPromptSubmit", "u", "/w/x"), D0 + 2, &UtcDays, &git, 7).is_none());
         assert!(apply(&mut st, &ev("SessionStart", "h", "/w/x"), D0 + 1, &UtcDays, &git, 7).is_none());
         assert!(apply(&mut st, &ev("SessionStart", "i", "/w/x/vendor"), D0, &UtcDays, &git, 7).is_none());
+    }
+
+    #[test]
+    fn one_start_names_one_desk_in_its_switch_question_and_its_notes_and_keeps_it() {
+        let mut st = State::default();
+        let a = desk_with_notes(&mut st);
+        let b = st.put_desk(crate::store::Desk { name: "Beta".into(), firmware_repos: vec!["/w/b".into()], ..Default::default() }, D0);
+        st.add_desk_note(&b, "on board Q, flash over SWD only", "user", None, D0).unwrap();
+        st.open_desk = Some(a.clone());
+        let git = FakeGit::default();
+        apply(&mut st, &ev("SessionStart", "s", "/w/x"), D0, &UtcDays, &git, 7);
+        assert_eq!(st.sessions["s"].start_desk.as_deref(), Some(a.as_str()));
+        // Resumed from another desk's repo: its first folder is still /w/x.
+        let out = apply(&mut st, &ev("SessionStart", "s", "/w/b/app"), D0 + H, &UtcDays, &git, 7).unwrap();
+        assert!(out.contains("this repo belongs to the desk \"Beta\"") && out.contains("standing notes for the desk \"Beta\""), "{out}");
+        assert!(out.contains("flash over SWD") && !out.contains("board Z"), "{out}");
+        assert_eq!((st.sessions["s"].cwd.as_str(), st.sessions["s"].desk_id.as_deref()), ("/w/x", Some(a.as_str())));
+        assert_eq!(st.notes_desk("s").as_deref(), Some(b.as_str()), "what it reads back and writes to is the desk it was told of");
+    }
+
+    #[test]
+    fn the_notes_a_session_hears_are_never_longer_than_the_cap() {
+        let mut st = State::default();
+        let k = st.put_desk(crate::store::Desk { name: "Alpha".into(), firmware_repos: vec!["/w/x".into()], ..Default::default() }, D0);
+        let full = vec!["x"; 125].join("\n");
+        let mut agent = false;
+        while st.add_desk_note(&k, &full, if agent { "agent" } else { "user" }, agent.then_some("s"), D0).is_ok() {
+            agent = !agent;
+        }
+        let block = desk_notes_text(&st, &k).unwrap();
+        let (head, list) = block.split_once('\n').unwrap();
+        assert!(head.starts_with(NOTES_HEAD) && list.starts_with("- x\n  x"), "{block}");
+        assert!(list.chars().count() <= crate::store::DESK_NOTES_MAX_CHARS, "{}", list.chars().count());
     }
 
     #[test]

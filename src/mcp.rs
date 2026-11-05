@@ -11,6 +11,7 @@
 //! put into the session's context.
 
 use crate::client::DeskClient;
+use crate::store::{desk_note_list, DeskNote};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
@@ -186,6 +187,22 @@ pub struct OpenParams {
     pub desk: String,
 }
 
+/// The pull's text followed by the standing notes `GET /sessions/{sid}`
+/// gives (decision 74): those the session heard at its start, repeated for
+/// one whose start hook was lost. Unchanged when there are none.
+fn with_desk_notes(text: &str, sess: &Value) -> String {
+    let notes: Vec<DeskNote> = serde_json::from_value(sess["desk_notes"].clone()).unwrap_or_default();
+    if notes.is_empty() {
+        return text.to_string();
+    }
+    format!(
+        "{}\n\n## Desk notes\nStanding notes for every session in this desk's repos, the ones this session was given at its \
+         start; follow them.\n{}\n",
+        text.trim_end(),
+        desk_note_list(&notes)
+    )
+}
+
 fn ok(v: Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(serde_json::to_string_pretty(&v).unwrap_or_default())]))
 }
@@ -251,19 +268,18 @@ impl DeskMcp {
         }
     }
 
-    #[tool(description = "Everything the desk holds about this session's work item: the Linear issue with its description and latest comments, PRs, sessions, notes (each memory file's newest state, the latest lines) and bench activity, newest first, cut at 16,000 characters. Call it when starting on the item or whenever you need its context. Use the desk session id from this session's context.")]
+    #[tool(description = "Everything the desk holds about this session's work item: the Linear issue with its description and latest comments, PRs, sessions, notes (each memory file's newest state, the latest lines) and bench activity, newest first, cut at 16,000 characters; then the standing notes of the desk this session was told of at its start. Call it when starting on the item or whenever you need its context. Use the desk session id from this session's context.")]
     async fn desk_work_item(&self, Parameters(p): Parameters<SessionParams>) -> Result<CallToolResult, McpError> {
         let sess = match self.client.get(&format!("/sessions/{}", p.session_id)).await {
             Ok(v) => v,
             Err(e) => return err(e),
         };
         let Some(item) = sess["work_item"]["id"].as_str() else {
-            return Ok(CallToolResult::success(vec![ContentBlock::text(
-                "This session is not on a work item yet. Ask the user which one it is and call desk_set_work_item.",
-            )]));
+            let ask = "This session is not on a work item yet. Ask the user which one it is and call desk_set_work_item.";
+            return Ok(CallToolResult::success(vec![ContentBlock::text(with_desk_notes(ask, &sess))]));
         };
         match self.client.get(&format!("/items/{}/brief", crate::uri::encode(item))).await {
-            Ok(v) => Ok(CallToolResult::success(vec![ContentBlock::text(v["text"].as_str().unwrap_or_default())])),
+            Ok(v) => Ok(CallToolResult::success(vec![ContentBlock::text(with_desk_notes(v["text"].as_str().unwrap_or_default(), &sess))])),
             Err(e) => err(e),
         }
     }
@@ -454,5 +470,28 @@ mod tests {
         let desk_note = tool("desk_add_desk_note");
         assert_eq!(serde_json::to_value(&desk_note.input_schema).unwrap()["required"], json!(["session_id", "text"]));
         assert!(desk_note.description.as_deref().unwrap_or_default().contains("Never part of Harvest"));
+    }
+
+    #[test]
+    fn the_pull_ends_with_the_desk_notes_the_session_was_given_and_the_brief_carries_none_itself() {
+        use crate::store::testing::UtcDays;
+        let mut st = crate::store::State::default();
+        let k = st.put_desk(crate::store::Desk { name: "Alpha".into(), ..Default::default() }, 0);
+        let w = st.create_item("Loader", None, 0);
+        st.items.get_mut(&w).unwrap().desk_id = Some(k.clone());
+        st.add_desk_note(&k, "in repo X, only app Y on board Z matters", "user", None, 0).unwrap();
+        st.add_desk_note(&k, "file F is another engineer's:\nreport findings, never open a fix branch", "agent", Some("s"), 0).unwrap();
+        let brief = crate::brief::render(&st, &crate::server::Cache::default(), &w, None, None, &UtcDays).unwrap();
+        assert!(!brief.contains("board Z") && !brief.contains("Desk notes"), "{brief}");
+        // What GET /sessions/{sid} answers.
+        let sess = json!({ "desk_id": k, "desk_notes": st.desk_notes_of(&k) });
+        let pull = with_desk_notes(&brief, &sess);
+        assert!(pull.starts_with(brief.trim_end()), "{pull}");
+        assert!(pull.ends_with(
+            "\n\n## Desk notes\nStanding notes for every session in this desk's repos, the ones this session was given at its start; \
+             follow them.\n- in repo X, only app Y on board Z matters\n\
+             - file F is another engineer's:\n  report findings, never open a fix branch (added by an agent)\n"
+        ), "{pull}");
+        assert_eq!(with_desk_notes(&brief, &json!({ "desk_id": null, "desk_notes": [] })), brief);
     }
 }
