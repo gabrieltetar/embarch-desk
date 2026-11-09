@@ -451,6 +451,16 @@ fn project_rows(acct: &Account, v: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// Every team in the workspace, as the server lists them; a team needs no
+/// project to be here.
+pub async fn teams(acct: &Account) -> Result<Vec<Value>> {
+    crate::refs::take_pages(crate::linear::TEAMS, |after: Option<String>| async move {
+        let v = call(acct, "list_teams", scoped(json!({ "limit": PAGE }), None, after)).await?;
+        Ok((v["teams"].as_array().cloned().unwrap_or_default(), next_cursor(&v)))
+    })
+    .await
+}
+
 /// As many matches as the GraphQL side returns.
 const SEARCH: usize = 20;
 

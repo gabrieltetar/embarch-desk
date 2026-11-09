@@ -383,6 +383,37 @@ pub async fn projects(accounts: &[Account]) -> Result<Vec<Value>> {
     Ok(out)
 }
 
+/// As many teams as one workspace is read for.
+pub const TEAMS: usize = 250;
+
+/// Every team in every connected workspace, a team with no project included —
+/// what an agent checks a key against, and the form's whole-team choices
+/// (decision 34).
+pub async fn teams(accounts: &[Account]) -> Result<Vec<Value>> {
+    let q = format!("{{ teams(first: {TEAMS}) {{ nodes {{ id key name }} }} }}");
+    let mut out = vec![];
+    for acct in accounts {
+        let nodes = if acct.mcp.is_some() {
+            linear_mcp::teams(acct).await?
+        } else {
+            gql(acct, &q, json!({})).await?["teams"]["nodes"].as_array().cloned().unwrap_or_default()
+        };
+        out.extend(team_rows(acct, &nodes));
+    }
+    Ok(out)
+}
+
+/// A workspace's teams in key order, each named with its account's label.
+pub(crate) fn team_rows(acct: &Account, nodes: &[Value]) -> Vec<Value> {
+    let mut rows: Vec<Value> = nodes
+        .iter()
+        .filter(|t| t["id"].is_string() && t["key"].is_string())
+        .map(|t| json!({ "account": acct.label, "id": t["id"], "key": t["key"], "name": t["name"] }))
+        .collect();
+    rows.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+    rows
+}
+
 /// Issues whose title contains the words — within the open desk's project
 /// when one is open — or the one a key names, wherever it is.
 pub async fn search(accounts: &[Account], query: &str, scope: Option<&LinearBinding>) -> Result<Vec<Value>> {
@@ -590,6 +621,21 @@ mod tests {
         assert!(all.contains("{ issues(") && !all.contains("viewer"), "{all}");
         let mine = open_query("($a: String)", OPEN_STATES, true);
         assert!(mine.contains("viewer { assignedIssues("), "{mine}");
+    }
+
+    #[test]
+    fn every_team_is_a_row_in_key_order_whether_or_not_it_holds_a_project() {
+        let acct = Account::new("personal", "t");
+        let nodes = json!([
+            { "id": "t2", "key": "ZED", "name": "Zed client" },
+            { "id": "t1", "key": "ABC", "name": "Abc client" },
+            { "id": null, "key": "BAD", "name": "No id" },
+        ]);
+        let rows = team_rows(&acct, nodes.as_array().unwrap());
+        assert_eq!(rows, vec![
+            json!({ "account": "personal", "id": "t1", "key": "ABC", "name": "Abc client" }),
+            json!({ "account": "personal", "id": "t2", "key": "ZED", "name": "Zed client" }),
+        ]);
     }
 
     #[tokio::test]

@@ -364,6 +364,14 @@ impl DeskMcp {
         }
     }
 
+    #[tool(description = "Every connected Linear workspace's teams: each team's key, name and id, with the workspace's account label, never a token. A team with no project is listed too. Check a key here when Linear says no connected workspace has it: a key whose team is missing is wrong, or its workspace is not connected.")]
+    async fn linear_teams(&self) -> Result<CallToolResult, McpError> {
+        match self.client.get("/linear/teams").await {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
     #[tool(description = "Find Linear issues by words in their title, or by key.")]
     async fn linear_search(&self, Parameters(p): Parameters<QueryParams>) -> Result<CallToolResult, McpError> {
         match self.client.post("/linear/search", json!({ "query": p.query })).await {
@@ -464,7 +472,8 @@ impl ServerHandler for DeskMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "embarch-desk: the one access point to Linear and Harvest, and the work item this session's \
              time and notes belong to. desk_work_item returns everything the desk holds about the session's \
-             item. Read Linear with linear_get_issue, linear_my_issues and linear_search; \
+             item. Read Linear with linear_get_issue, linear_my_issues and linear_search, and list the \
+             connected workspaces' team keys with linear_teams; \
              move a status with linear_set_status; propose a comment, an issue or a change to one with linear_draft_comment, \
              linear_draft_issue or linear_draft_edit — they wait for the user's Send on the Desk tab. Read Harvest with \
              harvest_entries and harvest_projects; time is never logged from a session: add notes with \
@@ -502,6 +511,15 @@ mod tests {
         let desk_note = tool("desk_add_desk_note");
         assert_eq!(serde_json::to_value(&desk_note.input_schema).unwrap()["required"], json!(["session_id", "text"]));
         assert!(desk_note.description.as_deref().unwrap_or_default().contains("Never part of Harvest"));
+    }
+
+    #[test]
+    fn the_team_list_is_a_linear_tool_that_takes_nothing() {
+        let tools = DeskMcp::linear_router().list_all();
+        let teams = tools.iter().find(|t| t.name == "linear_teams").expect("no tool linear_teams");
+        let schema = serde_json::to_value(&teams.input_schema).unwrap();
+        assert!(schema["required"].as_array().is_none_or(|r| r.is_empty()), "{schema}");
+        assert!(teams.description.as_deref().unwrap_or_default().contains("never a token"));
     }
 
     #[test]

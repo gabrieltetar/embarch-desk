@@ -18,6 +18,7 @@ One desk per project — a Linear project (or a whole team), a Harvest project a
 ## Linear
 
 - Read with `linear_get_issue` (description and latest comments, each with its `id` and the `parent` it replies under), `linear_my_issues`, `linear_search`.
+- `linear_teams` lists each connected workspace's teams (key, name, id) under its account label. When a key is refused with "no connected Linear workspace has", check its team key there before asking the user.
 - Move a status with `linear_set_status` — it goes straight through.
 - **Write prose only as a draft**: `linear_draft_comment`, `linear_draft_issue`, `linear_draft_edit`. Nothing is posted; the draft waits on the user's Desk tab for their Send. Write it the way it should be posted, then tell the user it is waiting there. If a voice or review skill applies to text going out under the user's name, follow it before drafting.
 - **An edit replaces the whole description**: read the issue first and send it complete. Its Send is refused if the description changed after you drafted; draft again from the current text.

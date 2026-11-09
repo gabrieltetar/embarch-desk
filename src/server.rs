@@ -145,6 +145,7 @@ pub fn router(app: Shared) -> Router {
         .route("/open", get(get_open).post(set_open))
         .route("/day/{date}", get(day))
         .route("/linear/projects", get(linear_projects))
+        .route("/linear/teams", get(linear_teams))
         .route("/github/repos", get(github_repos))
         .route("/harvest/entry/{account}/{id}", axum::routing::patch(edit_entry).delete(remove_entry))
         .route("/pickup", get(pickup))
@@ -2217,6 +2218,10 @@ async fn set_open(Ax(app): Ax<Shared>, Json(b): Json<OpenBody>) -> ApiResult {
 
 async fn linear_projects() -> ApiResult {
     Ok(Json(json!({ "projects": linear::projects(&linear_accounts()?).await? })))
+}
+
+async fn linear_teams() -> ApiResult {
+    Ok(Json(json!({ "teams": linear::teams(&linear_accounts()?).await? })))
 }
 
 async fn github_repos() -> ApiResult {
