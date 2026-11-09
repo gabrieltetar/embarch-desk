@@ -72,10 +72,9 @@ enum Cmd {
     },
     /// Is the desk up, and what does it see?
     Status,
-    /// List the desks and which one is open.
+    /// List the desks, the one the UI shows (*), and inside a Claude Code
+    /// session the one it works on.
     Desks,
-    /// Open a desk suite-wide by name or id, or `none`.
-    Open { desk: String },
 }
 
 #[derive(Subcommand)]
@@ -204,16 +203,11 @@ fn main() -> Result<()> {
                 );
             }
             if open.is_empty() {
-                println!("no desk open");
+                println!("the UI shows no desk");
             }
-            Ok(())
-        }),
-        Cmd::Open { desk } => runtime()?.block_on(async {
-            let c = client::DeskClient::new(Duration::from_secs(10))?;
-            let v = c.post("/open", serde_json::json!({ "desk": desk })).await?;
-            match v["desk"]["name"].as_str() {
-                Some(n) => println!("open: {n}"),
-                None => println!("no desk open"),
+            if let Some(s) = v.get("session") {
+                let name = s.as_str().and_then(|k| v["desks"].as_array()?.iter().find(|d| d["id"].as_str() == Some(k))?["name"].as_str());
+                println!("this session works on: {}", name.unwrap_or("no desk"));
             }
             Ok(())
         }),
@@ -290,7 +284,7 @@ async fn serve() -> Result<()> {
         .await
         .with_context(|| format!("binding {addr} — is another desk already running?"))?;
     tracing::info!("embarch-desk listening on http://{addr}");
-    server::publish_open(&app);
+    server::publish_desks(&app);
     let import_app = app.clone();
     tokio::spawn(async move { server::import_memories(&import_app).await });
     tokio::spawn(server::flush_loop(app.clone()));

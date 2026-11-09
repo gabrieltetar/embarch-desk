@@ -56,10 +56,12 @@ pub struct State {
     /// repos, firmware repos and saved bench (`embarch-open-desk-proposal.md`).
     #[serde(default)]
     pub desks: BTreeMap<String, Desk>,
-    /// The one desk the whole suite has open, or none — a bare repo, nothing
-    /// scoped.
-    #[serde(default)]
-    pub open_desk: Option<String>,
+    /// The desk the UI has selected, or none: whose cards the Desk tab shows
+    /// and whose repo the UI's tabs open. It scopes no session, which works
+    /// on its own desk ([`State::caller_desk`]). A state file from before
+    /// EMB-94 called it `open_desk`.
+    #[serde(default, alias = "open_desk")]
+    pub ui_desk: Option<String>,
     /// What Harvest already holds, per day: entries logged by hand, by the
     /// Harvest app, or by a tile's ✓. A tile proposes only the gap.
     #[serde(default)]
@@ -90,7 +92,7 @@ pub struct State {
     pub settings: Settings,
     /// Standing notes on a whole desk, by desk id (decision 74): working
     /// agreements every session in the desk's repos hears at its start.
-    /// Kept outside `Desk`, which the desk form rebuilds and `open-desk.json`
+    /// Kept outside `Desk`, which the desk form rebuilds and `desks.json`
     /// publishes, and outside `notes` and `tiles`, which Harvest reads.
     #[serde(default)]
     pub desk_notes: BTreeMap<String, Vec<DeskNote>>,
@@ -233,7 +235,7 @@ pub struct Desk {
     /// Absolute paths; the first is what the suite opens.
     #[serde(default)]
     pub firmware_repos: Vec<String>,
-    /// A saved bench in the firmware repo, proposed when the desk opens.
+    /// A saved bench in the firmware repo, proposed when the UI selects the desk.
     #[serde(default)]
     pub bench: Option<String>,
     #[serde(default)]
@@ -618,7 +620,7 @@ pub struct Draft {
     pub status: String,
     #[serde(default)]
     pub url: Option<String>,
-    /// The Linear project a new issue is filed into (the open desk's).
+    /// The Linear project a new issue is filed into (the session's desk's).
     #[serde(default)]
     pub project_id: Option<String>,
     /// The comment a comment draft replies under: its thread's head (75).
@@ -1337,15 +1339,15 @@ impl State {
         id
     }
 
-    /// Remove a desk: its items keep no desk, it is no longer open, and its
-    /// notes go with it. False when there was no such desk.
+    /// Remove a desk: its items keep no desk, the UI no longer shows it, and
+    /// its notes go with it. False when there was no such desk.
     pub fn delete_desk(&mut self, id: &str) -> bool {
         let found = self.desks.remove(id).is_some();
         for i in self.items.values_mut().filter(|i| i.desk_id.as_deref() == Some(id)) {
             i.desk_id = None;
         }
-        if self.open_desk.as_deref() == Some(id) {
-            self.open_desk = None;
+        if self.ui_desk.as_deref() == Some(id) {
+            self.ui_desk = None;
         }
         self.desk_notes.remove(id);
         found
@@ -1363,6 +1365,19 @@ impl State {
         self.desk_for_path(cwd)
             .or_else(|| sess.item_id.as_ref().and_then(|i| self.items.get(i)).and_then(|w| w.desk_id.clone()))
             .filter(|k| self.desks.contains_key(k))
+    }
+
+    /// The desk a caller works on (EMB-94). A session works on its own:
+    /// [`State::session_desk`] for the folder it runs in, or for one this
+    /// desk has not met yet, the desk holding that folder. A session on no
+    /// desk is unscoped, never the UI's. A caller naming no session is the
+    /// UI, a script or a terminal, and works on the UI's desk.
+    pub fn caller_desk(&self, session: Option<&str>, cwd: Option<&str>) -> Option<String> {
+        let Some(sid) = session else { return self.ui_desk.clone() };
+        match self.sessions.get(sid) {
+            Some(s) => self.session_desk(sid, cwd.unwrap_or(&s.cwd)),
+            None => cwd.and_then(|c| self.desk_for_path(c)),
+        }
     }
 
     /// A hidden session, or one stopped at the door for its ignored path:
@@ -2318,10 +2333,10 @@ mod tests {
         assert_eq!(st.desk_notes_of(&k)[0].text, "only app Y matters");
         let w = st.create_item("x", None, D0);
         st.items.get_mut(&w).unwrap().desk_id = Some(k.clone());
-        st.open_desk = Some(k.clone());
+        st.ui_desk = Some(k.clone());
         assert!(st.delete_desk(&k));
         assert!(st.desk_notes_of(&k).is_empty() && !st.desk_notes.contains_key(&k));
-        assert_eq!((st.items[&w].desk_id.as_ref(), st.open_desk.as_ref()), (None, None));
+        assert_eq!((st.items[&w].desk_id.as_ref(), st.ui_desk.as_ref()), (None, None));
         assert_eq!(st.desk_notes_of(&b).len(), 1, "another desk's notes stay");
         assert!(!st.delete_desk(&k));
     }
@@ -2347,6 +2362,30 @@ mod tests {
         st.sessions.insert("f".into(), f);
         assert_eq!(st.session_desk("f", "/w/x"), None);
         assert_eq!(st.session_desk("nobody", "/w/x"), None);
+    }
+
+    #[test]
+    fn a_caller_works_on_its_sessions_desk_and_only_a_caller_naming_no_session_on_the_uis() {
+        let mut st = State::default();
+        let a = alpha(&mut st);
+        let b = st.put_desk(Desk { name: "Beta".into(), firmware_repos: vec!["/w/b".into()], ..Default::default() }, D0);
+        st.ui_desk = Some(b.clone());
+        st.sessions.insert("s".into(), Session::new("s", "/w/x/app", D0));
+        st.sessions.insert("t".into(), Session::new("t", "/tmp/scratch", D0));
+        assert_eq!(st.caller_desk(Some("s"), Some("/w/x/app")).as_deref(), Some(a.as_str()), "its folder's, not the UI's");
+        assert_eq!(st.caller_desk(Some("s"), None).as_deref(), Some(a.as_str()), "the folder it was seen in");
+        assert_eq!(st.caller_desk(Some("t"), Some("/tmp/scratch")), None, "a session on no desk is unscoped");
+        assert_eq!(st.caller_desk(Some("new"), Some("/w/b/fw")).as_deref(), Some(b.as_str()), "an unmet session: its folder's");
+        assert_eq!(st.caller_desk(Some("new"), None), None);
+        assert_eq!(st.caller_desk(None, Some("/w/x")).as_deref(), Some(b.as_str()), "no session: the UI's");
+        st.ui_desk = None;
+        assert_eq!(st.caller_desk(None, None), None);
+    }
+
+    #[test]
+    fn a_state_file_from_before_names_the_uis_desk_open_desk() {
+        let st: State = serde_json::from_value(serde_json::json!({ "open_desk": "k1" })).unwrap();
+        assert_eq!(st.ui_desk.as_deref(), Some("k1"));
     }
 
     #[test]

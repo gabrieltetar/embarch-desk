@@ -410,11 +410,11 @@ fn view_sessions(st: &State, cache: &Cache, now: i64) -> Vec<Value> {
 }
 
 /// The Desk tab's whole view. `desk` scopes the cards to that desk instead
-/// of the open one, for a window on another desk (chat proposal 9).
+/// of the UI's, for a window on another desk (chat proposal 9).
 pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, desk: Option<&str>, days: &dyn Days) -> Value {
     let today = days.date(now);
     let open = open_tile_keys(st);
-    let scope = desk.map(str::to_string).or_else(|| st.open_desk.clone());
+    let scope = desk.map(str::to_string).or_else(|| st.ui_desk.clone());
     let in_open = |i: &store::WorkItem| scope.is_none() || i.desk_id == scope;
     let mut items: Vec<&store::WorkItem> =
         st.items.values().filter(|i| visible(st, i, now, window_days, &open) && in_open(i)).collect();
@@ -500,7 +500,7 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, desk: Op
         "drafts": st.drafts.values().filter(|d| d.status == "open").collect::<Vec<_>>(),
         "hand": hand,
         "desks": st.desks.values().collect::<Vec<_>>(),
-        "open_desk": st.open_desk.as_ref().and_then(|k| st.desks.get(k)),
+        "open_desk": st.ui_desk.as_ref().and_then(|k| st.desks.get(k)),
         "desk_notes": scope.as_ref().filter(|k| st.desks.contains_key(*k)).map(|k| {
             let mut v = desk_notes_body(st, k);
             v["desk_id"] = json!(k);
@@ -547,7 +547,7 @@ async fn view(Ax(app): Ax<Shared>, Query(q): Query<ViewQuery>) -> ApiResult {
     // seconds; the view's timer counts from its start.
     let (mut v, viewed) = {
         let cache = app.cache.lock().expect("cache");
-        app.db.read(|st| (view_json(st, &cache, now, app.window_days, desk.as_deref(), &LocalDays), desk.clone().or(st.open_desk.clone())))
+        app.db.read(|st| (view_json(st, &cache, now, app.window_days, desk.as_deref(), &LocalDays), desk.clone().or(st.ui_desk.clone())))
     };
     // When the viewed desk's reference index last changed: a client
     // re-reads `/refs` only when it moves (decision 56).
@@ -555,12 +555,12 @@ async fn view(Ax(app): Ax<Shared>, Query(q): Query<ViewQuery>) -> ApiResult {
     Ok(Json(v))
 }
 
-/// The reference index of the named desk, else the open one (decision 56):
+/// The reference index of the named desk, else the UI's (decision 56):
 /// every issue in its Linear scope and every PR in its repos, from memory —
 /// the sync loop refreshes it, so a request never waits on Linear or GitHub.
-/// With no desk open and none named, an empty index naming no desk.
+/// With no desk selected in the UI and none named, an empty index naming no desk.
 async fn refs_route(Ax(app): Ax<Shared>, Query(q): Query<ViewQuery>) -> ApiResult {
-    let desk = named_desk(&app, &q)?.or_else(|| app.db.read(|st| st.open_desk.clone()));
+    let desk = named_desk(&app, &q)?.or_else(|| app.db.read(|st| st.ui_desk.clone()));
     Ok(Json(app.refs.json(desk.as_deref())))
 }
 
@@ -1592,12 +1592,36 @@ async fn linear_issue(Path(key): Path<String>) -> ApiResult {
     Ok(Json(linear::read_issue(&linear_accounts()?, key.trim()).await?))
 }
 
-fn open_linear(app: &App) -> Option<store::LinearBinding> {
-    app.db.read(|st| st.open_desk.as_ref().and_then(|k| st.desks.get(k)).and_then(|d| d.linear.clone()))
+/// Who a call comes from (EMB-94): the session and folder a `DeskClient`
+/// sends, or neither for the UI, a script or a terminal.
+fn caller(headers: &HeaderMap) -> (Option<String>, Option<String>) {
+    let read = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    (read(crate::client::SESSION_HEADER), read(crate::client::CWD_HEADER))
 }
 
-async fn linear_mine(Ax(app): Ax<Shared>) -> ApiResult {
-    let scope = open_linear(&app);
+/// The desk a call works on: its session's own, else the UI's
+/// ([`State::caller_desk`]). `session` stands in for a call that names its
+/// session in its body rather than its headers.
+fn caller_desk(app: &App, headers: &HeaderMap, session: Option<&str>) -> Option<String> {
+    let (sid, cwd) = caller(headers);
+    app.db.read(|st| st.caller_desk(sid.as_deref().or(session), cwd.as_deref()))
+}
+
+/// The Linear scope of the desk a call works on; `None` searches everything.
+fn caller_linear(app: &App, headers: &HeaderMap, session: Option<&str>) -> Option<store::LinearBinding> {
+    let desk = caller_desk(app, headers, session)?;
+    app.db.read(|st| st.desks.get(&desk).and_then(|d| d.linear.clone()))
+}
+
+async fn linear_mine(Ax(app): Ax<Shared>, headers: HeaderMap) -> ApiResult {
+    let scope = caller_linear(&app, &headers, None);
     let (issues, truncated) = linear::my_issues(&linear_accounts()?, scope.as_ref()).await?;
     Ok(Json(json!({
         "scope": scope.as_ref().map(|b| b.project_name.clone()),
@@ -1607,8 +1631,8 @@ async fn linear_mine(Ax(app): Ax<Shared>) -> ApiResult {
 }
 
 /// Every open issue in scope, assigned or not (decision 71).
-async fn linear_open(Ax(app): Ax<Shared>) -> ApiResult {
-    let scope = open_linear(&app);
+async fn linear_open(Ax(app): Ax<Shared>, headers: HeaderMap) -> ApiResult {
+    let scope = caller_linear(&app, &headers, None);
     let (issues, truncated) = linear::open_issues(&linear_accounts()?, scope.as_ref()).await?;
     Ok(Json(json!({
         "scope": scope.as_ref().map(|b| b.project_name.clone()),
@@ -1629,11 +1653,11 @@ struct SearchBody {
     query: String,
 }
 
-async fn linear_search(Ax(app): Ax<Shared>, Json(b): Json<SearchBody>) -> ApiResult {
+async fn linear_search(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<SearchBody>) -> ApiResult {
     if b.query.trim().is_empty() {
         return Err(bad("an empty search"));
     }
-    let scope = open_linear(&app);
+    let scope = caller_linear(&app, &headers, None);
     Ok(Json(json!({
         "scope": scope.as_ref().map(|b| b.project_name.clone()),
         "issues": linear::search(&linear_accounts()?, &b.query, scope.as_ref()).await?,
@@ -1704,12 +1728,12 @@ fn clean(s: &Option<String>) -> Option<String> {
 
 /// An agent's proposed comment or issue. Nothing is sent: it waits on the
 /// Desk tab for the user's Send, as they leave it.
-async fn create_draft(Ax(app): Ax<Shared>, Json(b): Json<NewDraft>) -> ApiResult {
+async fn create_draft(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<NewDraft>) -> ApiResult {
     let now = now_ms();
     let issue_key = clean(&b.issue_key).map(|k| k.to_ascii_uppercase());
-    let desk_linear = open_linear(&app);
+    let desk_linear = caller_linear(&app, &headers, clean(&b.session_id).as_deref());
     let named_team = clean(&b.team_key).map(|k| k.to_ascii_uppercase());
-    // A new issue with no team named goes into the open desk's project.
+    // A new issue with no team named goes into the session's desk's project.
     let project_id = if b.kind == "linear_issue" && named_team.is_none() {
         desk_linear.as_ref().map(|l| l.project_id.clone()).filter(|p| !p.is_empty())
     } else {
@@ -1717,7 +1741,7 @@ async fn create_draft(Ax(app): Ax<Shared>, Json(b): Json<NewDraft>) -> ApiResult
     };
     let team_key = named_team.or_else(|| desk_linear.as_ref().filter(|_| b.kind == "linear_issue").map(|l| l.team_key.clone()).filter(|k| !k.is_empty()));
     let title = clean(&b.title);
-    // A Project named outright wins over the open desk's, and needs a team to look in.
+    // A Project named outright wins over the desk's, and needs a team to look in.
     let project_id = match clean(&b.project).filter(|_| b.kind == "linear_issue") {
         Some(name) => {
             let Some(team) = team_key.as_deref() else { return Err(bad("a project needs a team_key")) };
@@ -1729,7 +1753,7 @@ async fn create_draft(Ax(app): Ax<Shared>, Json(b): Json<NewDraft>) -> ApiResult
     match b.kind.as_str() {
         "linear_comment" | "linear_edit" if issue_key.is_none() => return Err(bad(format!("a {} draft needs issue_key", b.kind))),
         "linear_issue" if team_key.is_none() || title.is_none() => {
-            return Err(bad("an issue draft needs a title, and a team_key when no desk is open"))
+            return Err(bad("an issue draft needs a title, and a team_key when this session is on no desk"))
         }
         "linear_edit" if title.is_none() && b.body.trim().is_empty() => {
             return Err(bad("an edit draft needs a new title, a new description or both"))
@@ -2016,24 +2040,34 @@ async fn timer_stop(Ax(app): Ax<Shared>) -> ApiResult {
 // ---------------------------------------------------------------- desks
 //
 // One desk per project (embarch-open-desk-proposal.md): a Linear project, a
-// Harvest project and task, GitHub repos, firmware repos, a saved bench. One
-// is open suite-wide, or none. Other processes read the open one from
-// `open-desk.json` beside the state file, so neither embarch-api nor
-// embarch-ui has to reach this service to know it.
+// Harvest project and task, GitHub repos, firmware repos, a saved bench.
+// Each session works on its own desk (EMB-94); the UI's selected desk only
+// picks the cards it shows. Every desk is published as `desks.json` beside
+// the state file, so embarch-api still finds a session's desk by its folder
+// while this service is stopped.
 
-pub fn publish_open(app: &App) {
-    let body = app.db.read(|st| json!({ "desk": st.open_desk.as_ref().and_then(|k| st.desks.get(k)) }));
-    let path = match crate::paths::data_dir() {
-        Ok(d) => d.join("open-desk.json"),
-        Err(_) => return,
-    };
-    if let Err(e) = crate::paths::write_private(&path, body.to_string().as_bytes()) {
-        tracing::warn!("publishing the open desk failed: {e:#}");
+pub fn publish_desks(app: &App) {
+    let body = app.db.read(|st| json!({ "desks": st.desks.values().collect::<Vec<_>>() }));
+    let Ok(dir) = crate::paths::data_dir() else { return };
+    if let Err(e) = crate::paths::write_private(&dir.join("desks.json"), body.to_string().as_bytes()) {
+        tracing::warn!("publishing the desks failed: {e:#}");
     }
+    // The one suite-wide desk it replaced: a reader left on it would build
+    // whatever desk was open last.
+    let _ = std::fs::remove_file(dir.join("open-desk.json"));
 }
 
-async fn list_desks(Ax(app): Ax<Shared>) -> ApiResult {
-    Ok(Json(app.db.read(|st| json!({ "desks": st.desks.values().collect::<Vec<_>>(), "open": st.open_desk }))))
+/// Every desk, the UI's (`open`), and for a session's call the desk that
+/// session works on (`session`, null for none).
+async fn list_desks(Ax(app): Ax<Shared>, headers: HeaderMap) -> ApiResult {
+    let (sid, cwd) = caller(&headers);
+    Ok(Json(app.db.read(|st| {
+        let mut v = json!({ "desks": st.desks.values().collect::<Vec<_>>(), "open": st.ui_desk });
+        if sid.is_some() {
+            v["session"] = json!(st.caller_desk(sid.as_deref(), cwd.as_deref()));
+        }
+        v
+    })))
 }
 
 #[derive(Deserialize)]
@@ -2103,7 +2137,7 @@ async fn put_desk(Ax(app): Ax<Shared>, Json(b): Json<DeskBody>) -> ApiResult {
     })?;
     // Its scope may have moved: its reference index refreshes on the next tick.
     app.refs.forget_checked(Some(&id));
-    publish_open(&app);
+    publish_desks(&app);
     Ok(Json(json!({ "id": id })))
 }
 
@@ -2112,7 +2146,7 @@ async fn delete_desk(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     if !found {
         return Err(missing("no such desk"));
     }
-    publish_open(&app);
+    publish_desks(&app);
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -2183,23 +2217,24 @@ async fn remove_desk_note(Ax(app): Ax<Shared>, Path((id, nid)): Path<(String, St
 }
 
 async fn get_open(Ax(app): Ax<Shared>) -> ApiResult {
-    Ok(Json(app.db.read(|st| json!({ "desk": st.open_desk.as_ref().and_then(|k| st.desks.get(k)) }))))
+    Ok(Json(app.db.read(|st| json!({ "desk": st.ui_desk.as_ref().and_then(|k| st.desks.get(k)) }))))
 }
 
 #[derive(Deserialize)]
 struct OpenBody {
-    /// A desk's id or name; absent, null or "none" opens no desk.
+    /// A desk's id or name; absent, null or "none" selects no desk.
     #[serde(default)]
     desk: Option<String>,
 }
 
-/// Open a desk suite-wide (or none). Touches no hardware: its bench is only
-/// proposed, by the UI, and applied on the user's click.
+/// The UI's selection (or none): whose cards the Desk tab shows and whose
+/// repo the UI's tabs open. It scopes no session (EMB-94) and touches no
+/// hardware: the UI proposes the desk's bench and loads it on a click.
 async fn set_open(Ax(app): Ax<Shared>, Json(b): Json<OpenBody>) -> ApiResult {
     let want = b.desk.map(|d| d.trim().to_string()).filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case("none"));
     let desk = app.db.write(|st| match want {
         None => {
-            st.open_desk = None;
+            st.ui_desk = None;
             Ok::<_, ApiError>(None)
         }
         Some(w) => {
@@ -2207,11 +2242,10 @@ async fn set_open(Ax(app): Ax<Shared>, Json(b): Json<OpenBody>) -> ApiResult {
                 let names: Vec<String> = st.desks.values().map(|k| k.name.clone()).collect();
                 missing(format!("no desk {w:?}; there are: {}", names.join(", ")))
             })?;
-            st.open_desk = Some(d.id.clone());
+            st.ui_desk = Some(d.id.clone());
             Ok(Some(d))
         }
     })?;
-    publish_open(&app);
     app.cache.lock().expect("cache").pr_checked.clear();
     Ok(Json(json!({ "desk": desk })))
 }
@@ -2229,7 +2263,7 @@ async fn github_repos() -> ApiResult {
     Ok(Json(json!({ "repos": github::user_repos(&conns.github_accounts()).await? })))
 }
 
-/// One day's work, grouped by desk — the open one first — for the list under
+/// One day's work, grouped by desk — the UI's first — for the list under
 /// the cards: every work item with time, a line, bench activity or a session
 /// that day, with its links, what was done, its status and sessions.
 pub fn day_json(st: &State, date: &str, now: i64) -> Value {
@@ -2298,7 +2332,7 @@ pub fn day_json(st: &State, date: &str, now: i64) -> Value {
     let mut groups: Vec<(i32, String, Option<String>, Vec<Value>)> = vec![];
     for (desk, row) in rows {
         let (rank, name) = match &desk {
-            Some(k) if st.open_desk.as_ref() == Some(k) => (0, st.desks.get(k).map(|d| d.name.clone()).unwrap_or_default()),
+            Some(k) if st.ui_desk.as_ref() == Some(k) => (0, st.desks.get(k).map(|d| d.name.clone()).unwrap_or_default()),
             Some(k) => (1, st.desks.get(k).map(|d| d.name.clone()).unwrap_or_else(|| k.clone())),
             None => (2, "No desk".to_string()),
         };
@@ -2341,15 +2375,15 @@ async fn day(Ax(app): Ax<Shared>, Path(date): Path<String>) -> ApiResult {
 
 // ---------------------------------------------------------------- picking up an issue
 //
-// embarch-desk-sessions-proposal.md: the open desk's issues with no card
+// embarch-desk-sessions-proposal.md: the UI's desk's issues with no card
 // yet, and Start work — the issue to In Progress, a worktree beside the main
 // clone on Linear's branch, auto mode, the launch claim, and the VS Code
 // links with a prompt pre-filled: `/promptu --item …` when Promptu is on and
 // installed, else the read-and-summarize starter (decision 67). The owner
 // presses Enter: nothing documented submits a VS Code chat from outside.
 
-async fn pickup(Ax(app): Ax<Shared>) -> ApiResult {
-    let scope = open_linear(&app);
+async fn pickup(Ax(app): Ax<Shared>, headers: HeaderMap) -> ApiResult {
+    let scope = caller_linear(&app, &headers, None);
     let (issues, _) = linear::my_issues(&linear_accounts()?, scope.as_ref()).await?;
     let carded: std::collections::HashSet<String> = app.db.read(|st| {
         st.items
@@ -3186,7 +3220,7 @@ mod tests {
         crate::store::record_activity(&mut s1, D0 + 9 * H, &UtcDays);
         crate::store::record_activity(&mut s1, D0 + 10 * H, &UtcDays);
         st.sessions.insert("s".into(), s1);
-        st.open_desk = Some(a.clone());
+        st.ui_desk = Some(a.clone());
         let v = view_json(&st, &Cache::default(), D0 + 11 * H, 7, None, &UtcDays);
         let cards: Vec<&str> = v["cards"].as_array().unwrap().iter().map(|c| c["title"].as_str().unwrap()).collect();
         assert_eq!(cards, ["on alpha"]);
@@ -3194,7 +3228,7 @@ mod tests {
         assert_eq!(v["hand"][0]["desk"], "Beta");
         assert_eq!(v["hand"][0]["item_id"], wb.as_str());
         assert_eq!(v["open_desk"]["name"], "Alpha");
-        st.open_desk = None;
+        st.ui_desk = None;
         let all = view_json(&st, &Cache::default(), D0 + 11 * H, 7, None, &UtcDays);
         assert_eq!(all["cards"].as_array().unwrap().len(), 2, "no desk open shows every card");
     }
@@ -3209,7 +3243,7 @@ mod tests {
             st.items.get_mut(&w).unwrap().desk_id = Some(desk.clone());
             st.add_line(&w, "2026-10-22", "did a thing", "agent", D0 + H);
         }
-        st.open_desk = Some(b.clone());
+        st.ui_desk = Some(b.clone());
         let d = day_json(&st, "2026-10-22", D0 + 2 * H);
         let names: Vec<&str> = d["groups"].as_array().unwrap().iter().map(|g| g["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["Beta", "Alpha"]);
@@ -3262,7 +3296,7 @@ mod tests {
             crate::store::record_activity(&mut s, D0 + day * 24 * H + 10 * H, &UtcDays);
             st.sessions.insert(sid.into(), s);
         }
-        st.open_desk = Some(a.clone());
+        st.ui_desk = Some(a.clone());
         let v = view_json(&st, &Cache::default(), D0 + 35 * H, 7, None, &UtcDays);
         let hand: Vec<(&str, &str)> = v["hand"].as_array().unwrap().iter()
             .map(|t| (t["item_title"].as_str().unwrap(), t["date"].as_str().unwrap())).collect();
@@ -3735,7 +3769,7 @@ mod tests {
     #[tokio::test]
     async fn an_edit_needs_a_key_and_a_change_and_only_a_comment_takes_a_thread() {
         let (app, dir) = scratch_app();
-        let draft = |b: Value| create_draft(Ax(app.clone()), Json(serde_json::from_value(b).unwrap()));
+        let draft = |b: Value| create_draft(Ax(app.clone()), HeaderMap::new(), Json(serde_json::from_value(b).unwrap()));
         let refused = |r: ApiResult| match r { Err(ApiError(c, m)) => (c, m), Ok(_) => panic!("accepted") };
         let (c, m) = refused(draft(json!({"kind": "linear_edit", "body": "x"})).await);
         assert_eq!(c, StatusCode::BAD_REQUEST);
@@ -3937,7 +3971,7 @@ mod tests {
             st.items.get_mut(&w).unwrap().desk_id = Some(desk.clone());
             st.add_line(&w, "2026-10-22", "did a thing", "agent", D0 + H);
         }
-        st.open_desk = Some(a.clone());
+        st.ui_desk = Some(a.clone());
         let titles = |v: &Value| v["cards"].as_array().unwrap().iter().map(|c| c["title"].as_str().unwrap().to_string()).collect::<Vec<_>>();
         assert_eq!(titles(&view_json(&st, &Cache::default(), D0 + 2 * H, 7, None, &UtcDays)), ["on alpha"]);
         let v = view_json(&st, &Cache::default(), D0 + 2 * H, 7, Some(b.as_str()), &UtcDays);
@@ -4003,7 +4037,7 @@ mod tests {
         let a = app.db.write(|st| st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0));
         let b = app.db.write(|st| st.put_desk(store::Desk { name: "Beta".into(), ..Default::default() }, D0));
         assert_eq!(get_refs(&app, None).await.unwrap(), json!({"desk_id": null, "synced_ms": null, "issues": [], "prs": []}), "no desk open");
-        app.db.write(|st| st.open_desk = Some(a.clone()));
+        app.db.write(|st| st.ui_desk = Some(a.clone()));
         assert_eq!(get_refs(&app, None).await.unwrap(), json!({"desk_id": a, "synced_ms": null, "issues": [], "prs": []}), "empty before the first sync");
         assert_eq!(get_refs(&app, Some("k404")).await, Err(StatusCode::NOT_FOUND));
         let (scope, got) = refs_index();
@@ -4026,7 +4060,7 @@ mod tests {
         let a = app.db.write(|st| st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0));
         let b = app.db.write(|st| st.put_desk(store::Desk { name: "Beta".into(), ..Default::default() }, D0));
         assert_eq!(get_view(&app, None).await["refs_ms"], Value::Null, "no desk open");
-        app.db.write(|st| st.open_desk = Some(a.clone()));
+        app.db.write(|st| st.ui_desk = Some(a.clone()));
         assert_eq!(get_view(&app, None).await["refs_ms"], Value::Null, "before the first sync");
         let (scope, got) = refs_index();
         app.refs.apply(&b, &scope, got, D0 + H);
@@ -4038,10 +4072,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sessions_call_works_on_its_own_desk_and_one_naming_no_session_on_the_uis() {
+        let (app, dir) = scratch_app();
+        let desk = |name: &str, repo: &str, team: &str| store::Desk {
+            name: name.into(),
+            firmware_repos: vec![repo.into()],
+            linear: Some(store::LinearBinding { team_key: team.into(), ..Default::default() }),
+            ..Default::default()
+        };
+        let a = app.db.write(|st| st.put_desk(desk("Alpha", "/w/a", "AAA"), D0));
+        let b = app.db.write(|st| st.put_desk(desk("Beta", "/w/b", "BBB"), D0));
+        app.db.write(|st| {
+            st.ui_desk = Some(a.clone());
+            st.sessions.insert("s".into(), store::Session::new("s", "/w/b/app", D0));
+            st.sessions.insert("t".into(), store::Session::new("t", "/tmp/x", D0));
+        });
+        let from = |sid: &str, cwd: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(crate::client::SESSION_HEADER, sid.parse().unwrap());
+            h.insert(crate::client::CWD_HEADER, cwd.parse().unwrap());
+            h
+        };
+        let team = |h: &HeaderMap| caller_linear(&app, h, None).map(|l| l.team_key);
+        assert_eq!(team(&from("s", "/w/b/app")).as_deref(), Some("BBB"), "its own desk, not the UI's");
+        assert_eq!(team(&from("t", "/tmp/x")), None, "a session on no desk searches everything");
+        assert_eq!(team(&HeaderMap::new()).as_deref(), Some("AAA"), "the UI's own calls");
+        assert_eq!(caller_linear(&app, &HeaderMap::new(), Some("s")).map(|l| l.team_key).as_deref(), Some("BBB"), "a session named in the body");
+        let Ok(Json(v)) = list_desks(Ax(app.clone()), from("s", "/w/b/app")).await else { panic!("desks") };
+        assert_eq!((v["open"].as_str(), v["session"].as_str()), (Some(a.as_str()), Some(b.as_str())));
+        let Ok(Json(v)) = list_desks(Ax(app.clone()), from("t", "/tmp/x")).await else { panic!("desks") };
+        assert!(v["session"].is_null() && v.get("session").is_some(), "on no desk: null, not absent");
+        let Ok(Json(v)) = list_desks(Ax(app.clone()), HeaderMap::new()).await else { panic!("desks") };
+        assert!(v.get("session").is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn a_restarted_desk_serves_its_last_index_at_once() {
         let (app, dir) = scratch_app();
         let a = app.db.write(|st| st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0));
-        app.db.write(|st| st.open_desk = Some(a.clone()));
+        app.db.write(|st| st.ui_desk = Some(a.clone()));
         app.db.flush().unwrap();
         let (scope, got) = refs_index();
         app.refs.apply(&a, &scope, got, D0 + H);
@@ -4309,7 +4379,7 @@ mod tests {
         let n = st.add_desk_note(&a, "only app Y matters", "user", None, D0).unwrap();
         let v = view_json(&st, &Cache::default(), D0 + H, 7, None, &UtcDays);
         assert_eq!(v["desk_notes"], Value::Null, "no desk open");
-        st.open_desk = Some(a.clone());
+        st.ui_desk = Some(a.clone());
         let v = view_json(&st, &Cache::default(), D0 + H, 7, None, &UtcDays);
         assert_eq!(v["desk_notes"], json!({ "desk_id": a, "notes": [n], "used_chars": 21, "max_chars": 4000, "max_note_chars": 500 }));
         let other = view_json(&st, &Cache::default(), D0 + H, 7, Some(&b), &UtcDays);
@@ -4330,7 +4400,7 @@ mod tests {
         st.add_line(&w, "2026-10-22", "flashed the loader", "agent", D0 + H);
         st.add_desk_note(&k, "only app Y on board Z matters", "agent", Some("s"), D0 + H).unwrap();
         st.add_desk_note(&k, "never branch for file F", "user", None, D0 + H).unwrap();
-        st.open_desk = Some(k.clone());
+        st.ui_desk = Some(k.clone());
         let leaks = |s: &str| s.contains("board Z") || s.contains("file F");
         let day = st.day_notes(&w, "2026-10-22", &UtcDays);
         assert_eq!(day.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["flashed the loader"]);

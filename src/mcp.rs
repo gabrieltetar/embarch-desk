@@ -161,7 +161,7 @@ pub struct EditDraftParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct IssueDraftParams {
-    /// The Linear team key the issue goes to, e.g. ABC. Omit it to file into the open desk's Linear project.
+    /// The Linear team key the issue goes to, e.g. ABC. Omit it to file into this session's desk's Linear project.
     #[serde(default)]
     pub team_key: Option<String>,
     pub title: String,
@@ -200,12 +200,6 @@ pub struct TimerParams {
     /// The desk a new standalone item belongs to (name or id, or "none") — ask the user.
     #[serde(default)]
     pub desk: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct OpenParams {
-    /// The desk's name or id; "none" opens no desk (a bare firmware repo, nothing scoped).
-    pub desk: String,
 }
 
 /// The pull's text followed by the standing notes `GET /sessions/{sid}`
@@ -356,7 +350,7 @@ impl DeskMcp {
         }
     }
 
-    #[tool(description = "The user's open Linear issues (assigned to them, not done or canceled), in every connected workspace, most recently updated first.")]
+    #[tool(description = "The user's open Linear issues (assigned to them, not done or canceled), in this session's desk's Linear project or team (its folder's desk, else its work item's), or every connected workspace when it is on no desk; most recently updated first.")]
     async fn linear_my_issues(&self) -> Result<CallToolResult, McpError> {
         match self.client.get("/linear/mine").await {
             Ok(v) => ok(v),
@@ -372,7 +366,7 @@ impl DeskMcp {
         }
     }
 
-    #[tool(description = "Find Linear issues by words in their title, or by key.")]
+    #[tool(description = "Find Linear issues by words in their title, within this session's desk's Linear project or team (everywhere when it is on no desk), or by key anywhere.")]
     async fn linear_search(&self, Parameters(p): Parameters<QueryParams>) -> Result<CallToolResult, McpError> {
         match self.client.post("/linear/search", json!({ "query": p.query })).await {
             Ok(v) => ok(v),
@@ -441,17 +435,9 @@ impl DeskMcp {
         }
     }
 
-    #[tool(description = "The desks — one per project: its Linear project, Harvest project and task, GitHub repos, firmware repos and saved bench — and which one is open.")]
+    #[tool(description = "The desks — one per project: its Linear project, Harvest project and task, GitHub repos, firmware repos and saved bench — the one this session works on (`session`: its folder's desk, else its work item's, null for none), and the one the UI shows (`open`).")]
     async fn desk_list_desks(&self) -> Result<CallToolResult, McpError> {
         match self.client.get("/desks").await {
-            Ok(v) => ok(v),
-            Err(e) => err(e),
-        }
-    }
-
-    #[tool(description = "Open a desk suite-wide, only when the user says to (\"switch to the X desk\", or yes to the desk's switch question): the UI, the agents' Linear and GitHub scope and embarch-api's default build target follow it; its saved bench is proposed in the UI, never applied by this tool. desk \"none\" opens no desk.")]
-    async fn desk_open(&self, Parameters(p): Parameters<OpenParams>) -> Result<CallToolResult, McpError> {
-        match self.client.post("/open", json!({ "desk": p.desk })).await {
             Ok(v) => ok(v),
             Err(e) => err(e),
         }

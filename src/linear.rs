@@ -231,7 +231,7 @@ fn issue_rows(acct: &Account, nodes: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// The accounts a scoped call asks: the open desk's one, or every one.
+/// The accounts a scoped call asks: its desk's one, or every one.
 fn in_scope<'a>(accounts: &'a [Account], scope: Option<&LinearBinding>) -> Vec<&'a Account> {
     match scope {
         Some(b) => accounts.iter().filter(|a| a.label == b.account).collect(),
@@ -254,8 +254,8 @@ const ROW_FIELDS: &str = "nodes { identifier title url updatedAt state { name } 
 /// Most open issues read per workspace (spec.md §4).
 pub const MINE_CAP: usize = 500;
 
-/// Open issues assigned to the user — in the open desk's Linear project when
-/// one is open, else in every connected workspace — and whether `MINE_CAP`
+/// Open issues assigned to the user — in the caller's desk's Linear scope when
+/// it has one, else in every connected workspace — and whether `MINE_CAP`
 /// cut any workspace's list.
 pub async fn my_issues(accounts: &[Account], scope: Option<&LinearBinding>) -> Result<(Vec<Value>, bool)> {
     open_rows(accounts, scope, true).await
@@ -414,8 +414,8 @@ pub(crate) fn team_rows(acct: &Account, nodes: &[Value]) -> Vec<Value> {
     rows
 }
 
-/// Issues whose title contains the words — within the open desk's project
-/// when one is open — or the one a key names, wherever it is.
+/// Issues whose title contains the words — within the caller's desk's scope
+/// when it has one — or the one a key names, wherever it is.
 pub async fn search(accounts: &[Account], query: &str, scope: Option<&LinearBinding>) -> Result<Vec<Value>> {
     if let Some(key) = crate::store::issue_key_in(query).filter(|k| k.eq_ignore_ascii_case(query.trim())) {
         return Ok(match read_issue(accounts, &key).await {

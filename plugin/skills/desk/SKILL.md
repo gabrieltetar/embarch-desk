@@ -9,11 +9,11 @@ The desk is **the one access point to Linear and Harvest**, and it tracks this s
 
 ## Desks
 
-One desk per project — a Linear project (or a whole team), a Harvest project and task, its GitHub repos, firmware repo and saved bench. **One desk is open suite-wide**, and your Linear and GitHub tools are scoped to it; with no desk open they search everything. `desk_list_desks` says which exist and which is open.
+One desk per project — a Linear project (or a whole team), a Harvest project and task, its GitHub repos, firmware repo and saved bench. **This session works on its own desk**: the desk holding its folder, else its work item's desk. Your Linear tools are scoped to it; on no desk they search everything. `desk_list_desks` says which desks exist, which one this session works on (`session`) and which one the UI shows (`open`).
 
-- **Switch only when the user says so**, with `desk_open` ("none" closes it). If the context says this session started in another desk's repo, ask the user once whether to switch; either way the session's time goes to its own desk.
+- **Nothing to switch.** Other sessions work on their own desks at the same time, and the desk the user picks in the UI only chooses the cards it shows.
 - **A new standalone work item needs its desk** — ask which (`desk` on `desk_set_work_item`, `desk_create_item`, `desk_timer_start`).
-- `embarch-api` tools build the open desk's firmware repo when no project is named.
+- `embarch-api` tools build this session's desk's firmware repo when no project is named.
 
 ## Linear
 

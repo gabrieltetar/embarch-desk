@@ -80,13 +80,9 @@ fn is_git_commit(input: &Option<Value>) -> bool {
 
 /// The line a session is shown when it has no work item.
 pub fn ask_text(state: &State, session_id: &str, now: i64, window_days: i64) -> String {
-    // The session's own desk first, else the open one: the cards it is most
-    // likely to be.
-    let scope = state
-        .sessions
-        .get(session_id)
-        .and_then(|s| s.desk_id.clone())
-        .or_else(|| state.open_desk.clone());
+    // The session's own desk's cards, the ones it is most likely to be; on
+    // no desk, every desk's. Never the UI's (EMB-94).
+    let scope = state.sessions.get(session_id).and_then(|s| s.desk_id.clone());
     let mut items: Vec<_> = state
         .items
         .values()
@@ -144,26 +140,6 @@ fn assigned_text(state: &State, session_id: &str, item_id: &str) -> String {
          — kind done for work finished without a commit, finding, decision, handoff or todo — \
          too many rather than too few. Commits and memory files are added automatically."
     )
-}
-
-/// When a session starts in one desk's repo while another (or none) is open:
-/// the one-time question, and the rule that its time is its own desk's. The
-/// repo is the one it starts in now, whose desk is also the one whose notes
-/// the same start gives it.
-fn switch_text(state: &State, cwd: &str) -> Option<String> {
-    let own = &state.desk_for_path(cwd)?;
-    if state.open_desk.as_ref() == Some(own) {
-        return None;
-    }
-    let name = |id: &String| state.desks.get(id).map(|d| d.name.clone()).unwrap_or_else(|| id.clone());
-    let open = state.open_desk.as_ref().map(name).unwrap_or_else(|| "no desk".to_string());
-    Some(format!(
-        "EmbArch Desk: this repo belongs to the desk \"{}\", but \"{open}\" is open. Ask the user \
-         once whether to switch the open desk to \"{}\" (the `desk_open` tool) — that also moves \
-         the UI, the agents' Linear and GitHub scope and the default build target, and proposes \
-         its bench. Either way, this session's time goes to \"{}\".",
-        name(own), name(own), name(own)
-    ))
 }
 
 /// A desk's standing notes as a session hears them (decision 74), or none
@@ -309,9 +285,8 @@ pub fn apply(
         ("SessionStart", None) => Some(unasked_text(&ev.session_id)),
         _ => None,
     };
-    let switch = start.then(|| switch_text(state, &cwd)).flatten();
     let notes = if start { start_notes(state, &ev.session_id, &cwd) } else { None };
-    let parts: Vec<String> = [main, switch, notes].into_iter().flatten().collect();
+    let parts: Vec<String> = [main, notes].into_iter().flatten().collect();
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
@@ -500,20 +475,21 @@ mod tests {
     }
 
     #[test]
-    fn a_session_in_another_desks_repo_is_asked_once_to_switch_and_keeps_its_desk() {
+    fn a_session_in_a_desk_the_ui_does_not_show_works_on_its_own_and_is_asked_nothing_about_it() {
         let mut st = State::default();
         let a = st.put_desk(crate::store::Desk { name: "Alpha".into(), firmware_repos: vec!["/w/a".into()], ..Default::default() }, D0);
         let b = st.put_desk(crate::store::Desk { name: "Beta".into(), firmware_repos: vec!["/w/b".into()], ..Default::default() }, D0);
-        st.open_desk = Some(a);
+        let w = st.create_item("on alpha", None, D0);
+        st.items.get_mut(&w).unwrap().desk_id = Some(a.clone());
+        st.ui_desk = Some(a.clone());
         let git = FakeGit::default();
         let out = apply(&mut st, &ev("SessionStart", "s", "/w/b/app"), D0, &UtcDays, &git, 7).unwrap();
-        assert!(out.contains("\"Beta\"") && out.contains("desk_open"), "{out}");
+        assert!(!out.contains("desk_open") && !out.contains("switch"), "{out}");
+        assert!(!out.contains("on alpha"), "it is offered its own desk's cards, not the UI's: {out}");
         assert_eq!(st.sessions["s"].desk_id.as_deref(), Some(b.as_str()));
-        let again = apply(&mut st, &ev("UserPromptSubmit", "s", "/w/b/app"), D0 + 1, &UtcDays, &git, 7).unwrap();
-        assert!(!again.contains("desk_open"), "the switch question is asked once, at start");
-        st.open_desk = Some(b);
-        let in_open = apply(&mut st, &ev("SessionStart", "t", "/w/b"), D0 + 2, &UtcDays, &git, 7).unwrap();
-        assert!(!in_open.contains("desk_open"));
+        assert_eq!(st.caller_desk(Some("s"), Some("/w/b/app")).as_deref(), Some(b.as_str()));
+        st.ui_desk = None;
+        assert_eq!(st.caller_desk(Some("s"), Some("/w/b/app")).as_deref(), Some(b.as_str()), "the UI moves nothing for it");
     }
 
     fn write(sid: &str, tool: &str, path: &str) -> HookEvent {
@@ -732,18 +708,18 @@ mod tests {
     }
 
     #[test]
-    fn one_start_names_one_desk_in_its_switch_question_and_its_notes_and_keeps_it() {
+    fn one_start_names_one_desk_in_its_notes_and_keeps_it() {
         let mut st = State::default();
         let a = desk_with_notes(&mut st);
         let b = st.put_desk(crate::store::Desk { name: "Beta".into(), firmware_repos: vec!["/w/b".into()], ..Default::default() }, D0);
         st.add_desk_note(&b, "on board Q, flash over SWD only", "user", None, D0).unwrap();
-        st.open_desk = Some(a.clone());
+        st.ui_desk = Some(a.clone());
         let git = FakeGit::default();
         apply(&mut st, &ev("SessionStart", "s", "/w/x"), D0, &UtcDays, &git, 7);
         assert_eq!(st.sessions["s"].start_desk.as_deref(), Some(a.as_str()));
         // Resumed from another desk's repo: its first folder is still /w/x.
         let out = apply(&mut st, &ev("SessionStart", "s", "/w/b/app"), D0 + H, &UtcDays, &git, 7).unwrap();
-        assert!(out.contains("this repo belongs to the desk \"Beta\"") && out.contains("standing notes for the desk \"Beta\""), "{out}");
+        assert!(out.contains("standing notes for the desk \"Beta\"") && !out.contains("belongs to the desk"), "{out}");
         assert!(out.contains("flash over SWD") && !out.contains("board Z"), "{out}");
         assert_eq!((st.sessions["s"].cwd.as_str(), st.sessions["s"].desk_id.as_deref()), ("/w/x", Some(a.as_str())));
         assert_eq!(st.notes_desk("s").as_deref(), Some(b.as_str()), "what it reads back and writes to is the desk it was told of");
@@ -772,7 +748,7 @@ mod tests {
         for id in ids {
             st.delete_desk_note(&k, &id).unwrap();
         }
-        st.open_desk = Some(k);
+        st.ui_desk = Some(k);
         let git = FakeGit::default();
         let out = apply(&mut st, &ev("SessionStart", "s", "/w/x"), D0, &UtcDays, &git, 7).unwrap();
         assert!(!out.contains("standing notes"), "{out}");
