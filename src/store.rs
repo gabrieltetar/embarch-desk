@@ -211,6 +211,12 @@ pub struct LinearBinding {
 }
 
 impl LinearBinding {
+    /// What a search on this binding names as the scope it searched: the
+    /// project when one is named, else `team <KEY>` (decision 34).
+    pub fn scope_label(&self) -> String {
+        if self.project_name.is_empty() { format!("team {}", self.team_key) } else { self.project_name.clone() }
+    }
+
     pub fn holds(&self, issue: &IssueRef) -> bool {
         if !self.project_id.is_empty() {
             !issue.project_id.is_empty() && issue.project_id == self.project_id
@@ -1973,7 +1979,9 @@ mod tests {
         assert_eq!(st.desk_for_path("/w/b/app/src").as_deref(), Some(b.as_str()));
         assert_eq!(st.desk_for_path("/w/bb"), None);
         assert_eq!(st.desk_by_name_or_id("b").map(|d| d.id.clone()), Some(b));
-        let team = LinearBinding { team_id: "t-c".into(), ..Default::default() };
+        let team = LinearBinding { team_id: "t-c".into(), team_key: "EMB".into(), ..Default::default() };
+        assert_eq!(team.scope_label(), "team EMB");
+        assert_eq!(LinearBinding { project_name: "Fw".into(), team_key: "EMB".into(), ..Default::default() }.scope_label(), "Fw");
         let c = st.put_desk(Desk { name: "C".into(), linear: Some(team), ..Default::default() }, D0);
         let in_team = IssueRef { key: "C-1".into(), team_id: "t-c".into(), project_id: "any".into(), ..Default::default() };
         assert_eq!(st.desk_for_issue(&in_team), Some(c), "a desk bound to a whole team takes all its projects");

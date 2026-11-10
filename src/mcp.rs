@@ -369,7 +369,7 @@ impl DeskMcp {
         }
     }
 
-    #[tool(description = "Find Linear issues by words in their title, within this session's desk's Linear project or team (everywhere when it is on no desk), or by key anywhere.")]
+    #[tool(description = "Find Linear issues by words in their title, within this session's desk's Linear project or team (everywhere when it is on no desk), or by key anywhere. The answer's scope names the project or team a word query searched; a key reads the issue from any connected workspace.")]
     async fn linear_search(&self, Parameters(p): Parameters<QueryParams>) -> Result<CallToolResult, McpError> {
         match self.client.post("/linear/search", json!({ "query": p.query })).await {
             Ok(v) => ok(v),

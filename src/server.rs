@@ -1695,7 +1695,7 @@ async fn linear_search(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<Se
     }
     let scope = caller_linear(&app, &headers, None);
     Ok(Json(json!({
-        "scope": scope.as_ref().map(|b| b.project_name.clone()),
+        "scope": scope.as_ref().map(|b| b.scope_label()),
         "issues": linear::search(&linear_accounts()?, &b.query, scope.as_ref()).await?,
     })))
 }
@@ -2436,7 +2436,7 @@ async fn pickup(Ax(app): Ax<Shared>, headers: HeaderMap) -> ApiResult {
         .into_iter()
         .filter(|i| i["key"].as_str().is_some_and(|k| !carded.contains(&k.to_ascii_uppercase())))
         .collect();
-    Ok(Json(json!({ "scope": scope.map(|b| if b.project_name.is_empty() { format!("team {}", b.team_key) } else { b.project_name }), "issues": open })))
+    Ok(Json(json!({ "scope": scope.map(|b| b.scope_label()), "issues": open })))
 }
 
 pub fn start_prompt(issue: &store::IssueRef, item_id: &str, branch: &str) -> String {
