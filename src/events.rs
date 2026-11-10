@@ -8,7 +8,7 @@
 //!   id — the tools need it, and nothing else identifies a session to them —
 //!   and its desk's standing notes (decision 74).
 //! - **UserPromptSubmit** on a session with no work item asks, every prompt,
-//!   until it is answered (proposal decision 7), unless time is off (decision 72).
+//!   until it is answered, an issue key in its opening prompt or a handoff taken first (proposal decision 7), unless time is off (decision 72).
 //! - **PostToolUse** turns a `git commit` into a tile line, an
 //!   `embarch-api` build, flash or study into bench activity, and a write
 //!   to a Claude Code memory file into the item's memory note.
@@ -104,12 +104,16 @@ pub fn ask_text(state: &State, session_id: &str, now: i64, window_days: i64) -> 
         format!("open cards: {}", list.join("; "))
     };
     format!(
-        "EmbArch Desk: this session (desk session id `{session_id}`) is not on a work item, so \
-         its time has nowhere to land. Before anything else, ask the user in one line which work \
-         item it is — {choices} — or a Linear issue key, or a title for a new standalone item. \
-         Then call the `desk_set_work_item` tool with session_id `{session_id}` and the answer \
-         (a new standalone item also needs its desk — ask which). If the user says this is not \
-         tracked work, call it with untracked: true. Ask again on every prompt until it is answered."
+         "EmbArch Desk: this session (desk session id `{session_id}`) is not on a work item, so \
+         its time has nowhere to land. First look in what you already have: an issue key in the \
+         user's opening prompt or a handoff, of a team the desk's workspaces hold (`linear_teams` \
+         lists the keys; a lookalike in prose is not one). If there is one, call the \
+         `desk_set_work_item` tool with session_id `{session_id}` and that key, say in one line \
+         which item you chose, and do not ask. If there is none, ask the user in one line which \
+         work item it is — {choices} — or a Linear issue key, or a title for a new standalone \
+         item, then call the tool with the answer (a new standalone item also needs its desk — \
+         ask which). If the user says this is not tracked work, call it with untracked: true. \
+         With no key anywhere, ask again on every prompt until it is answered."
     )
 }
 
@@ -421,6 +425,8 @@ mod tests {
         let git = FakeGit::default();
         let a = apply(&mut st, &ev("SessionStart", "s", "/w/r"), D0, &UtcDays, &git, 7).unwrap();
         assert!(a.contains("desk_set_work_item") && a.contains("`s`"));
+        assert!(a.contains("opening prompt or a handoff") && a.contains("do not ask"), "{a}");
+        assert!(a.contains("ask the user in one line") && a.contains("ask again on every prompt"), "{a}");
         assert!(apply(&mut st, &ev("UserPromptSubmit", "s", "/w/r"), D0 + 1, &UtcDays, &git, 7).is_some());
         assert!(apply(&mut st, &ev("UserPromptSubmit", "s", "/w/r"), D0 + 2, &UtcDays, &git, 7).is_some());
         assert!(apply(&mut st, &ev("Stop", "s", "/w/r"), D0 + 3, &UtcDays, &git, 7).is_none());
@@ -638,7 +644,7 @@ mod tests {
         st.settings.time = false;
         let git = FakeGit::default();
         let start = apply(&mut st, &ev("SessionStart", "q", "/w/r"), D0, &UtcDays, &git, 7).unwrap();
-        assert!(start.contains("`q`") && start.contains("do not ask") && !start.contains("Ask again"), "{start}");
+        assert!(start.contains("`q`") && start.contains("do not ask") && !start.contains("ask again"), "{start}");
         assert!(apply(&mut st, &ev("UserPromptSubmit", "q", "/w/r"), D0, &UtcDays, &git, 7).is_none(), "a prompt hears nothing");
         assert!(st.sessions["q"].item_id.is_none() && !st.sessions["q"].ignored, "it stays listed, with no item");
         let w = st.create_item("x", None, D0);
