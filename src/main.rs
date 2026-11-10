@@ -8,6 +8,7 @@ mod client;
 mod connectors;
 mod db;
 mod events;
+mod files;
 mod github;
 mod harvest;
 mod hook;

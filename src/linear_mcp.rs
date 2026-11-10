@@ -187,6 +187,17 @@ fn not_here(e: &anyhow::Error) -> bool {
 /// One tool call, its answer parsed from the JSON text the server returns.
 /// A token refused before its time is renewed once and the call made again.
 async fn call(acct: &Account, tool: &str, args: Value) -> Result<Value> {
+    let body = post_tool(acct, tool, args).await?;
+    tool_result(&acct.label, tool, &body)
+}
+
+/// A token good for the next few minutes, for a fetch outside the MCP server.
+pub async fn access_token(acct: &Account) -> Result<String> {
+    token(acct, false).await
+}
+
+/// The raw reply body of one tool call; a refused token is renewed once.
+async fn post_tool(acct: &Account, tool: &str, args: Value) -> Result<String> {
     let mut tok = token(acct, false).await?;
     let mut renewed = false;
     loop {
@@ -207,8 +218,58 @@ async fn call(acct: &Account, tool: &str, args: Value) -> Result<Value> {
         if !status.is_success() {
             bail!("linear ({}): {tool}: HTTP {status}", acct.label);
         }
-        return tool_result(&acct.label, tool, &body);
+        return Ok(body);
     }
+}
+
+/// An upload read for an MCP sign-in (decision 81). Assumed, not measured: the
+/// sign-in's token is accepted by the upload host as a bearer. If the host
+/// refuses it, the server's own `extract_images` tool is asked for the image
+/// (assumed argument `markdown`). A file that is no image has no second way,
+/// and the answer names both attempts.
+pub async fn fetch_file(acct: &Account, url: &str) -> Result<crate::files::Fetched> {
+    let tok = access_token(acct).await?;
+    let refused = match crate::files::download(url, Some(("Authorization", format!("Bearer {tok}")))).await {
+        Ok(f) => return Ok(f),
+        Err(e) => match e.downcast_ref::<crate::files::HttpStatus>() {
+            Some(s) => s.to_string(),
+            None => return Err(e),
+        },
+    };
+    let by_tool = async {
+        let body = post_tool(acct, "extract_images", json!({ "markdown": format!("![]({url})") })).await?;
+        image_in(&body)
+    };
+    match by_tool.await {
+        Ok(f) => Ok(f),
+        Err(e) => Err(anyhow!(
+            "linear ({}): Linear's MCP sign-in could not fetch {url}: the upload host answered {refused} to its token, \
+             and the server's extract_images said: {e:#}",
+            acct.label
+        )),
+    }
+}
+
+/// The first image block of a tool reply.
+fn image_in(body: &str) -> Result<crate::files::Fetched> {
+    use base64::Engine;
+    let v = rpc_answer(body).ok_or_else(|| anyhow!("no answer in the MCP reply"))?;
+    if let Some(e) = v.get("error") {
+        bail!("{}", e["message"].as_str().unwrap_or("error"));
+    }
+    let r = &v["result"];
+    let blocks = r["content"].as_array().cloned().unwrap_or_default();
+    if r["isError"] == true {
+        bail!("{}", blocks.iter().filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join(" "));
+    }
+    let img = blocks.iter().find(|c| c["type"] == "image").ok_or_else(|| anyhow!("it returned no image"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(img["data"].as_str().unwrap_or_default())
+        .map_err(|e| anyhow!("its image was not base64: {e}"))?;
+    if bytes.len() > crate::files::MAX_BYTES {
+        bail!("the file is {} bytes, over the {}-byte cap; not fetched", bytes.len(), crate::files::MAX_BYTES);
+    }
+    Ok(crate::files::Fetched { mime: img["mimeType"].as_str().unwrap_or("image/png").to_string(), bytes })
 }
 
 /// The JSON-RPC answer in a body that is plain JSON or a server-sent event stream.
@@ -354,6 +415,10 @@ fn detail_from(acct: &Account, i: &Value, rows: &[Value], cut: bool, skip: usize
         "description": i["description"],
         "updated": i["updatedAt"],
     });
+    // Assumed, not measured: `get_issue` includes `attachments` ({title, url}) unasked,
+    // since asking for a field it lacks may fail the whole read.
+    let attachments = i["attachments"].as_array().cloned().unwrap_or_default();
+    v["files"] = json!(crate::files::files_of(i["description"].as_str(), &comments, &attachments));
     crate::linear::merge(&mut v, crate::linear::comment_fields(&comments, cut, skip));
     v
 }
@@ -596,6 +661,29 @@ mod tests {
         assert_eq!((i.state_name.as_str(), i.state_type.as_str(), i.team_id.as_str()), ("Todo", "unstarted", "t1"));
         assert_eq!((i.project_id.as_str(), i.branch_name.as_str(), i.refreshed_ms), ("p1", "me/abc-94-mac", 7));
         assert!(issue_from(&acct(), &json!("Could not find"), 7).is_none());
+    }
+
+    #[test]
+    fn an_mcp_issue_lists_its_upload_links_and_attachments_and_refuses_any_other_link() {
+        let up = "https://uploads.linear.app/w/1/2/shot.png";
+        let i = json!({ "id": "ABC-1", "description": format!("![s]({up})"), "attachments": [{"title": "PR", "url": "https://github.com/o/r/pull/2"}] });
+        let rows = vec![json!({"id": "c1", "author": {"name": "Ana"}, "createdAt": "1", "body": "![t](https://uploads.linear.app/w/9/9/9/log.txt)"})];
+        let d = detail_from(&acct(), &i, &rows, false, 0);
+        let found: Vec<&str> = d["files"].as_array().unwrap().iter().map(|f| f["found"].as_str().unwrap()).collect();
+        assert_eq!(found, ["description", "comment c1 by Ana", "attachment"]);
+        assert!(crate::files::require_listed(&d, "ABC-1", up).is_ok());
+        assert!(crate::files::require_listed(&d, "ABC-1", "https://uploads.linear.app/w/other/secret.png").is_err());
+    }
+
+    #[test]
+    fn the_servers_own_image_tool_answers_an_image_or_a_reason_the_fetch_names() {
+        let ok = r#"{"result":{"content":[{"type":"text","text":"1 image"},{"type":"image","data":"AQID","mimeType":"image/jpeg"}]}}"#;
+        let f = image_in(ok).unwrap();
+        assert_eq!((f.mime.as_str(), f.bytes.as_slice()), ("image/jpeg", [1u8, 2, 3].as_slice()));
+        let none = r#"{"result":{"content":[{"type":"text","text":"no images found"}]}}"#;
+        assert!(image_in(none).unwrap_err().to_string().contains("no image"));
+        let bad = r#"{"result":{"isError":true,"content":[{"type":"text","text":"Unknown argument markdown"}]}}"#;
+        assert!(image_in(bad).unwrap_err().to_string().contains("Unknown argument"));
     }
 
     #[test]

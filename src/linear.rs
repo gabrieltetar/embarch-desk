@@ -222,7 +222,7 @@ pub const COMMENTS_FETCH: usize = 50;
 async fn gql_detail(acct: &Account, key: &str, skip: usize) -> Result<Option<Value>> {
     let q = "query($id: String!) { issue(id: $id) { id identifier title url description priorityLabel \
              createdAt updatedAt state { id name type } team { id key name } assignee { name } \
-             project { name } labels { nodes { name } } } }";
+             project { name } labels { nodes { name } } attachments { nodes { title url } } } }";
     let i = match gql(acct, q, json!({ "id": key })).await {
         Ok(d) if d["issue"].is_object() => d["issue"].clone(),
         Ok(_) => return Ok(None),
@@ -295,8 +295,35 @@ fn detail_from(acct: &Account, i: &Value, rows: &[Value], cut: bool, skip: usize
         "description": i["description"],
         "updated": i["updatedAt"],
     });
+    let attachments = i["attachments"]["nodes"].as_array().cloned().unwrap_or_default();
+    v["files"] = json!(crate::files::files_of(i["description"].as_str(), &comments, &attachments));
     merge(&mut v, comment_fields(&comments, cut, skip));
     v
+}
+
+/// One file an issue lists (decision 81), read now with the credentials of the
+/// workspace that has the issue. A link the issue does not list is refused.
+pub async fn read_file(accounts: &[Account], key: &str, url: &str) -> Result<crate::files::Read> {
+    let issue = read_issue(accounts, key, 0).await?;
+    crate::files::require_listed(&issue, key, url)?;
+    let label = issue["workspace"].as_str().unwrap_or_default();
+    let acct = accounts.iter().find(|a| a.label == label).ok_or_else(|| anyhow!("no Linear account {label:?} connected"))?;
+    let host = crate::files::host_of(url)?;
+    let got = if host != crate::files::UPLOAD_HOST {
+        // A link out of Linear gets no credential.
+        crate::files::download(url, None).await?
+    } else if acct.mcp.is_some() {
+        linear_mcp::fetch_file(acct, url).await?
+    } else {
+        // Assumed, not measured: the bare key works on the upload host as it does on GraphQL.
+        crate::files::download(url, Some(("Authorization", acct.token.clone())))
+            .await
+            .map_err(|e| match e.downcast_ref::<crate::files::HttpStatus>() {
+                Some(s) => anyhow!("linear ({}): the workspace's API key was refused by the upload host ({s}) for {url}", acct.label),
+                None => e,
+            })?
+    };
+    crate::files::deliver(&crate::files::files_dir()?, key, url, got)
 }
 
 /// Copy `from`'s fields into `into`.
@@ -900,6 +927,23 @@ mod tests {
         let i = issue_from(&acct, &v, 5).unwrap();
         assert_eq!((i.key.as_str(), i.state_name.as_str(), i.account.as_str()), ("ABC-123", "In Progress", "work"));
         assert!(issue_from(&acct, &Value::Null, 5).is_none());
+    }
+
+    #[test]
+    fn an_api_key_issue_lists_its_upload_links_and_attachments_and_refuses_any_other_link() {
+        let up = "https://uploads.linear.app/w/1/2/shot.png";
+        let i = json!({
+            "identifier": "ABC-1", "description": format!("![s]({up})"),
+            "attachments": {"nodes": [{"title": "Spec", "url": "https://example.com/spec.pdf"}]}
+        });
+        let rows = vec![json!({"id": "c1", "body": "![t](https://uploads.linear.app/w/9/log.txt)", "createdAt": "1", "user": {"name": "Ana"}, "parent": null})];
+        let d = detail_from(&Account::new("work", "t"), &i, &rows, false, 0);
+        let found: Vec<&str> = d["files"].as_array().unwrap().iter().map(|f| f["found"].as_str().unwrap()).collect();
+        assert_eq!(found, ["description", "comment c1 by Ana", "attachment"]);
+        assert_eq!(d["files"][2]["title"], "Spec");
+        assert!(crate::files::require_listed(&d, "ABC-1", up).is_ok());
+        let e = crate::files::require_listed(&d, "ABC-1", "https://uploads.linear.app/w/other/secret.png").unwrap_err();
+        assert!(e.to_string().contains("ABC-1"));
     }
 
     #[test]

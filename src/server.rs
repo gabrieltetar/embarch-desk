@@ -150,6 +150,7 @@ pub fn router(app: Shared) -> Router {
         .route("/ignore", get(get_ignore).put(put_ignore))
         .route("/linear/issue/{key}", get(linear_issue))
         .route("/linear/issue/{key}/states", get(linear_issue_states))
+        .route("/linear/issue/{key}/file", post(linear_issue_file))
         .route("/linear/mine", get(linear_mine))
         .route("/linear/open", get(linear_open))
         .route("/linear/search", post(linear_search))
@@ -1654,6 +1655,20 @@ async fn linear_issue(Ax(app): Ax<Shared>, headers: HeaderMap, Path(key): Path<S
     let accounts = linear_accounts()?;
     match linear::read_issue(&accounts, key.trim(), q.skip).await {
         Ok(v) => Ok(Json(v)),
+        Err(e) => Err(key_error(&app, &headers, &accounts, key.trim(), e).await),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct FileBody {
+    url: String,
+}
+
+/// One file an issue lists (decision 81); any other link is refused.
+async fn linear_issue_file(Ax(app): Ax<Shared>, headers: HeaderMap, Path(key): Path<String>, Json(b): Json<FileBody>) -> ApiResult {
+    let accounts = linear_accounts()?;
+    match linear::read_file(&accounts, key.trim(), b.url.trim()).await {
+        Ok(r) => Ok(Json(r.to_json())),
         Err(e) => Err(key_error(&app, &headers, &accounts, key.trim(), e).await),
     }
 }

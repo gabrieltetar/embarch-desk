@@ -111,6 +111,14 @@ pub struct LinkParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct FileParams {
+    /// The Linear issue key, e.g. ABC-123.
+    pub key: String,
+    /// The file's link, exactly as linear_get_issue lists it under `files`.
+    pub url: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct IssueParams {
     /// A Linear issue key, e.g. ABC-123.
     pub key: String,
@@ -239,6 +247,28 @@ fn ok(v: Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(serde_json::to_string_pretty(&v).unwrap_or_default())]))
 }
 
+/// What `/linear/issue/{key}/file` answered, as the session reads it: an image
+/// as image content beside a line naming it, a text as the text itself, any
+/// other file as the path it was written to.
+fn file_answer(v: &Value) -> CallToolResult {
+    let name = v["name"].as_str().unwrap_or("file");
+    let size = v["size"].as_u64().unwrap_or(0);
+    let blocks = match v["kind"].as_str() {
+        Some("image") => vec![
+            ContentBlock::text(format!("{name}: {} image, {size} bytes", v["mime"].as_str().unwrap_or("?"))),
+            ContentBlock::image(v["data"].as_str().unwrap_or_default(), v["mime"].as_str().unwrap_or("image/png")),
+        ],
+        Some("text") => vec![ContentBlock::text(v["text"].as_str().unwrap_or_default())],
+        _ => vec![ContentBlock::text(format!(
+            "{name}: {} bytes ({}), written to {}; open it from there.",
+            size,
+            v["mime"].as_str().filter(|m| !m.is_empty()).unwrap_or("unknown type"),
+            v["path"].as_str().unwrap_or("?")
+        ))],
+    };
+    CallToolResult::success(blocks)
+}
+
 fn err(e: anyhow::Error) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))]))
 }
@@ -358,11 +388,20 @@ impl DeskMcp {
 
 #[tool_router(router = linear_router, vis = "pub")]
 impl DeskMcp {
-    #[tool(description = "Read a Linear issue: title, state, team, project, assignee, labels, description and its newest 25 comments, oldest first, each with its id and the id of the comment it replies under. The answer carries comments_total and, when some are not returned, comments_truncated and a comments_note; read older ones by calling again with skip. Works across every connected Linear workspace.")]
+    #[tool(description = "Read a Linear issue: title, state, team, project, assignee, labels, description and its newest 25 comments, oldest first, each with its id and the id of the comment it replies under. The answer's `files` lists every upload link in the description and comments and every attachment record, each saying where it was found; read one with linear_get_file. The answer carries comments_total and, when some are not returned, comments_truncated and a comments_note; read older ones by calling again with skip. Works across every connected Linear workspace.")]
     async fn linear_get_issue(&self, Parameters(p): Parameters<IssueParams>) -> Result<CallToolResult, McpError> {
         let key = crate::uri::encode(p.key.trim());
         match self.client.get(&format!("/linear/issue/{key}?skip={}", p.skip.unwrap_or(0))).await {
             Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "Read one file a Linear issue lists: a screenshot or file pasted into its description or a comment, or an attachment. Give the issue key and a link exactly as linear_get_issue lists it under `files`; any other link is refused. An image comes back as an image, a text file as text, and anything else (a PDF, an archive, a very long text) is written under the desk's data folder and its path returned, so open it from there. A file over 10 MiB is refused with its size. Linear's upload links expire within minutes, so use the link from a fresh linear_get_issue.")]
+    async fn linear_get_file(&self, Parameters(p): Parameters<FileParams>) -> Result<CallToolResult, McpError> {
+        let key = crate::uri::encode(p.key.trim());
+        match self.client.post(&format!("/linear/issue/{key}/file"), json!({ "url": p.url })).await {
+            Ok(v) => Ok(file_answer(&v)),
             Err(e) => err(e),
         }
     }
@@ -483,7 +522,7 @@ impl ServerHandler for DeskMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "embarch-desk: the one access point to Linear and Harvest, and the work item this session's \
              time and notes belong to. desk_work_item returns everything the desk holds about the session's \
-             item. Read Linear with linear_get_issue, linear_my_issues, linear_search and linear_list_issues, and list the \
+             item. Read Linear with linear_get_issue, linear_my_issues, linear_search and linear_list_issues, an issue's images and files with linear_get_file, and list the \
              connected workspaces' team keys with linear_teams; \
              move a status with linear_set_status; propose a comment, an issue or a change to one with linear_draft_comment, \
              linear_draft_issue or linear_draft_edit — they wait for the user's Send on the Desk tab. Read Harvest with \
@@ -525,6 +564,19 @@ mod tests {
         let desk_note = tool("desk_add_desk_note");
         assert_eq!(serde_json::to_value(&desk_note.input_schema).unwrap()["required"], json!(["session_id", "text"]));
         assert!(desk_note.description.as_deref().unwrap_or_default().contains("Never part of Harvest"));
+    }
+
+    #[test]
+    fn the_file_tool_takes_a_key_and_a_link_and_answers_by_kind() {
+        let tools = DeskMcp::linear_router().list_all();
+        let t = tools.iter().find(|t| t.name == "linear_get_file").expect("no tool linear_get_file");
+        assert_eq!(serde_json::to_value(&t.input_schema).unwrap()["required"], json!(["key", "url"]));
+        let kinds = |v: Value| serde_json::to_value(file_answer(&v).content).unwrap();
+        let img = kinds(json!({ "kind": "image", "mime": "image/png", "data": "AQID", "name": "a.png", "size": 3 }));
+        assert_eq!((img[0]["type"].as_str(), img[1]["type"].as_str(), img[1]["data"].as_str()), (Some("text"), Some("image"), Some("AQID")));
+        assert_eq!(kinds(json!({ "kind": "text", "text": "hi", "name": "n", "size": 2 }))[0]["text"], "hi");
+        let f = kinds(json!({ "kind": "file", "path": "/d/ABC-1/x.pdf", "mime": "application/pdf", "name": "x.pdf", "size": 9 }));
+        assert!(f[0]["text"].as_str().unwrap().contains("/d/ABC-1/x.pdf"), "{f}");
     }
 
     #[test]
