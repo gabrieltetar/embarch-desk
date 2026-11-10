@@ -625,6 +625,8 @@ async fn ensure_item(app: &App, headers: &HeaderMap, title: Option<&str>, issue_
     if let Some(key) = issue_key.map(str::trim).filter(|k| !k.is_empty()) {
         let key = key.to_ascii_uppercase();
         if let Some(id) = app.db.read(|st| st.item_by_key(&key).map(|i| i.id.clone())) {
+            // An existing card the view window has hidden comes back to the board.
+            app.db.write(|st| st.items.get_mut(&id).map(|i| i.last_activity_ms = now));
             return Ok(id);
         }
         let conns = Connectors::load()?;
@@ -2416,26 +2418,32 @@ async fn day(Ax(app): Ax<Shared>, Path(date): Path<String>) -> ApiResult {
 // ---------------------------------------------------------------- picking up an issue
 //
 // embarch-desk-sessions-proposal.md: the UI's desk's issues with no card
-// yet, and Start work — the issue to In Progress, a worktree beside the main
+// on the board, and Start work — the issue to In Progress, a worktree beside the main
 // clone on Linear's branch, auto mode, the launch claim, and the VS Code
 // links with a prompt pre-filled: `/promptu --item …` when Promptu is on and
 // installed, else the read-and-summarize starter (decision 67). The owner
 // presses Enter: nothing documented submits a VS Code chat from outside.
 
+/// Only a card on the board hides its issue: one the view window has
+/// dropped (quiet, unpinned) leaves the issue in Pick up.
+fn pickup_open(st: &State, issues: Vec<Value>, now: i64, window_days: i64) -> Vec<Value> {
+    let open = open_tile_keys(st);
+    let carded: std::collections::HashSet<String> = st
+        .items
+        .values()
+        .filter(|i| visible(st, i, now, window_days, &open))
+        .filter_map(|i| i.issue.as_ref().map(|r| r.key.to_ascii_uppercase()))
+        .collect();
+    issues
+        .into_iter()
+        .filter(|i| i["key"].as_str().is_some_and(|k| !carded.contains(&k.to_ascii_uppercase())))
+        .collect()
+}
+
 async fn pickup(Ax(app): Ax<Shared>, headers: HeaderMap) -> ApiResult {
     let scope = caller_linear(&app, &headers, None);
     let (issues, _) = linear::my_issues(&linear_accounts()?, scope.as_ref()).await?;
-    let carded: std::collections::HashSet<String> = app.db.read(|st| {
-        st.items
-            .values()
-            .filter(|i| !i.archived)
-            .filter_map(|i| i.issue.as_ref().map(|r| r.key.to_ascii_uppercase()))
-            .collect()
-    });
-    let open: Vec<Value> = issues
-        .into_iter()
-        .filter(|i| i["key"].as_str().is_some_and(|k| !carded.contains(&k.to_ascii_uppercase())))
-        .collect();
+    let open = app.db.read(|st| pickup_open(st, issues, now_ms(), app.window_days));
     Ok(Json(json!({ "scope": scope.map(|b| b.scope_label()), "issues": open })))
 }
 
@@ -3214,6 +3222,22 @@ mod tests {
         assert_eq!(cards[0]["tiles"][0]["hours"], 2.0);
         assert_eq!(cards[0]["tiles"][0]["status"], "open");
         assert!(!cards.iter().any(|c| c["id"] == old.as_str()));
+    }
+
+    #[test]
+    fn pickup_lists_an_issue_whose_card_the_view_window_hides() {
+        let mut st = State::default();
+        let mk = |k: &str| store::IssueRef { key: k.into(), ..Default::default() };
+        st.create_item("on board", Some(mk("ABC-1")), D0);
+        st.create_item("quiet", Some(mk("ABC-2")), D0 - 30 * 24 * H);
+        let pinned = st.create_item("pinned", Some(mk("ABC-3")), D0 - 30 * 24 * H);
+        st.items.get_mut(&pinned).unwrap().pinned = true;
+        let gone = st.create_item("archived", Some(mk("ABC-4")), D0);
+        st.items.get_mut(&gone).unwrap().archived = true;
+        let issues: Vec<Value> = (1..=5).map(|n| json!({ "key": format!("abc-{n}") })).collect();
+        let keys: Vec<String> =
+            pickup_open(&st, issues, D0 + H, 7).iter().map(|i| i["key"].as_str().unwrap().to_string()).collect();
+        assert_eq!(keys, ["abc-2", "abc-4", "abc-5"]);
     }
 
     #[test]
