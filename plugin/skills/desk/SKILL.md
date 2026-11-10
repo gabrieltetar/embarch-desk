@@ -55,7 +55,7 @@ A desk can hold **standing notes**: working agreements for every session in its 
 
 ## The work item
 
-1. **When the context says the session has no work item, ask the user in one line** which one it is, offering the open cards the desk listed, a Linear issue key, or a title for a new standalone item. Then call `desk_set_work_item` with the desk session id from the context. If the user says this is not tracked work, call it with `untracked: true`. Keep doing the user's actual request in the same turn; the question is one line, not a gate.
+1. **When the context says the session has no work item, look in the opening prompt and any handoff first.** An issue key of a connected team there (`linear_teams` lists the keys; a lookalike in prose is not one) is set with `desk_set_work_item` without asking, and you say which item you chose in one line. **Only with no such key, ask the user in one line** which one it is, offering the open cards the desk listed, a Linear issue key, or a title for a new standalone item. Then call `desk_set_work_item` with the desk session id from the context. If the user says this is not tracked work, call it with `untracked: true`. Keep doing the user's actual request in the same turn; the question is one line, not a gate.
 2. **If the user moves to different work**, call `desk_set_work_item` again with the new item.
 
 **Never approve, discard or archive anything, and never send a draft.** Those are the user's, on the Desk tab.

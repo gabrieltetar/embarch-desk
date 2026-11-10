@@ -261,7 +261,7 @@ impl DeskMcp {
         };
         let Some(item) = sess["work_item"]["id"].as_str() else {
             return Ok(CallToolResult::success(vec![ContentBlock::text(
-                "This session is not on a work item yet. Ask the user which one it is and call desk_set_work_item.",
+                "This session is not on a work item yet. If the user's opening prompt or a handoff holds an issue key of a connected team (linear_teams lists them; a lookalike in prose is not one), call desk_set_work_item with it and say which in one line. Only with no such key, ask the user which item it is and call desk_set_work_item.",
             )]));
         };
         match self.client.post(&format!("/items/{item}/repos"), json!({ "repo": p.repo })).await {
@@ -293,7 +293,7 @@ impl DeskMcp {
             Err(e) => return err(e),
         };
         let Some(item) = sess["work_item"]["id"].as_str() else {
-            let ask = "This session is not on a work item yet. Ask the user which one it is and call desk_set_work_item.";
+            let ask = "This session is not on a work item yet. If the user's opening prompt or a handoff holds an issue key of a connected team (linear_teams lists them; a lookalike in prose is not one), call desk_set_work_item with it and say which in one line. Only with no such key, ask the user which item it is and call desk_set_work_item.";
             return Ok(CallToolResult::success(vec![ContentBlock::text(with_desk_notes(ask, &sess))]));
         };
         match self.client.get(&format!("/items/{}/brief", crate::uri::encode(item))).await {
@@ -470,7 +470,9 @@ impl ServerHandler for DeskMcp {
              repos (always, never, from now on, in this repo) is a desk note, added with desk_add_desk_note, \
              never a line. desk_timer_start/stop track work away from Claude. \
              The session's context carries its desk session id; when the desk asks which work item a session \
-             is on, ask the user and call desk_set_work_item.",
+             is on, first take an issue key of a connected team from the opening prompt or a handoff (a lookalike \
+             in prose is not one), call desk_set_work_item with it and say which in one line; ask the user only \
+             when there is no such key.",
         )
     }
 }
