@@ -16,7 +16,7 @@ use crate::connectors::Connectors;
 use crate::db::Db;
 use crate::events::{self, HookEvent};
 use crate::store::{self, Days, HarvestTarget, LocalDays, MailboxEntry, PendingLaunch, RealGit, State, TakeError, TileStatus};
-use crate::{brief, github, harvest, linear, linear_mcp, localrepo, refs, uri};
+use crate::{brief, github, harvest, linear, linear_mcp, localrepo, mcpreg, refs, uri};
 use axum::extract::{Path, Query, State as Ax};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -36,6 +36,8 @@ pub struct App {
     pub wsl_distro: Option<String>,
     pub window_days: i64,
     pub model: String,
+    /// The login this instance's sessions run under (decision 82); none without `HOME`.
+    pub login: Option<crate::mcpreg::Login>,
 }
 
 #[derive(Default)]
@@ -619,6 +621,24 @@ async fn hook(Ax(app): Ax<Shared>, Json(ev): Json<HookEvent>) -> ApiResult {
         }
         ctx
     });
+    // A session starting in a desk's folder whose login lacks `embarch-api`
+    // is told once, beside the standing notes (decision 82). The files are
+    // read outside the database lock.
+    let ctx = match (&app.login, ev.hook_event_name.as_str()) {
+        (Some(login), "SessionStart") if !ev.session_id.is_empty() => {
+            let folder = app.db.read(|st| {
+                let s = st.sessions.get(&ev.session_id).filter(|s| !st.shut_out(s))?;
+                s.start_desk.as_ref().filter(|k| st.desks.contains_key(*k))?;
+                s.start_cwd.clone()
+            });
+            let said = folder.and_then(|f| mcpreg::session_text(login, &f));
+            match (ctx, said) {
+                (Some(c), Some(s)) => Some(format!("{c}\n\n{s}")),
+                (c, s) => c.or(s),
+            }
+        }
+        _ => ctx,
+    };
     Ok(Json(json!({ "context": ctx })))
 }
 
@@ -2174,7 +2194,19 @@ pub fn publish_desks(app: &App) {
 async fn list_desks(Ax(app): Ax<Shared>, headers: HeaderMap) -> ApiResult {
     let (sid, cwd) = caller(&headers);
     Ok(Json(app.db.read(|st| {
-        let mut v = json!({ "desks": st.desks.values().collect::<Vec<_>>(), "open": st.ui_desk });
+        // Each desk's folders, and whether the login has `embarch-api` for each (decision 82).
+        let desks: Vec<Value> = st
+            .desks
+            .values()
+            .map(|d| {
+                let mut j = json!(d);
+                if let Some(login) = &app.login {
+                    j["embarch_api"] = d.firmware_repos.iter().map(|f| mcpreg::folder_json(login, f)).collect();
+                }
+                j
+            })
+            .collect();
+        let mut v = json!({ "desks": desks, "open": st.ui_desk });
         if sid.is_some() {
             v["session"] = json!(st.caller_desk(sid.as_deref(), cwd.as_deref()));
         }
@@ -3921,6 +3953,7 @@ mod tests {
             wsl_distro: None,
             window_days: 7,
             model: String::new(),
+            login: None,
         });
         (app, dir)
     }
@@ -4292,6 +4325,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_desk_folder_without_embarch_api_in_the_login_is_marked_and_its_session_told_once() {
+        let (mut_app, dir) = scratch_app();
+        let home = dir.join("home");
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(home.join(".claude-w")).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        let login = mcpreg::Login { config_dir: Some(home.join(".claude-w")), home: home.clone() };
+        let app = Arc::new(App {
+            db: Db::open(dir.clone()).unwrap(),
+            refs: refs::Store::open(&dir),
+            token: "t".into(),
+            cache: Mutex::new(Cache::default()),
+            wsl_distro: None,
+            window_days: 7,
+            model: String::new(),
+            login: Some(login),
+        });
+        drop(mut_app);
+        let r = repo.display().to_string();
+        app.db.write(|st| st.put_desk(store::Desk { name: "Alpha".into(), firmware_repos: vec![r.clone()], ..Default::default() }, D0));
+        let desk_field = || async {
+            let Ok(Json(v)) = list_desks(Ax(app.clone()), HeaderMap::new()).await else { panic!("desks") };
+            v["desks"][0]["embarch_api"][0].clone()
+        };
+        let f = desk_field().await;
+        assert_eq!((&f["folder"], &f["registered"]), (&json!(r), &json!(false)));
+        assert!(f["register_command"].as_str().unwrap().contains("claude mcp add --scope user embarch-api --"), "{f}");
+        let start = |sid: &str| HookEvent {
+            hook_event_name: "SessionStart".into(),
+            session_id: sid.into(),
+            cwd: r.clone(),
+            tool_name: None,
+            tool_input: None,
+            tool_response: None,
+            last_assistant_message: None,
+            notification_type: None,
+            message: None,
+        };
+        let Ok(Json(v)) = hook(Ax(app.clone()), Json(start("s"))).await else { panic!("hook") };
+        assert!(v["context"].as_str().unwrap().contains("has no `embarch-api` MCP server"), "{v}");
+        std::fs::write(repo.join(".mcp.json"), r#"{"mcpServers":{"embarch-api":{"command":"x"}}}"#).unwrap();
+        assert_eq!(desk_field().await["registered"], json!(true));
+        let Ok(Json(v)) = hook(Ax(app.clone()), Json(start("t"))).await else { panic!("hook") };
+        assert!(!v["context"].as_str().unwrap_or_default().contains("embarch-api"), "{v}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn a_sessions_call_works_on_its_own_desk_and_one_naming_no_session_on_the_uis() {
         let (app, dir) = scratch_app();
         let desk = |name: &str, repo: &str, team: &str| store::Desk {
@@ -4348,6 +4429,7 @@ mod tests {
             wsl_distro: None,
             window_days: 7,
             model: String::new(),
+            login: None,
         });
         let after = get_refs(&again, None).await.unwrap();
         assert_eq!(after, before);

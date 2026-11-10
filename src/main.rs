@@ -16,6 +16,7 @@ mod linear;
 mod linear_mcp;
 mod localrepo;
 mod mcp;
+mod mcpreg;
 mod memory;
 mod paths;
 mod promptu;
@@ -279,6 +280,7 @@ async fn serve() -> Result<()> {
         wsl_distro: server::detect_wsl_distro(),
         window_days: std::env::var("EMBARCH_DESK_WINDOW_DAYS").ok().and_then(|d| d.parse().ok()).unwrap_or(7),
         model: std::env::var("EMBARCH_DESK_MODEL").unwrap_or_else(|_| claude::DEFAULT_MODEL.into()),
+        login: mcpreg::Login::from_env(),
     });
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], paths::port()));
     let listener = tokio::net::TcpListener::bind(addr)
