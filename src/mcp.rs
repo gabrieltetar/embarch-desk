@@ -126,6 +126,17 @@ pub struct QueryParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct StateListParams {
+    /// A team's key, e.g. EMB (linear_teams lists them).
+    pub team_key: String,
+    /// The workflow state's name as the team spells it, e.g. "Fleet Ready"; case is ignored.
+    pub state: String,
+    /// Narrow to one project, by name.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct StatusParams {
     /// A Linear issue key, e.g. ABC-123.
     pub key: String,
@@ -380,6 +391,14 @@ impl DeskMcp {
         }
     }
 
+    #[tool(description = "List a team's Linear issues that are in one workflow state, by the state's name (\"Fleet Ready\"), optionally only those of one project (by name); most recently updated first. Not limited to this session's desk: any connected workspace's team, by its key. A state the team does not have is an error that lists the ones it has. The answer carries truncated, and a note when the 500-issue cap cut the list.")]
+    async fn linear_list_issues(&self, Parameters(p): Parameters<StateListParams>) -> Result<CallToolResult, McpError> {
+        match self.client.post("/linear/issues", json!({ "team": p.team_key, "state": p.state, "project": p.project })).await {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
     #[tool(description = "Move a Linear issue to another workflow state by name (\"In Progress\", \"In Review\"). A status move goes straight through; the error lists the team's states if the name is wrong.")]
     async fn linear_set_status(&self, Parameters(p): Parameters<StatusParams>) -> Result<CallToolResult, McpError> {
         match self.client.post("/linear/status", json!({ "key": p.key, "status": p.status })).await {
@@ -464,7 +483,7 @@ impl ServerHandler for DeskMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "embarch-desk: the one access point to Linear and Harvest, and the work item this session's \
              time and notes belong to. desk_work_item returns everything the desk holds about the session's \
-             item. Read Linear with linear_get_issue, linear_my_issues and linear_search, and list the \
+             item. Read Linear with linear_get_issue, linear_my_issues, linear_search and linear_list_issues, and list the \
              connected workspaces' team keys with linear_teams; \
              move a status with linear_set_status; propose a comment, an issue or a change to one with linear_draft_comment, \
              linear_draft_issue or linear_draft_edit — they wait for the user's Send on the Desk tab. Read Harvest with \

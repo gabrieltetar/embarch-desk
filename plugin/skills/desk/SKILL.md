@@ -17,7 +17,8 @@ One desk per project — a Linear project (or a whole team), a Harvest project a
 
 ## Linear
 
-- Read with `linear_get_issue` (description and the newest 25 comments, each with its `id` and the `parent` it replies under; `comments_total` and `comments_note` say when some were not returned, and `skip` reads older ones), `linear_my_issues`, `linear_search`.
+- Read with `linear_get_issue` (description and the newest 25 comments, each with its `id` and the `parent` it replies under; `comments_total` and `comments_note` say when some were not returned, and `skip` reads older ones), `linear_my_issues`, `linear_search`, and `linear_list_issues` for a team's queue (every issue of a team key in a named state such as "Fleet Ready", optionally one project; `truncated` and a `note` say when its 500-issue cap cut the list).
+- **Do not fall back to Claude's own Linear connector** for a read or write the desk has no tool for. Say the desk lacks it and file the gap against the desk (embarch-desk decision 29 applies; there is no second route).
 - `linear_teams` lists each connected workspace's teams (key, name, id) under its account label. When a key is refused with "no connected Linear workspace has", check its team key there before asking the user.
 - Move a status with `linear_set_status` — it goes straight through.
 - **Write prose only as a draft**: `linear_draft_comment`, `linear_draft_issue`, `linear_draft_edit`. Nothing is posted; the draft waits on the user's Desk tab for their Send. Write it the way it should be posted, then tell the user it is waiting there. If a voice or review skill applies to text going out under the user's name, follow it before drafting.

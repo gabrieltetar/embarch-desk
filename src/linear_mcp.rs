@@ -400,6 +400,25 @@ pub async fn open_page(acct: &Account, scope: Option<&LinearBinding>, mine: bool
     Ok((open_rows(acct, &v), next_cursor(&v)))
 }
 
+/// One page of a team's issues in one state, and the next page's cursor. The
+/// server takes the state as an argument; its answer is also checked against
+/// the state's name, since the argument matches a state type as well.
+pub async fn state_page(acct: &Account, team_id: &str, state: &str, project: Option<&str>, after: Option<String>) -> Result<(Vec<Value>, Option<String>)> {
+    let mut args = json!({ "limit": PAGE, "orderBy": "updatedAt", "fields": ROW_FIELDS, "team": team_id, "state": state });
+    if let Some(p) = project {
+        args["project"] = json!(p);
+    }
+    if let Some(a) = after {
+        args["cursor"] = json!(a);
+    }
+    let v = call(acct, "list_issues", args).await?;
+    Ok((state_rows(acct, &v, state), next_cursor(&v)))
+}
+
+fn state_rows(acct: &Account, v: &Value, state: &str) -> Vec<Value> {
+    v["issues"].as_array().into_iter().flatten().filter(|i| i["status"] == state).map(|i| row(acct, i)).collect()
+}
+
 fn open_rows(acct: &Account, v: &Value) -> Vec<Value> {
     v["issues"]
         .as_array()
@@ -624,6 +643,37 @@ mod tests {
         assert_eq!((rows[0]["key"].as_str(), rows[0]["state"].as_str(), rows[0]["workspace"].as_str()), (Some("ABC-1"), Some("Todo"), Some("client")));
         assert_eq!(next_cursor(&v).as_deref(), Some("c2"));
         assert_eq!(next_cursor(&json!({"hasNextPage": false, "cursor": "c3"})), None);
+    }
+
+    #[test]
+    fn a_state_page_keeps_only_issues_in_that_state_and_carries_the_cursor() {
+        let v = json!({
+            "issues": [
+                {"id": "ABC-1", "title": "A", "url": "u1", "status": "Fleet Ready", "statusType": "unstarted"},
+                {"id": "ABC-2", "title": "B", "url": "u2", "status": "Started", "statusType": "started"},
+            ],
+            "hasNextPage": true, "cursor": "c9"
+        });
+        let rows = state_rows(&acct(), &v, "Fleet Ready");
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0]["key"].as_str(), rows[0]["workspace"].as_str()), (Some("ABC-1"), Some("client")));
+        assert_eq!(next_cursor(&v).as_deref(), Some("c9"));
+    }
+
+    #[tokio::test]
+    async fn a_state_list_through_the_mcp_pages_stops_at_the_cap_and_says_so() {
+        let a = acct();
+        let (rows, cut) = crate::connectors::take_capped(crate::linear::MINE_CAP, |after: Option<String>| {
+            let n: usize = after.as_deref().map(|c| c.parse().unwrap()).unwrap_or(0);
+            let issues: Vec<Value> = (0..PAGE).map(|i| json!({"id": format!("X-{}", n * PAGE + i), "status": "Fleet Ready"})).collect();
+            let v = json!({"issues": issues, "hasNextPage": true, "cursor": (n + 1).to_string()});
+            let a = &a;
+            async move { Ok((state_rows(a, &v, "Fleet Ready"), next_cursor(&v))) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), crate::linear::MINE_CAP);
+        assert!(cut);
     }
 
     #[test]

@@ -113,13 +113,18 @@ pub async fn states(accounts: &[Account], issue: &IssueRef) -> Result<Vec<Value>
         .iter()
         .find(|a| a.label == issue.account)
         .ok_or_else(|| anyhow!("no Linear account {:?} connected", issue.account))?;
+    team_states(acct, &issue.team_id).await
+}
+
+/// One workspace's team's workflow states, in board order.
+async fn team_states(acct: &Account, team_id: &str) -> Result<Vec<Value>> {
     if acct.mcp.is_some() {
-        return linear_mcp::team_states(acct, &issue.team_id).await;
+        return linear_mcp::team_states(acct, team_id).await;
     }
     let d = gql(
         acct,
         "query($id: String!) { team(id: $id) { states { nodes { id name type position } } } }",
-        json!({ "id": issue.team_id }),
+        json!({ "id": team_id }),
     )
     .await?;
     let mut nodes = d["team"]["states"]["nodes"].as_array().cloned().unwrap_or_default();
@@ -499,6 +504,84 @@ pub(crate) fn team_rows(acct: &Account, nodes: &[Value]) -> Vec<Value> {
     rows
 }
 
+/// The state a name means among a team's, spelled as the team spells it, or
+/// the error listing the ones it has.
+fn state_named(states: &[Value], team: &str, name: &str) -> Result<String> {
+    let want = name.trim().to_lowercase();
+    states
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .find(|n| n.to_lowercase() == want)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            let names: Vec<&str> = states.iter().filter_map(|s| s["name"].as_str()).collect();
+            anyhow!("team {team} has no state {name:?}; it has: {}", names.join(", "))
+        })
+}
+
+/// The query for one page of a team's issues in one state, narrowed to a
+/// project by name when `project` is set.
+fn state_query(project: bool) -> String {
+    let p = if project { ", project: { name: { eqIgnoreCase: $p } }" } else { "" };
+    let decl = if project { "($t: ID, $s: String, $p: String, $a: String)" } else { "($t: ID, $s: String, $a: String)" };
+    format!(
+        "query{decl} {{ issues(first: 50, after: $a, orderBy: updatedAt, \
+         filter: {{ team: {{ id: {{ eq: $t }} }}, state: {{ name: {{ eq: $s }} }}{p} }}) {{ {ROW_FIELDS} \
+         pageInfo {{ hasNextPage endCursor }} }} }}"
+    )
+}
+
+/// Every issue of a team (by key) in a workflow state (by name, as the team
+/// defines it, case ignored), optionally in one project (by name), newest
+/// update first, up to `MINE_CAP`; and whether that cap cut the list. The
+/// team is looked up in every connected workspace; the state must be one it
+/// has, so a misspelling is an error and never an empty list.
+pub async fn issues_in_state(accounts: &[Account], team_key: &str, state: &str, project: Option<&str>) -> Result<StateList> {
+    let all = teams(accounts).await?;
+    let key = team_key.trim();
+    let Some(team) = all.iter().find(|t| t["key"].as_str().is_some_and(|k| k.eq_ignore_ascii_case(key))) else {
+        let keys: Vec<&str> = all.iter().filter_map(|t| t["key"].as_str()).collect();
+        bail!("no connected workspace has a team {key:?}; the teams are: {}", keys.join(", "));
+    };
+    let label = team["account"].as_str().unwrap_or_default();
+    let team_id = team["id"].as_str().unwrap_or_default();
+    let team_key = team["key"].as_str().unwrap_or_default().to_string();
+    let acct = accounts.iter().find(|a| a.label == label).ok_or_else(|| anyhow!("no Linear account {label:?} connected"))?;
+    let state = state_named(&team_states(acct, team_id).await?, &team_key, state)?;
+    let project = project.map(str::trim).filter(|p| !p.is_empty());
+    let (issues, truncated) = if acct.mcp.is_some() {
+        crate::connectors::take_capped(MINE_CAP, |after: Option<String>| {
+            linear_mcp::state_page(acct, team_id, &state, project, after)
+        })
+        .await?
+    } else {
+        let q = state_query(project.is_some());
+        let q = q.as_str();
+        let mut vars = json!({ "t": team_id, "s": state });
+        if let Some(p) = project {
+            vars["p"] = json!(p);
+        }
+        let vars = &vars;
+        crate::connectors::take_capped(MINE_CAP, |after: Option<String>| async move {
+            let mut v = vars.clone();
+            v["a"] = json!(after);
+            let d = gql(acct, q, v).await?;
+            Ok(issue_page(acct, &d["issues"]))
+        })
+        .await?
+    };
+    Ok(StateList { workspace: label.to_string(), team: team_key, state, issues, truncated })
+}
+
+/// A team's issues in one state, as `issues_in_state` answers.
+pub struct StateList {
+    pub workspace: String,
+    pub team: String,
+    pub state: String,
+    pub issues: Vec<Value>,
+    pub truncated: bool,
+}
+
 /// Issues whose title contains the words — within the caller's desk's scope
 /// when it has one — or the one a key names, wherever it is.
 pub async fn search(accounts: &[Account], query: &str, scope: Option<&LinearBinding>) -> Result<Vec<Value>> {
@@ -742,6 +825,42 @@ mod tests {
         assert_eq!(rows.len(), 100);
         assert!(!cut);
         assert_eq!(rows[99]["key"], "X-99");
+    }
+
+    #[test]
+    fn a_state_is_matched_by_name_as_the_team_spells_it_and_a_miss_lists_the_team_states() {
+        let states = vec![json!({"name": "Backlog"}), json!({"name": "Fleet Ready"})];
+        assert_eq!(state_named(&states, "EMB", " fleet ready ").unwrap(), "Fleet Ready");
+        let e = state_named(&states, "EMB", "Ready").unwrap_err().to_string();
+        assert!(e.contains("EMB") && e.contains("Backlog, Fleet Ready"), "{e}");
+    }
+
+    #[test]
+    fn the_state_query_filters_on_team_and_state_and_on_project_only_when_asked() {
+        let q = state_query(false);
+        assert!(q.contains("team: { id: { eq: $t } }") && q.contains("state: { name: { eq: $s } }") && !q.contains("eqIgnoreCase"), "{q}");
+        let q = state_query(true);
+        assert!(q.contains("project: { name: { eqIgnoreCase: $p } }") && q.contains("$p: String"), "{q}");
+    }
+
+    #[tokio::test]
+    async fn a_state_list_stops_at_the_cap_and_says_so() {
+        let acct = Account::new("w", "t");
+        // An endless queue: every page is full and has a next.
+        let page = |after: Option<String>| {
+            let n: u32 = after.as_deref().map(|a| a.parse().unwrap()).unwrap_or(0);
+            let nodes: Vec<Value> = (0..50).map(|i| json!({ "identifier": format!("X-{}", n * 50 + i) })).collect();
+            json!({ "nodes": nodes, "pageInfo": { "hasNextPage": true, "endCursor": format!("{}", n + 1) } })
+        };
+        let (rows, cut) = crate::connectors::take_capped(MINE_CAP, |a| {
+            let p = page(a);
+            let acct = &acct;
+            async move { Ok(issue_page(acct, &p)) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), MINE_CAP);
+        assert!(cut);
     }
 
     #[test]

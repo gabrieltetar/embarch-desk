@@ -153,6 +153,7 @@ pub fn router(app: Shared) -> Router {
         .route("/linear/mine", get(linear_mine))
         .route("/linear/open", get(linear_open))
         .route("/linear/search", post(linear_search))
+        .route("/linear/issues", post(linear_issues))
         .route("/linear/status", post(linear_status))
         .route("/drafts", post(create_draft))
         .route("/drafts/{id}", axum::routing::patch(patch_draft))
@@ -1727,6 +1728,33 @@ async fn linear_search(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<Se
         "scope": scope.as_ref().map(|b| b.scope_label()),
         "issues": linear::search(&linear_accounts()?, &b.query, scope.as_ref()).await?,
     })))
+}
+
+#[derive(Deserialize)]
+struct StateListBody {
+    team: String,
+    state: String,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+/// A team's issues in a named state, in whichever workspace has the team (decision 79).
+async fn linear_issues(Json(b): Json<StateListBody>) -> ApiResult {
+    if b.team.trim().is_empty() || b.state.trim().is_empty() {
+        return Err(bad("a team key and a state name are both needed"));
+    }
+    let l = linear::issues_in_state(&linear_accounts()?, &b.team, &b.state, b.project.as_deref()).await.map_err(|e| bad(e.to_string()))?;
+    let mut v = json!({
+        "workspace": l.workspace, "team": l.team, "state": l.state, "project": b.project,
+        "issues": l.issues, "truncated": l.truncated,
+    });
+    if l.truncated {
+        v["note"] = json!(format!(
+            "The list stopped at {} issues; older ones in this state are not returned.",
+            linear::MINE_CAP
+        ));
+    }
+    Ok(Json(v))
 }
 
 #[derive(Deserialize)]
