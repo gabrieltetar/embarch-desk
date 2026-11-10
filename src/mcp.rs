@@ -73,6 +73,9 @@ pub struct LineParams {
     /// done (the default: a piece of work finished), finding (something learned), decision (a choice made, and why), handoff (what the next session needs to know), todo (something left to do).
     #[serde(default)]
     pub kind: Option<String>,
+    /// Another work item this note belongs to: its issue key (`ABC-123`) or desk item id, on any desk. Leave out for a note about this session's own item.
+    #[serde(default)]
+    pub item: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -270,9 +273,9 @@ impl DeskMcp {
         }
     }
 
-    #[tool(description = "Add a note to this session's work item: one short line, unasked, whenever something worth keeping happens — kind done (the default) for a piece of work finished without a commit, finding, decision, handoff or todo. Too many rather than too few; the user cuts. Commits and memory-file writes are added automatically; do not repeat them. The day's notes become the Harvest note.")]
+    #[tool(description = "Add a note to this session's work item: one short line, unasked, whenever something worth keeping happens — kind done (the default) for a piece of work finished without a commit, finding, decision, handoff or todo. Too many rather than too few; the user cuts. Commits and memory-file writes are added automatically; do not repeat them. The day's notes become the Harvest note. Set item (an issue key or desk item id) only when the note is about a different work item than this session's own, such as something learned about another issue while working on this one: it lands on that item's tile for today, with this session's id. An unknown item is an error and nothing is written.")]
     async fn desk_add_line(&self, Parameters(p): Parameters<LineParams>) -> Result<CallToolResult, McpError> {
-        match self.client.post(&format!("/sessions/{}/line", p.session_id), json!({ "text": p.text, "kind": p.kind })).await {
+        match self.client.post(&format!("/sessions/{}/line", p.session_id), json!({ "text": p.text, "kind": p.kind, "item": p.item })).await {
             Ok(v) => ok(v),
             Err(e) => err(e),
         }
@@ -496,6 +499,7 @@ mod tests {
         assert_eq!(pull["required"], json!(["session_id"]));
         let line = serde_json::to_value(&tool("desk_add_line").input_schema).unwrap();
         assert!(line["properties"]["kind"].is_object(), "{line}");
+        assert!(line["properties"]["item"].is_object(), "{line}");
         assert_eq!(line["required"], json!(["session_id", "text"]));
         let add = serde_json::to_value(&tool("desk_add_repo").input_schema).unwrap();
         assert_eq!(add["required"], json!(["session_id", "repo"]));

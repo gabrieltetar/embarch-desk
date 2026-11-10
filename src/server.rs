@@ -888,6 +888,10 @@ struct LineBody {
     /// `done` (the default), `finding`, `decision`, `handoff` or `todo`.
     #[serde(default)]
     kind: Option<String>,
+    /// Another work item for `session_line` to file the note on: an issue key
+    /// or a desk item id, on any desk (decision 78). Absent: the session's own.
+    #[serde(default)]
+    item: Option<String>,
 }
 
 impl LineBody {
@@ -910,9 +914,19 @@ async fn session_line(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): Jso
     let today = LocalDays.date(now);
     let mut note = b.note(now, "agent")?;
     note.session_id = Some(sid.clone());
-    let landed = app.db.write(|st| {
-        let sess = st.sessions.get_mut(&sid)?;
-        match sess.item_id.clone() {
+    let target = clean(&b.item);
+    let landed = app.db.write(|st| -> Result<Option<Value>, ApiError> {
+        if !st.sessions.contains_key(&sid) {
+            return Ok(None);
+        }
+        if let Some(t) = &target {
+            let id = st.items.get(t).map(|i| i.id.clone()).or_else(|| st.item_by_key(t).map(|i| i.id.clone()));
+            let id = id.ok_or_else(|| missing(format!("no work item {t:?}: not an issue key or a desk item id on any desk; nothing was written")))?;
+            let nid = st.add_note(&id, &today, note.clone());
+            return Ok(Some(json!({ "tile": format!("{id}@{today}"), "note_id": nid })));
+        }
+        let sess = st.sessions.get_mut(&sid).expect("checked above");
+        Ok(match sess.item_id.clone() {
             Some(item) => {
                 let id = st.add_note(&item, &today, note);
                 Some(json!({ "tile": format!("{item}@{today}"), "note_id": id }))
@@ -921,8 +935,8 @@ async fn session_line(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): Jso
                 sess.held_lines.push(note);
                 Some(json!({ "held": true, "note": "the session has no work item yet; the line lands when it gets one" }))
             }
-        }
-    });
+        })
+    })?;
     landed.map(Json).ok_or_else(|| missing("the desk has not seen this session"))
 }
 
@@ -3864,6 +3878,66 @@ mod tests {
             model: String::new(),
         });
         (app, dir)
+    }
+
+    fn line_body(v: Value) -> LineBody {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_session_line_goes_to_its_own_item_or_is_held_and_the_old_body_still_parses() {
+        let (app, dir) = scratch_app();
+        let w = app.db.write(|st| {
+            let w = st.create_item("own", None, D0);
+            let mut s = crate::store::testing::session("s");
+            s.item_id = Some(w.clone());
+            st.sessions.insert("s".into(), s);
+            st.sessions.insert("bare".into(), crate::store::testing::session("bare"));
+            w
+        });
+        // The body from before `item` existed.
+        let Ok(Json(v)) = session_line(Ax(app.clone()), Path("s".into()), Json(line_body(json!({"text": "own note"})))).await else { panic!("own") };
+        assert_eq!(v["tile"].as_str().unwrap().split('@').next(), Some(w.as_str()), "{v}");
+        let Ok(Json(v)) = session_line(Ax(app.clone()), Path("bare".into()), Json(line_body(json!({"text": "held", "item": "  "})))).await else { panic!("held") };
+        assert_eq!(v["held"], true, "a blank item is no item");
+        assert_eq!(app.db.read(|st| st.sessions["bare"].held_lines.len()), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_session_line_with_an_item_files_on_that_items_tile_and_an_unknown_one_writes_nothing() {
+        let (app, dir) = scratch_app();
+        let (own, other) = app.db.write(|st| {
+            let own = st.create_item("own", Some(store::IssueRef { key: "ABC-1".into(), ..Default::default() }), D0);
+            let other = st.create_item("other", Some(store::IssueRef { key: "XYZ-9".into(), ..Default::default() }), D0);
+            let mut s = crate::store::testing::session("s");
+            s.item_id = Some(own.clone());
+            st.sessions.insert("s".into(), s);
+            st.sessions.insert("bare".into(), crate::store::testing::session("bare"));
+            (own, other)
+        });
+        let today = LocalDays.date(now_ms());
+        let Ok(Json(v)) = session_line(Ax(app.clone()), Path("s".into()), Json(line_body(json!({"text": "found it", "kind": "finding", "item": "xyz-9"})))).await else { panic!("by key") };
+        assert_eq!(v["tile"], format!("{other}@{today}"), "{v}");
+        let Ok(Json(_)) = session_line(Ax(app.clone()), Path("s".into()), Json(line_body(json!({"text": "by id", "item": other})))).await else { panic!("by id") };
+        app.db.read(|st| {
+            let lines = &st.tiles[&format!("{other}@{today}")].lines;
+            assert_eq!(lines.len(), 2);
+            assert_eq!((lines[0].text.as_str(), lines[0].kind.as_str(), lines[0].session_id.as_deref()), ("found it", "finding", Some("s")));
+            assert!(!st.tiles.contains_key(&format!("{own}@{today}")), "nothing on the session's own item");
+            assert!(open_tile_keys(st).contains(&(other.clone(), today.clone())), "the tile waits in the hand at 0 h");
+        });
+        // Unknown: an error naming it, nothing written, nothing held.
+        for sid in ["s", "bare"] {
+            let Err(ApiError(code, msg)) = session_line(Ax(app.clone()), Path(sid.into()), Json(line_body(json!({"text": "lost", "item": "NOPE-1"})))).await else { panic!("unknown item took a note") };
+            assert_eq!(code, StatusCode::NOT_FOUND);
+            assert!(msg.contains("NOPE-1"), "{msg}");
+        }
+        app.db.read(|st| {
+            assert_eq!(st.tiles.len(), 1);
+            assert!(st.sessions["bare"].held_lines.is_empty());
+        });
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// The shapes decision 75 adds, checked before anything reaches Linear.

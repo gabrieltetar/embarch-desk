@@ -37,6 +37,8 @@ The work item is where the work's knowledge gathers. **`desk_work_item` returns 
 - `handoff` — what the next session needs to know: "The PR waits on the reviewer's question about the timeout."
 - `todo` — something left to do: "The retry path still lacks a test."
 
+**A note about a different work item goes to that item.** When you learn something about another issue while working on this one, call `desk_add_line` with `item` set to its issue key or desk item id, so it lands on that item's day and not on this one. Leave `item` out for your own. An unknown `item` is an error and nothing is saved: check the key.
+
 Commits and Claude Code memory files are added automatically — a write to `~/.claude/projects/*/memory/` becomes the item's memory note, its versions kept — so do not repeat them. **What goes to Harvest is the summary of that day's notes.**
 
 ## Desk notes
