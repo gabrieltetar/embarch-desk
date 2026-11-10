@@ -94,6 +94,29 @@ fn missing(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, msg.into())
 }
 
+/// A 404 for a key no connected workspace has, saying which case it is: the
+/// team belongs to another desk (named, with its folder), or no connected
+/// workspace has the team (EMB-9).
+async fn no_key(app: &App, headers: &HeaderMap, accounts: &[crate::connectors::Account], key: &str) -> ApiError {
+    let teams = linear::teams(accounts).await.ok();
+    let caller = caller_desk(app, headers, None);
+    let msg = app.db.read(|st| {
+        let desks: Vec<&store::Desk> = st.desks.values().collect();
+        linear::no_key_message(key, teams.as_deref(), &desks, caller.as_deref())
+    });
+    missing(msg)
+}
+
+/// An error from a call on `key`: [`no_key`]'s message when no workspace has
+/// it, else the error as it came.
+async fn key_error(app: &App, headers: &HeaderMap, accounts: &[crate::connectors::Account], key: &str, e: anyhow::Error) -> ApiError {
+    if e.downcast_ref::<linear::NoWorkspaceHas>().is_some() {
+        no_key(app, headers, accounts, key).await
+    } else {
+        e.into()
+    }
+}
+
 type ApiResult = Result<Json<Value>, ApiError>;
 type Shared = Arc<App>;
 
@@ -597,7 +620,7 @@ struct NewItem {
 }
 
 /// Make (or find) the work item for an issue key, or a standalone one.
-async fn ensure_item(app: &App, title: Option<&str>, issue_key: Option<&str>, desk: Option<&str>) -> Result<String, ApiError> {
+async fn ensure_item(app: &App, headers: &HeaderMap, title: Option<&str>, issue_key: Option<&str>, desk: Option<&str>) -> Result<String, ApiError> {
     let now = now_ms();
     if let Some(key) = issue_key.map(str::trim).filter(|k| !k.is_empty()) {
         let key = key.to_ascii_uppercase();
@@ -608,9 +631,10 @@ async fn ensure_item(app: &App, title: Option<&str>, issue_key: Option<&str>, de
         if conns.linear.is_empty() {
             return Err(bad("no Linear workspace is connected; add a Linear API key on the Desk tab first"));
         }
-        let issue = linear::find_issue(&conns.linear, &key, now)
-            .await?
-            .ok_or_else(|| missing(format!("no connected Linear workspace has {key}")))?;
+        let issue = match linear::find_issue(&conns.linear, &key, now).await? {
+            Some(i) => i,
+            None => return Err(no_key(app, headers, &conns.linear, &key).await),
+        };
         let title = issue.title.clone();
         return Ok(app.db.write(|st| st.create_item(&title, Some(issue), now)));
     }
@@ -641,8 +665,8 @@ async fn ensure_item(app: &App, title: Option<&str>, issue_key: Option<&str>, de
     }))
 }
 
-async fn create_item(Ax(app): Ax<Shared>, Json(b): Json<NewItem>) -> ApiResult {
-    let id = ensure_item(&app, b.title.as_deref(), b.issue_key.as_deref(), b.desk.as_deref()).await?;
+async fn create_item(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<NewItem>) -> ApiResult {
+    let id = ensure_item(&app, &headers, b.title.as_deref(), b.issue_key.as_deref(), b.desk.as_deref()).await?;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -674,7 +698,7 @@ struct Link {
     repo_path: Option<String>,
 }
 
-async fn link_item(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<Link>) -> ApiResult {
+async fn link_item(Ax(app): Ax<Shared>, headers: HeaderMap, Path(id): Path<String>, Json(b): Json<Link>) -> ApiResult {
     if !app.db.read(|st| st.items.contains_key(&id)) {
         return Err(missing("no such work item"));
     }
@@ -687,9 +711,10 @@ async fn link_item(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<Li
     if let Some(key) = b.issue_key.filter(|k| !k.trim().is_empty()) {
         let key = key.trim().to_ascii_uppercase();
         let conns = Connectors::load()?;
-        let issue = linear::find_issue(&conns.linear, &key, now_ms())
-            .await?
-            .ok_or_else(|| missing(format!("no connected Linear workspace has {key}")))?;
+        let issue = match linear::find_issue(&conns.linear, &key, now_ms()).await? {
+            Some(i) => i,
+            None => return Err(no_key(&app, &headers, &conns.linear, &key).await),
+        };
         app.db.write(|st| {
             if let Some(i) = st.items.get_mut(&id) {
                 i.title = issue.title.clone();
@@ -813,7 +838,7 @@ struct Assign {
     client: Option<String>,
 }
 
-async fn assign_session(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): Json<Assign>) -> ApiResult {
+async fn assign_session(Ax(app): Ax<Shared>, headers: HeaderMap, Path(sid): Path<String>, Json(b): Json<Assign>) -> ApiResult {
     let now = now_ms();
     let client = clean(&b.client).map(|c| c.chars().take(40).collect::<String>());
     app.db.write(|st| {
@@ -832,7 +857,7 @@ async fn assign_session(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): J
     }
     let item_id = match b.item_id.filter(|i| !i.is_empty()) {
         Some(i) => i,
-        None => ensure_item(&app, b.new_title.as_deref(), b.issue_key.as_deref(), b.desk.as_deref()).await?,
+        None => ensure_item(&app, &headers, b.new_title.as_deref(), b.issue_key.as_deref(), b.desk.as_deref()).await?,
     };
     let ok = app.db.write(|st| st.assign_session(&sid, &item_id, now, &LocalDays, &RealGit));
     if !ok {
@@ -1595,8 +1620,12 @@ struct IssueQuery {
     skip: usize,
 }
 
-async fn linear_issue(Path(key): Path<String>, Query(q): Query<IssueQuery>) -> ApiResult {
-    Ok(Json(linear::read_issue(&linear_accounts()?, key.trim(), q.skip).await?))
+async fn linear_issue(Ax(app): Ax<Shared>, headers: HeaderMap, Path(key): Path<String>, Query(q): Query<IssueQuery>) -> ApiResult {
+    let accounts = linear_accounts()?;
+    match linear::read_issue(&accounts, key.trim(), q.skip).await {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err(key_error(&app, &headers, &accounts, key.trim(), e).await),
+    }
 }
 
 /// Who a call comes from (EMB-94): the session and folder a `DeskClient`
@@ -1678,9 +1707,13 @@ struct StatusBody {
 }
 
 /// A status move by state name: straight through, like the card's dropdown.
-async fn linear_status(Ax(app): Ax<Shared>, Json(b): Json<StatusBody>) -> ApiResult {
+async fn linear_status(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<StatusBody>) -> ApiResult {
     let now = now_ms();
-    let updated = linear::set_state_by_name(&linear_accounts()?, b.key.trim(), &b.status, now).await?;
+    let accounts = linear_accounts()?;
+    let updated = match linear::set_state_by_name(&accounts, b.key.trim(), &b.status, now).await {
+        Ok(u) => u,
+        Err(e) => return Err(key_error(&app, &headers, &accounts, b.key.trim(), e).await),
+    };
     app.db.write(|st| {
         if let Some(id) = st.item_by_key(&updated.key).map(|i| i.id.clone()) {
             if let Some(i) = st.items.get_mut(&id) {
@@ -2020,13 +2053,13 @@ struct TimerBody {
 
 /// The manual timer, for work away from Claude Code — what harvest:track
 /// covered (decision 31).
-async fn timer_start(Ax(app): Ax<Shared>, Json(b): Json<TimerBody>) -> ApiResult {
+async fn timer_start(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<TimerBody>) -> ApiResult {
     if !app.db.read(|st| st.settings.time) {
         return Err(bad("this desk captures no time"));
     }
     let item_id = match clean(&b.item_id) {
         Some(i) => i,
-        None => ensure_item(&app, b.new_title.as_deref(), b.issue_key.as_deref(), b.desk.as_deref()).await?,
+        None => ensure_item(&app, &headers, b.new_title.as_deref(), b.issue_key.as_deref(), b.desk.as_deref()).await?,
     };
     let now = now_ms();
     if !app.db.write(|st| st.start_timer(&item_id, now, &LocalDays)) {
@@ -3634,7 +3667,7 @@ mod tests {
         let Ok(Json(v)) = put(json!({"time": false, "direct_writes": true})).await else { panic!("put") };
         assert_eq!((v["time"].as_bool(), v["promptu"].as_bool(), v["direct_writes"].as_bool()), (Some(false), Some(true), Some(true)));
         let body = serde_json::from_value(json!({"new_title": "x"})).unwrap();
-        assert!(timer_start(Ax(app.clone()), Json(body)).await.is_err(), "no timer on a desk that captures no time");
+        assert!(timer_start(Ax(app.clone()), HeaderMap::new(), Json(body)).await.is_err(), "no timer on a desk that captures no time");
         std::fs::remove_dir_all(dir).ok();
     }
 

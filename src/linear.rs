@@ -165,7 +165,44 @@ where
             Err(e) => last_err = Some(e),
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow!("no connected Linear workspace has {key}")))
+    Err(last_err.unwrap_or_else(|| NoWorkspaceHas(key.to_string()).into()))
+}
+
+/// No connected workspace has the issue key. A typed error so the server can
+/// say which case it is ([`no_key_message`]); alone it reads as it always did.
+#[derive(Debug)]
+pub struct NoWorkspaceHas(pub String);
+
+impl std::fmt::Display for NoWorkspaceHas {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no connected Linear workspace has {}", self.0)
+    }
+}
+
+impl std::error::Error for NoWorkspaceHas {}
+
+/// Why no workspace has `key`, in words an agent can act on (EMB-9). The
+/// key's team (its prefix) is looked up first among the desks other than the
+/// caller's: bound to one of them, the message names that desk and its folder,
+/// since a session works on its own desk (decision 77). Else, when the
+/// connected workspaces' `teams` are known and lack it, it says no connected
+/// workspace has that team, naming no desk. Else the team is here and the
+/// issue is not.
+pub fn no_key_message(key: &str, teams: Option<&[Value]>, desks: &[&crate::store::Desk], caller: Option<&str>) -> String {
+    let prefix = key.rsplit_once('-').map_or(key, |(p, _)| p).to_ascii_uppercase();
+    let bound = |d: &&&crate::store::Desk| d.linear.as_ref().is_some_and(|l| l.team_key.eq_ignore_ascii_case(&prefix));
+    if let Some(d) = desks.iter().filter(|d| Some(d.id.as_str()) != caller).find(bound) {
+        let folder = d.firmware_repos.first().map_or_else(
+            || "it has no folder yet; add one on the Desk tab".to_string(),
+            |f| format!("open a session in {f}"),
+        );
+        return format!("{key} is in team {prefix}, which belongs to desk {:?}, not this session's; {folder}", d.name);
+    }
+    let known = teams.is_some_and(|t| t.iter().any(|t| t["key"].as_str().is_some_and(|k| k.eq_ignore_ascii_case(&prefix))));
+    match teams {
+        Some(_) if !known => format!("no connected Linear workspace has a team {prefix}, so {key} is not a key here; check the key"),
+        _ => format!("no connected Linear workspace has {key}"),
+    }
 }
 
 /// Comments an issue read returns at once: the newest of them.
@@ -501,7 +538,7 @@ pub async fn search(accounts: &[Account], query: &str, scope: Option<&LinearBind
 
 /// A status move by the state's name, as an agent says it ("In Review").
 pub async fn set_state_by_name(accounts: &[Account], key: &str, name: &str, now: i64) -> Result<IssueRef> {
-    let issue = find_issue(accounts, key, now).await?.ok_or_else(|| anyhow!("no connected Linear workspace has {key}"))?;
+    let issue = find_issue(accounts, key, now).await?.ok_or_else(|| anyhow::Error::from(NoWorkspaceHas(key.to_string())))?;
     let all = states(accounts, &issue).await?;
     let want = name.trim().to_lowercase();
     let st = all
@@ -800,5 +837,33 @@ mod tests {
         let v = comment_fields(&numbered(COMMENTS_CAP), true, 0);
         assert_eq!((v["comments_capped"].as_bool(), v["comments_truncated"].as_bool()), (Some(true), Some(true)));
         assert!(v["comments_note"].as_str().unwrap().contains("500+"));
+    }
+
+    #[test]
+    fn a_key_no_workspace_has_says_which_case_it_is() {
+        use crate::store::{Desk, LinearBinding};
+        let desk = |id: &str, name: &str, team: &str, repos: &[&str]| Desk {
+            id: id.into(),
+            name: name.into(),
+            linear: Some(LinearBinding { team_key: team.into(), ..Default::default() }),
+            firmware_repos: repos.iter().map(|r| r.to_string()).collect(),
+            ..Default::default()
+        };
+        let (a, b, c) = (desk("a", "Alpha", "AAA", &["/w/a"]), desk("b", "Beta", "BBB", &["/w/b", "/w/b2"]), desk("c", "Gamma", "CCC", &[]));
+        let desks = [&a, &b, &c];
+        let teams = [json!({ "key": "AAA" }), json!({ "key": "ZZZ" })];
+        // Another desk's team: the desk and its first folder, never the key's own desk.
+        let m = no_key_message("bbb-7", Some(&teams), &desks, Some("a"));
+        assert!(m.contains("\"Beta\"") && m.contains("/w/b") && !m.contains("b2"), "{m}");
+        let m = no_key_message("CCC-1", None, &desks, Some("a"));
+        assert!(m.contains("\"Gamma\"") && m.contains("no folder"), "{m}");
+        // No connected workspace has the team: says so, names no desk.
+        let m = no_key_message("QQQ-3", Some(&teams), &desks, Some("a"));
+        assert!(m.contains("has a team QQQ") && !m.contains("Alpha") && !m.contains("desk"), "{m}");
+        // The caller's own team, or a team that is here: the issue is what is missing.
+        assert_eq!(no_key_message("AAA-9", Some(&teams), &desks, Some("a")), "no connected Linear workspace has AAA-9");
+        assert_eq!(no_key_message("ZZZ-9", Some(&teams), &desks, None), "no connected Linear workspace has ZZZ-9");
+        // The typed error reads as it always did.
+        assert_eq!(NoWorkspaceHas("X-1".into()).to_string(), "no connected Linear workspace has X-1");
     }
 }
