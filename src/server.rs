@@ -53,6 +53,12 @@ pub struct Cache {
     /// When `agents` was read.
     pub agents_ms: i64,
     pub wsl_distro: Option<String>,
+    /// When each folder was last polled for its mailbox, by normalised path:
+    /// a window shows a folder while it polls for it (decision 84).
+    pub polled: HashMap<String, i64>,
+    /// When this desk started; 0 on a default cache. Absence is measured
+    /// from the later of a folder's last poll and this.
+    pub started_ms: i64,
     /// Linear sign-ins through its MCP server, by the state each handed out.
     pub signins: HashMap<String, SignIn>,
 }
@@ -2763,7 +2769,15 @@ fn start_entry(item_id: &str, folder: &str, prompt: &str) -> MailboxEntry {
     }
 }
 
-// ---------------------------------------------------------------- close-out (decision 77)
+// ---------------------------------------------------------------- close-out (decision 83)
+
+/// Why the folder is left when the desk cannot see windows (decision 84).
+const CHAT_OFF_WHY: &str = "the chat panel setting is off, so the desk cannot see whether a window shows the folder; remove it yourself";
+
+/// How long no poll for a folder may go before it has no window: three of
+/// the chat's 60 s back-off, so a window backing off is not read as closed
+/// (decision 84) [chosen].
+const WINDOW_GRACE_MS: i64 = 180_000;
 
 /// Run the checks on an item's issue folder and tell its window: an `end`
 /// when every one passes, an `unfinished` naming each failure otherwise. The
@@ -2777,7 +2791,15 @@ async fn close_out(app: &App, suite: &crate::suite::Suite, item_id: &str, outcom
     let window = window.filter(|w| std::path::Path::new(w).starts_with(&dir))?;
     let checked = dir.clone();
     let blockers = tokio::task::spawn_blocking(move || crate::closeout::check(&checked, outcome)).await.ok()?;
-    let done = store::CloseOut { outcome: outcome.to_string(), blockers };
+    let chat_panel = app.db.read(|st| st.settings.chat_panel);
+    let removal = if !blockers.is_empty() {
+        store::Removal::new(store::Removal::LEFT, "the checks failed; Finish runs them again")
+    } else if !chat_panel {
+        store::Removal::new(store::Removal::LEFT, CHAT_OFF_WHY)
+    } else {
+        store::Removal::new(store::Removal::WAITING, "waiting for the issue's window to close")
+    };
+    let done = store::CloseOut { outcome: outcome.to_string(), blockers, removal: Some(removal) };
     let entry = MailboxEntry {
         kind: if done.blockers.is_empty() { "end" } else { "unfinished" }.into(),
         item_id: Some(item_id.to_string()),
@@ -2814,7 +2836,7 @@ async fn note_state(app: &App, suite: &crate::suite::Suite, item_id: &str, state
 }
 
 /// The reference index's pass over the items with a folder: a move made in
-/// Linear itself closes out at the refresh that sees it (decision 77). The
+/// Linear itself closes out at the refresh that sees it (decision 83). The
 /// index's state type is read first; where the connector gives none, the
 /// issue is read again when its state's name differs from the item's.
 async fn close_out_pass(app: &App, suite: &crate::suite::Suite, accounts: &[crate::connectors::Account]) {
@@ -2842,6 +2864,90 @@ async fn close_out_pass(app: &App, suite: &crate::suite::Suite, accounts: &[crat
         };
         note_state(app, suite, &id, &state_type).await;
     }
+}
+
+/// When a window last showed any folder inside `dir`: the latest poll, or
+/// the desk's own start, since a restart is not a window closing.
+fn last_seen_ms(app: &App, dir: &std::path::Path) -> i64 {
+    let cache = app.cache.lock().expect("cache");
+    let dir = store::norm_folder(&dir.to_string_lossy());
+    cache
+        .polled
+        .iter()
+        .filter(|(f, _)| std::path::Path::new(f.as_str()).starts_with(&dir))
+        .map(|(_, at)| *at)
+        .fold(cache.started_ms, i64::max)
+}
+
+/// Remove the folder of each closed-out issue whose window is gone
+/// (decision 84). Only a record waiting for its window is looked at, and
+/// only while the chat panel setting is on: with it off a window may never
+/// poll, so the folder is left for the owner. The checks run again inside
+/// [`crate::closeout::remove`]; a failure posts an `unfinished` and removes
+/// nothing.
+async fn removal_pass(app: &App, suite: &crate::suite::Suite, now: i64) {
+    let waiting: Vec<(String, String, String, Option<String>)> = app.db.read(|st| {
+        st.items
+            .values()
+            .filter_map(|i| {
+                let c = i.close_out.as_ref()?;
+                let waiting = c.blockers.is_empty() && c.removal.as_ref().is_some_and(|r| r.state == store::Removal::WAITING);
+                waiting.then(|| (i.id.clone(), c.outcome.clone(), i.issue.as_ref().map(|r| r.key.clone()).unwrap_or_default(), i.repo_path.clone()))
+            })
+            .collect()
+    });
+    for (id, outcome, key, window) in waiting {
+        let set = |r: store::Removal| app.db.write(|st| st.items.get_mut(&id).and_then(|i| i.close_out.as_mut()).map(|c| c.removal = Some(r)));
+        if !app.db.read(|st| st.settings.chat_panel) {
+            set(store::Removal::new(store::Removal::LEFT, CHAT_OFF_WHY));
+            continue;
+        }
+        let Ok(dir) = suite.issue_dir(&key) else { continue };
+        if !dir.is_dir() {
+            set(store::Removal::new(store::Removal::REMOVED, "the folder was already gone"));
+            continue;
+        }
+        if now - last_seen_ms(app, &dir) < WINDOW_GRACE_MS {
+            continue;
+        }
+        let removing = dir.clone();
+        let result = tokio::task::spawn_blocking(move || crate::closeout::remove(&removing, &outcome)).await;
+        match result {
+            Ok(Ok(crate::closeout::Removed::Gone)) => {
+                set(store::Removal::new(store::Removal::REMOVED, "removed after its window closed"));
+            }
+            Ok(Ok(crate::closeout::Removed::Blocked(blockers))) => {
+                app.db.write(|st| {
+                    if let Some(c) = st.items.get_mut(&id).and_then(|i| i.close_out.as_mut()) {
+                        c.blockers = blockers.clone();
+                        c.removal = Some(store::Removal::new(store::Removal::LEFT, "the checks failed again at removal; Finish runs them again"));
+                    }
+                    if let Some(window) = window {
+                        let entry = MailboxEntry {
+                            kind: "unfinished".into(),
+                            item_id: Some(id.clone()),
+                            folder: window,
+                            issue_key: Some(key.clone()),
+                            outcome: Some(c_outcome(st, &id)),
+                            blockers: Some(blockers),
+                            ..Default::default()
+                        };
+                        st.post_mail(entry, now);
+                    }
+                });
+            }
+            Ok(Err(why)) => {
+                set(store::Removal::new(store::Removal::LEFT, format!("could not remove it: {why}")));
+            }
+            Err(e) => {
+                set(store::Removal::new(store::Removal::LEFT, format!("the removal did not finish: {e}")));
+            }
+        }
+    }
+}
+
+fn c_outcome(st: &store::State, id: &str) -> String {
+    st.items.get(id).and_then(|i| i.close_out.as_ref()).map(|c| c.outcome.clone()).unwrap_or_default()
 }
 
 /// Re-run the close-out checks for an item whose issue is Done or Canceled
@@ -2932,6 +3038,7 @@ struct MailQuery {
 async fn get_mailbox(Ax(app): Ax<Shared>, Query(q): Query<MailQuery>) -> ApiResult {
     let folder = clean(&q.folder).filter(|f| f.starts_with('/')).ok_or_else(|| bad("give folder, an absolute path"))?;
     let now = now_ms();
+    app.cache.lock().expect("cache").polled.insert(store::norm_folder(&folder), now);
     Ok(Json(app.db.read(|st| json!({ "entries": st.mail_for(&folder, now) }))))
 }
 
@@ -3288,6 +3395,9 @@ where
 /// `POST /sync`. Only this task refreshes, so passes never overlap.
 pub async fn refs_loop(app: Shared) {
     refs_loop_with(app, std::time::Duration::from_secs(30), |app| async move {
+        if let Some(suite) = crate::suite::Suite::from_env() {
+            removal_pass(&app, &suite, now_ms()).await;
+        }
         let Ok(conns) = Connectors::load() else { return };
         let gh = conns.github_accounts();
         let (linear, gh) = (&conns.linear, &gh);
@@ -4897,7 +5007,7 @@ mod tests {
         assert_eq!((m.kind.as_str(), m.outcome.as_deref(), m.issue_key.as_deref(), m.blockers.clone()), ("end", Some("done"), Some("ABC-1"), None));
         assert_eq!(m.item_id.as_deref(), Some(id.as_str()));
         assert!(m.expires_ms > now + store::LAUNCH_CLAIM_MS * 1000, "a close-out waits for its window, not for a clock");
-        assert_eq!(app.db.read(|st| st.items[&id].close_out.clone()), Some(store::CloseOut { outcome: "done".into(), blockers: vec![] }));
+        assert_eq!(app.db.read(|st| st.items[&id].close_out.clone()), Some(store::CloseOut { outcome: "done".into(), blockers: vec![], removal: Some(store::Removal::new(store::Removal::LEFT, CHAT_OFF_WHY)) }));
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -5010,6 +5120,110 @@ mod tests {
             assert!(post(json!({"kind": kind, "folder": "/w/fw", "outcome": "done"})).await.is_err(), "{kind}");
         }
         assert!(app.db.read(|st| st.mailbox.is_empty()));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ------------------------------------------------------------ the folder's removal (decision 84)
+
+    fn chat_on(app: &Shared) {
+        app.db.write(|st| st.settings.chat_panel = true);
+    }
+
+    fn removal(app: &Shared, id: &str) -> store::Removal {
+        app.db.read(|st| st.items[id].close_out.clone().unwrap().removal.unwrap())
+    }
+
+    fn polled(app: &Shared, folder: &str, at: i64) {
+        app.cache.lock().unwrap().polled.insert(store::norm_folder(folder), at);
+    }
+
+    #[tokio::test]
+    async fn the_folder_goes_once_no_poll_has_come_for_the_grace_and_a_symlinks_target_stays() {
+        let (app, dir, suite, id, window) = closeout_fixture("canceled");
+        chat_on(&app);
+        let sibling = dir.join("sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("keep.txt"), "x").unwrap();
+        let folder = suite.issue_dir("ABC-1").unwrap();
+        std::os::unix::fs::symlink(&sibling, folder.join("sibling")).unwrap();
+        note_state(&app, &suite, &id, "canceled").await;
+        assert_eq!(removal(&app, &id).state, store::Removal::WAITING);
+        polled(&app, &window, 1_000_000);
+        removal_pass(&app, &suite, 1_000_000 + WINDOW_GRACE_MS - 1).await;
+        assert!(folder.is_dir(), "a window that polled within the grace still shows it");
+        assert_eq!(removal(&app, &id).state, store::Removal::WAITING);
+        removal_pass(&app, &suite, 1_000_000 + WINDOW_GRACE_MS).await;
+        assert!(!folder.exists());
+        assert!(sibling.join("keep.txt").exists(), "a symlink's target is untouched");
+        assert_eq!(removal(&app, &id).state, store::Removal::REMOVED);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_desk_that_has_just_started_does_not_read_a_folder_as_windowless() {
+        let (app, dir, suite, id, _window) = closeout_fixture("canceled");
+        chat_on(&app);
+        note_state(&app, &suite, &id, "canceled").await;
+        let folder = suite.issue_dir("ABC-1").unwrap();
+        app.cache.lock().unwrap().started_ms = 5_000_000;
+        // No poll has ever arrived, and the desk started a moment ago.
+        removal_pass(&app, &suite, 5_000_000 + WINDOW_GRACE_MS - 1).await;
+        assert!(folder.is_dir());
+        assert_eq!(removal(&app, &id).state, store::Removal::WAITING);
+        // A poll before the start does not count for more than the start.
+        polled(&app, &folder.join("fw").to_string_lossy(), 4_000_000);
+        removal_pass(&app, &suite, 5_000_000 + WINDOW_GRACE_MS - 1).await;
+        assert!(folder.is_dir());
+        removal_pass(&app, &suite, 5_000_000 + WINDOW_GRACE_MS).await;
+        assert!(!folder.exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn with_the_chat_setting_off_nothing_is_removed_and_the_record_says_why() {
+        let (app, dir, suite, id, _window) = closeout_fixture("canceled");
+        note_state(&app, &suite, &id, "canceled").await;
+        let r = removal(&app, &id);
+        assert_eq!(r.state, store::Removal::LEFT);
+        assert!(r.why.contains("chat panel setting is off"), "{}", r.why);
+        removal_pass(&app, &suite, i64::MAX / 2).await;
+        assert!(suite.issue_dir("ABC-1").unwrap().is_dir());
+        // Turned off after the close-out: the waiting record turns into left.
+        let (app, dir2, suite, id, _w) = closeout_fixture("canceled");
+        chat_on(&app);
+        note_state(&app, &suite, &id, "canceled").await;
+        app.db.write(|st| st.settings.chat_panel = false);
+        removal_pass(&app, &suite, i64::MAX / 2).await;
+        assert_eq!(removal(&app, &id).state, store::Removal::LEFT);
+        assert!(suite.issue_dir("ABC-1").unwrap().is_dir());
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(dir2).ok();
+    }
+
+    #[tokio::test]
+    async fn uncommitted_files_at_removal_time_post_an_unfinished_and_remove_nothing() {
+        let (app, dir, suite, id, window) = closeout_fixture("canceled");
+        chat_on(&app);
+        note_state(&app, &suite, &id, "canceled").await;
+        std::fs::write(std::path::Path::new(&window).join("late.txt"), "x").unwrap();
+        removal_pass(&app, &suite, i64::MAX / 2).await;
+        assert!(suite.issue_dir("ABC-1").unwrap().is_dir());
+        let m = mail(&app, &window);
+        assert_eq!((m.len(), m[0].kind.as_str(), m[0].outcome.as_deref()), (1, "unfinished", Some("canceled")));
+        let b = m[0].blockers.clone().unwrap();
+        assert!(b[0].repo == "fw" && b[0].reason.contains("uncommitted"), "{b:?}");
+        let c = app.db.read(|st| st.items[&id].close_out.clone()).unwrap();
+        assert_eq!((c.blockers.len(), c.removal.unwrap().state), (1, store::Removal::LEFT.to_string()));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_mailbox_route_records_the_poll() {
+        let (app, dir) = scratch_app();
+        let q = || Query(MailQuery { folder: Some("/w/fw-1/".into()) });
+        assert!(app.cache.lock().unwrap().polled.is_empty());
+        let _ = get_mailbox(Ax(app.clone()), q()).await.unwrap_or_else(|e| panic!("{}", e.1));
+        assert!(app.cache.lock().unwrap().polled.contains_key("/w/fw-1"));
         std::fs::remove_dir_all(dir).ok();
     }
 

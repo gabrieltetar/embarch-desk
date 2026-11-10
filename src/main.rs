@@ -277,7 +277,7 @@ async fn serve() -> Result<()> {
         db,
         refs,
         token: paths::desk_token()?,
-        cache: Mutex::new(server::Cache { wsl_distro: server::detect_wsl_distro(), ..Default::default() }),
+        cache: Mutex::new(server::Cache { wsl_distro: server::detect_wsl_distro(), started_ms: server::now_ms(), ..Default::default() }),
         wsl_distro: server::detect_wsl_distro(),
         window_days: std::env::var("EMBARCH_DESK_WINDOW_DAYS").ok().and_then(|d| d.parse().ok()).unwrap_or(7),
         model: std::env::var("EMBARCH_DESK_MODEL").unwrap_or_else(|_| claude::DEFAULT_MODEL.into()),

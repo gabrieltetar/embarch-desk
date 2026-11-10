@@ -141,7 +141,7 @@ pub struct MailboxEntry {
     pub id: String,
     /// `start` (a chat on an item, with a prompt), `focus` (a session),
     /// `open` (an untracked chat, with no item and no prompt), or — written
-    /// by the desk alone (decision 77) — `end` and `unfinished`.
+    /// by the desk alone (decision 83) — `end` and `unfinished`.
     pub kind: String,
     #[serde(default)]
     pub item_id: Option<String>,
@@ -175,12 +175,35 @@ pub struct Blocker {
 }
 
 /// What the desk did when an item's issue went Done or Canceled (decision
-/// 77): the outcome, `done` or `canceled`, and the checks that failed.
-/// Recorded once per move, cleared when the issue is open again.
+/// 83): the outcome, `done` or `canceled`, the checks that failed, and what
+/// became of the folder. Recorded once per move, cleared when the issue is
+/// open again.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CloseOut {
     pub outcome: String,
     pub blockers: Vec<Blocker>,
+    /// What became of the folder (decision 84); `None` for a record from
+    /// before the removal existed.
+    #[serde(default)]
+    pub removal: Option<Removal>,
+}
+
+/// `waiting` for the window to go, `removed`, or `left` for the owner, and
+/// why in one line.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Removal {
+    pub state: String,
+    pub why: String,
+}
+
+impl Removal {
+    pub const WAITING: &'static str = "waiting";
+    pub const REMOVED: &'static str = "removed";
+    pub const LEFT: &'static str = "left";
+
+    pub fn new(state: &str, why: impl Into<String>) -> Removal {
+        Removal { state: state.to_string(), why: why.into() }
+    }
 }
 
 /// A close-out's mailbox entry never expires on the launch clock, and so
