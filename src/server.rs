@@ -2606,9 +2606,11 @@ async fn start_work(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     let prepared = tokio::task::spawn_blocking(move || match source {
         StartFrom::Suite(s, repo) => s.start(&key, &repo, &br),
         StartFrom::Clone(main) => {
-            let p = crate::worktree::prepare(&main, &key, &br)?;
+            let mut p = crate::worktree::prepare(&main, &key, &br)?;
             crate::worktree::set_auto_mode(&p.path)?;
             crate::worktree::link_local_files(&main, &p.path)?;
+            let zephyr = crate::worktree::set_zephyr_modules(&main, &p.path)?;
+            p.warnings.extend(zephyr);
             Ok::<_, anyhow::Error>(p)
         }
     })

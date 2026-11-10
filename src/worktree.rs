@@ -155,6 +155,12 @@ pub fn add_directory(worktree: &Path, dir: &Path) -> Result<()> {
 }
 
 fn edit_permissions(worktree: &Path, edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>)) -> Result<()> {
+    edit_section(worktree, "permissions", edit)
+}
+
+/// Edit one top-level object of the worktree's local settings file (made if
+/// absent), every other key kept, and keep the file out of git.
+fn edit_section(worktree: &Path, section: &str, edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>)) -> Result<()> {
     let dir = worktree.join(".claude");
     std::fs::create_dir_all(&dir)?;
     let file = dir.join("settings.local.json");
@@ -165,12 +171,95 @@ fn edit_permissions(worktree: &Path, edit: impl FnOnce(&mut serde_json::Map<Stri
     if !v.is_object() {
         v = serde_json::json!({});
     }
-    let perms = v.as_object_mut().expect("object").entry("permissions").or_insert_with(|| serde_json::json!({}));
-    if let Some(p) = perms.as_object_mut() {
+    let sec = v.as_object_mut().expect("object").entry(section).or_insert_with(|| serde_json::json!({}));
+    if let Some(p) = sec.as_object_mut() {
         edit(p);
     }
     std::fs::write(&file, serde_json::to_string_pretty(&v)? + "\n")?;
     exclude_from_git(worktree, ".claude/settings.local.json")
+}
+
+/// The module name Zephyr gives a repo: `name:` in `zephyr/module.yml`, else
+/// its directory's name. `None` when the file has no `name:`.
+fn declared_module_name(repo: &Path) -> Option<String> {
+    let yml = std::fs::read_to_string(repo.join("zephyr").join("module.yml")).ok()?;
+    yml.lines().find_map(|l| {
+        let v = l.strip_prefix("name:")?.split('#').next()?.trim().trim_matches(|c| c == '"' || c == '\'');
+        (!v.is_empty()).then(|| v.to_string())
+    })
+}
+
+/// Whether a west project is a Zephyr module: `zephyr` itself and a plain
+/// manifest repo are listed by west but are not, and Zephyr's own module
+/// list leaves them out.
+fn is_zephyr_module(dir: &Path) -> bool {
+    dir.join("zephyr").join("module.yml").is_file() || dir.join("zephyr").join("CMakeLists.txt").is_file()
+}
+
+/// The `.west/` workspace above `dir`, if any.
+fn west_workspace_of(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors().skip(1).find(|a| a.join(".west").is_dir()).map(Path::to_path_buf)
+}
+
+/// A build in `worktree` reads its Zephyr module files from the worktree, not
+/// from the main clone west lists: `ZEPHYR_MODULES` (which replaces west's
+/// module list outright, read by `zephyr_get`, so the environment works)
+/// goes into the worktree's local settings `env` as the workspace's modules
+/// with the main clone swapped for the worktree. Returns warnings.
+/// Nothing is written, and nothing said, when the clone is in no west
+/// workspace or west does not list it as a project; a missing `west` is a
+/// warning, never an error.
+pub fn set_zephyr_modules(main_clone: &Path, worktree: &Path) -> Result<Vec<String>> {
+    set_zephyr_modules_with(main_clone, worktree, "west")
+}
+
+pub fn set_zephyr_modules_with(main_clone: &Path, worktree: &Path, west: &str) -> Result<Vec<String>> {
+    let Ok(main) = main_clone.canonicalize() else { return Ok(vec![]) };
+    if west_workspace_of(&main).is_none() || main == worktree.canonicalize().unwrap_or_default() {
+        return Ok(vec![]);
+    }
+    let out = match Command::new(west).args(["list", "-f", "{abspath}"]).current_dir(&main).output() {
+        Ok(o) => o,
+        Err(e) => {
+            let why = if e.kind() == std::io::ErrorKind::NotFound { "west was not found".to_string() } else { format!("could not run west: {e}") };
+            return Ok(vec![format!(
+                "{why}: a build in this worktree reads this repo's Zephyr module files from the main clone, not the worktree; set ZEPHYR_MODULES by hand"
+            )]);
+        }
+    };
+    if !out.status.success() {
+        return Ok(vec![format!(
+            "west list failed ({}), so ZEPHYR_MODULES is not set: a build in this worktree reads this repo's Zephyr module files from the main clone",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )]);
+    }
+    let listed: Vec<PathBuf> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| PathBuf::from(l).canonicalize().unwrap_or_else(|_| PathBuf::from(l)))
+        .collect();
+    if !listed.contains(&main) {
+        return Ok(vec![]);
+    }
+    let wt = worktree.to_string_lossy().into_owned();
+    let modules: Vec<String> = listed
+        .iter()
+        .filter_map(|p| if *p == main { Some(wt.clone()) } else { is_zephyr_module(p).then(|| p.to_string_lossy().into_owned()) })
+        .collect();
+    let mut warnings = vec![];
+    if declared_module_name(worktree).is_none() {
+        let dir = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        warnings.push(format!(
+            "this repo's zephyr/module.yml has no name:, so Zephyr names the module after its folder: {} here, {} in the main clone, and ZEPHYR_<NAME>_MODULE_DIR and any Kconfig keyed on the name change with it. ZEPHYR_MODULES is still set; add name: to module.yml to keep one name",
+            dir(worktree),
+            dir(&main)
+        ));
+    }
+    edit_section(worktree, "env", |env| {
+        env.insert("ZEPHYR_MODULES".into(), serde_json::json!(modules.join(";")));
+    })?;
+    Ok(warnings)
 }
 
 /// Append `pattern` to the repo's shared `info/exclude` unless it is there.
@@ -316,6 +405,118 @@ mod tests {
         assert_eq!(git(&w, &["status", "--porcelain"]).unwrap(), "", "the links are ignored");
         let exclude = std::fs::read_to_string(clone.join(".git/info/exclude")).unwrap();
         assert_eq!(exclude.lines().filter(|l| *l == "embarch").count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A west workspace at `root/proj` (its `.west/`), a stand-in `west` that
+    /// prints `listing` (one path per line), and the clone made a module.
+    #[cfg(unix)]
+    fn fake_west(root: &Path, listing: &[PathBuf], module_yml: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(root.join("proj/.west")).unwrap();
+        let clone = root.join("proj/fw");
+        std::fs::create_dir_all(clone.join("zephyr")).unwrap();
+        std::fs::write(clone.join("zephyr/module.yml"), module_yml).unwrap();
+        let script = root.join("west");
+        let body: String = listing.iter().map(|p| format!("echo '{}'\n", p.display())).collect();
+        std::fs::write(&script, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    fn workspace_listing(root: &Path) -> (Vec<PathBuf>, PathBuf) {
+        let proj = root.join("proj");
+        let other = proj.join("hal");
+        std::fs::create_dir_all(other.join("zephyr")).unwrap();
+        std::fs::write(other.join("zephyr/module.yml"), "name: hal\n").unwrap();
+        let zephyr = proj.join("zephyr");
+        std::fs::create_dir_all(&zephyr).unwrap();
+        let main = proj.join("fw");
+        (vec![zephyr.clone(), other.clone(), main.clone()], other)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_main_clone_is_swapped_for_the_worktree_in_zephyr_modules() {
+        let (root, clone) = fixture();
+        let w = prepare(&clone, "ABC-7", "user/abc-7").unwrap().path;
+        let (listing, other) = workspace_listing(&root);
+        let west = fake_west(&root, &listing, "name: fw\n");
+        std::fs::create_dir_all(w.join("zephyr")).unwrap();
+        std::fs::write(w.join("zephyr/module.yml"), "name: fw  # kept\n").unwrap();
+        let warnings = set_zephyr_modules_with(&clone, &w, &west).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(w.join(".claude/settings.local.json")).unwrap()).unwrap();
+        let canon = |p: &Path| p.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert_eq!(s["env"]["ZEPHYR_MODULES"], format!("{};{}", canon(&other), w.display()), "zephyr itself is no module; the clone gives way");
+        assert!(!git(&w, &["status", "--porcelain"]).unwrap().contains("settings.local.json"), "the settings file is ignored");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zephyr_modules_merges_into_an_existing_settings_file() {
+        let (root, clone) = fixture();
+        let w = prepare(&clone, "ABC-8", "user/abc-8").unwrap().path;
+        set_auto_mode(&w).unwrap();
+        let file = w.join(".claude/settings.local.json");
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        v["env"] = serde_json::json!({"KEEP": "1", "ZEPHYR_MODULES": "old"});
+        std::fs::write(&file, v.to_string()).unwrap();
+        let (listing, _) = workspace_listing(&root);
+        let west = fake_west(&root, &listing, "name: fw\n");
+        set_zephyr_modules_with(&clone, &w, &west).unwrap();
+        let s: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(s["env"]["KEEP"], "1");
+        assert_eq!(s["permissions"]["defaultMode"], "auto");
+        assert_ne!(s["env"]["ZEPHYR_MODULES"], "old");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outside_a_west_workspace_or_unlisted_nothing_is_written() {
+        let (root, clone) = fixture();
+        let w = prepare(&clone, "ABC-9", "user/abc-9").unwrap().path;
+        // No .west above the clone: west is never asked, so a missing one is no warning.
+        assert!(set_zephyr_modules_with(&clone, &w, "/no/such/west").unwrap().is_empty());
+        assert!(!w.join(".claude/settings.local.json").exists());
+        // A workspace that does not list the clone.
+        let (listing, other) = workspace_listing(&root);
+        let west = fake_west(&root, &listing[..2], "name: fw\n");
+        assert!(set_zephyr_modules_with(&clone, &w, &west).unwrap().is_empty());
+        assert!(!w.join(".claude/settings.local.json").exists());
+        let _ = other;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_west_in_a_workspace_is_a_warning() {
+        let (root, clone) = fixture();
+        let w = prepare(&clone, "ABC-10", "user/abc-10").unwrap().path;
+        fake_west(&root, &[], "name: fw\n");
+        let warnings = set_zephyr_modules_with(&clone, &w, "/no/such/west").unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("west was not found"), "{warnings:?}");
+        assert!(!w.join(".claude/settings.local.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_module_with_no_name_warns_and_is_still_set() {
+        let (root, clone) = fixture();
+        let w = prepare(&clone, "ABC-11", "user/abc-11").unwrap().path;
+        let (listing, _) = workspace_listing(&root);
+        let west = fake_west(&root, &listing, "build:\n  cmake: .\n");
+        std::fs::create_dir_all(w.join("zephyr")).unwrap();
+        std::fs::write(w.join("zephyr/module.yml"), "build:\n  cmake: .\n").unwrap();
+        let warnings = set_zephyr_modules_with(&clone, &w, &west).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("has no name:") && warnings[0].contains("fw-abc-11"), "{warnings:?}");
+        assert!(w.join(".claude/settings.local.json").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
