@@ -1660,7 +1660,7 @@ async fn linear_mine(Ax(app): Ax<Shared>, headers: HeaderMap) -> ApiResult {
     let scope = caller_linear(&app, &headers, None);
     let (issues, truncated) = linear::my_issues(&linear_accounts()?, scope.as_ref()).await?;
     Ok(Json(json!({
-        "scope": scope.as_ref().map(|b| b.project_name.clone()),
+        "scope": scope.as_ref().map(|b| b.scope_label()),
         "issues": issues,
         "truncated": truncated,
     })))
@@ -1671,7 +1671,7 @@ async fn linear_open(Ax(app): Ax<Shared>, headers: HeaderMap) -> ApiResult {
     let scope = caller_linear(&app, &headers, None);
     let (issues, truncated) = linear::open_issues(&linear_accounts()?, scope.as_ref()).await?;
     Ok(Json(json!({
-        "scope": scope.as_ref().map(|b| b.project_name.clone()),
+        "scope": scope.as_ref().map(|b| b.scope_label()),
         "issues": issues,
         "truncated": truncated,
     })))
@@ -4139,6 +4139,9 @@ mod tests {
         assert_eq!(team(&from("t", "/tmp/x")), None, "a session on no desk searches everything");
         assert_eq!(team(&HeaderMap::new()).as_deref(), Some("AAA"), "the UI's own calls");
         assert_eq!(caller_linear(&app, &HeaderMap::new(), Some("s")).map(|l| l.team_key).as_deref(), Some("BBB"), "a session named in the body");
+        let label = |h: &HeaderMap| caller_linear(&app, h, None).map(|l| l.scope_label());
+        assert_eq!(label(&from("s", "/w/b/app")).as_deref(), Some("team BBB"), "the label /linear/mine and /linear/open answer: team-bound, no project");
+        assert_eq!(label(&from("t", "/tmp/x")), None);
         let Ok(Json(v)) = list_desks(Ax(app.clone()), from("s", "/w/b/app")).await else { panic!("desks") };
         assert_eq!((v["open"].as_str(), v["session"].as_str()), (Some(a.as_str()), Some(b.as_str())));
         let Ok(Json(v)) = list_desks(Ax(app.clone()), from("t", "/tmp/x")).await else { panic!("desks") };
