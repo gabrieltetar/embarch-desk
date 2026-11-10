@@ -2545,6 +2545,7 @@ async fn start_work(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
         StartFrom::Clone(main) => {
             let p = crate::worktree::prepare(&main, &key, &br)?;
             crate::worktree::set_auto_mode(&p.path)?;
+            crate::worktree::link_local_files(&main, &p.path)?;
             Ok::<_, anyhow::Error>(p)
         }
     })

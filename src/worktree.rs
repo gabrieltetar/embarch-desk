@@ -170,14 +170,47 @@ fn edit_permissions(worktree: &Path, edit: impl FnOnce(&mut serde_json::Map<Stri
         edit(p);
     }
     std::fs::write(&file, serde_json::to_string_pretty(&v)? + "\n")?;
+    exclude_from_git(worktree, ".claude/settings.local.json")
+}
+
+/// Append `pattern` to the repo's shared `info/exclude` unless it is there.
+fn exclude_from_git(worktree: &Path, pattern: &str) -> Result<()> {
     let common = git(worktree, &["rev-parse", "--git-common-dir"])?;
     let common = if Path::new(&common).is_absolute() { PathBuf::from(common) } else { worktree.join(common) };
     let exclude = common.join("info").join("exclude");
     let current = std::fs::read_to_string(&exclude).unwrap_or_default();
-    if !current.lines().any(|l| l.trim() == ".claude/settings.local.json") {
+    if !current.lines().any(|l| l.trim() == pattern) {
         std::fs::create_dir_all(exclude.parent().expect("info dir"))?;
         let sep = if current.is_empty() || current.ends_with('\n') { "" } else { "\n" };
-        std::fs::write(&exclude, format!("{current}{sep}.claude/settings.local.json\n"))?;
+        std::fs::write(&exclude, format!("{current}{sep}{pattern}\n"))?;
+    }
+    Ok(())
+}
+
+/// The main clone's untracked local files a session needs: the atlas, the
+/// local instructions and the MCP config.
+const LOCAL_FILES: [&str; 3] = ["embarch", "CLAUDE.local.md", ".mcp.json"];
+
+/// Link each of `LOCAL_FILES` the main clone has into the worktree, so the
+/// session loads the atlas and the MCP servers. A name the worktree already
+/// has (a tracked file) is left alone. The excludes carry no trailing slash:
+/// to git a symlink is not a directory.
+pub fn link_local_files(main_clone: &Path, worktree: &Path) -> Result<()> {
+    for name in LOCAL_FILES {
+        let from = main_clone.join(name);
+        let to = worktree.join(name);
+        if from.symlink_metadata().is_err() || to.symlink_metadata().is_ok() {
+            continue;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&from, &to)?;
+        #[cfg(windows)]
+        if from.is_dir() {
+            std::os::windows::fs::symlink_dir(&from, &to)?;
+        } else {
+            std::os::windows::fs::symlink_file(&from, &to)?;
+        }
+        exclude_from_git(worktree, name)?;
     }
     Ok(())
 }
@@ -265,6 +298,35 @@ mod tests {
         assert_eq!(git(&w, &["status", "--porcelain"]).unwrap(), "", "the settings file is ignored");
         let exclude = std::fs::read_to_string(clone.join(".git/info/exclude")).unwrap();
         assert_eq!(exclude.matches(".claude/settings.local.json").count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_clones_local_files_are_linked_and_ignored() {
+        let (root, clone) = fixture();
+        std::fs::create_dir_all(clone.join("embarch")).unwrap();
+        std::fs::write(clone.join("embarch/MAP.md"), "m").unwrap();
+        std::fs::write(clone.join("CLAUDE.local.md"), "c").unwrap();
+        let w = prepare(&clone, "ABC-5", "user/abc-5").unwrap().path;
+        link_local_files(&clone, &w).unwrap();
+        link_local_files(&clone, &w).unwrap();
+        assert_eq!(std::fs::read_to_string(w.join("embarch/MAP.md")).unwrap(), "m");
+        assert!(w.join("CLAUDE.local.md").symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(w.join(".mcp.json").symlink_metadata().is_err(), "the clone has no .mcp.json");
+        assert_eq!(git(&w, &["status", "--porcelain"]).unwrap(), "", "the links are ignored");
+        let exclude = std::fs::read_to_string(clone.join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude.lines().filter(|l| *l == "embarch").count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_clone_without_the_files_gets_no_links() {
+        let (root, clone) = fixture();
+        let w = prepare(&clone, "ABC-6", "user/abc-6").unwrap().path;
+        link_local_files(&clone, &w).unwrap();
+        for n in LOCAL_FILES {
+            assert!(w.join(n).symlink_metadata().is_err(), "{n}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }
