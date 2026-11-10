@@ -136,11 +136,12 @@ impl Default for Settings {
 /// One request waiting for a VS Code window's embarch-chat panel, taken once
 /// by the window whose folder matches — decision 25's launch claim extended
 /// to the panel.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct MailboxEntry {
     pub id: String,
-    /// `start` (a chat on an item, with a prompt), `focus` (a session) or
-    /// `open` (an untracked chat, with no item and no prompt).
+    /// `start` (a chat on an item, with a prompt), `focus` (a session),
+    /// `open` (an untracked chat, with no item and no prompt), or — written
+    /// by the desk alone (decision 77) — `end` and `unfinished`.
     pub kind: String,
     #[serde(default)]
     pub item_id: Option<String>,
@@ -149,11 +150,45 @@ pub struct MailboxEntry {
     pub folder: String,
     #[serde(default)]
     pub prompt: Option<String>,
+    /// An `end` or `unfinished`: the issue's key and how it closed, `done`
+    /// or `canceled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// An `unfinished`'s failed checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blockers: Option<Vec<Blocker>>,
     pub created_ms: i64,
     pub expires_ms: i64,
     /// Kept until it expires, so a second take is told it is gone.
     #[serde(default)]
     pub taken_ms: Option<i64>,
+}
+
+/// One failed close-out check: the repo's folder name in the issue's folder
+/// and a one-line reason.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Blocker {
+    pub repo: String,
+    pub reason: String,
+}
+
+/// What the desk did when an item's issue went Done or Canceled (decision
+/// 77): the outcome, `done` or `canceled`, and the checks that failed.
+/// Recorded once per move, cleared when the issue is open again.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CloseOut {
+    pub outcome: String,
+    pub blockers: Vec<Blocker>,
+}
+
+/// A close-out's mailbox entry never expires on the launch clock, and so
+/// carries the largest time a JSON number holds exactly.
+pub const NO_EXPIRY_MS: i64 = (1 << 53) - 1;
+
+fn is_close_out(kind: &str) -> bool {
+    kind == "end" || kind == "unfinished"
 }
 
 /// Why a mailbox entry could not be taken.
@@ -338,6 +373,9 @@ pub struct WorkItem {
     pub pinned: bool,
     #[serde(default)]
     pub archived: bool,
+    /// Set when the issue went Done or Canceled and the desk told its window.
+    #[serde(default)]
+    pub close_out: Option<CloseOut>,
     pub created_ms: i64,
     pub last_activity_ms: i64,
 }
@@ -875,6 +913,7 @@ impl State {
                 bench: vec![],
                 pinned: false,
                 archived: false,
+                close_out: None,
                 created_ms: now,
                 last_activity_ms: now,
             },
@@ -1211,8 +1250,12 @@ impl State {
         if entry.kind == "open" {
             self.mailbox.retain(|m| m.kind != "open" || m.taken_ms.is_some() || m.folder != entry.folder);
         }
+        // The newest close-out for a folder is the one its window acts on.
+        if is_close_out(&entry.kind) {
+            self.mailbox.retain(|m| !is_close_out(&m.kind) || m.taken_ms.is_some() || m.folder != entry.folder);
+        }
         entry.created_ms = now;
-        entry.expires_ms = now + LAUNCH_CLAIM_MS;
+        entry.expires_ms = if is_close_out(&entry.kind) { NO_EXPIRY_MS } else { now + LAUNCH_CLAIM_MS };
         entry.taken_ms = None;
         let id = entry.id.clone();
         self.mailbox.push(entry);
@@ -1697,7 +1740,13 @@ impl State {
                 })
         });
         self.pending_launches.retain(|p| p.expires_ms > now);
-        self.mailbox.retain(|m| m.expires_ms > now);
+        // A close-out waits for its window, not for a clock: it goes when
+        // taken and a launch claim's time has passed, or its folder is gone.
+        self.mailbox.retain(|m| {
+            m.expires_ms > now
+                && !(is_close_out(&m.kind)
+                    && (m.taken_ms.is_some_and(|t| now - t >= LAUNCH_CLAIM_MS) || !std::path::Path::new(&m.folder).exists()))
+        });
         if let Some(cutoff) = chrono::DateTime::from_timestamp_millis(now - 14 * 86_400_000) {
             let cutoff = cutoff.date_naive().to_string();
             self.harvest_logged.retain(|d, _| d.as_str() >= cutoff.as_str());
@@ -2176,7 +2225,7 @@ mod tests {
         let mut st = State::default();
         let start = |item: &str, folder: &str| MailboxEntry {
             id: String::new(), kind: "start".into(), item_id: Some(item.into()), session_id: None,
-            folder: folder.into(), prompt: Some("Read ABC-1".into()), created_ms: 0, expires_ms: 0, taken_ms: None,
+            folder: folder.into(), prompt: Some("Read ABC-1".into()), ..Default::default()
         };
         st.post_mail(start("w1", "/w/fw-abc-1"), D0);
         let second = st.post_mail(start("w1", "/w/fw-abc-1/"), D0 + 1);
@@ -2205,7 +2254,7 @@ mod tests {
         let mut st = State::default();
         let entry = |folder: &str| MailboxEntry {
             id: String::new(), kind: "focus".into(), item_id: None, session_id: Some("s".into()),
-            folder: folder.into(), prompt: None, created_ms: 0, expires_ms: 0, taken_ms: None,
+            folder: folder.into(), prompt: None, ..Default::default()
         };
         let m = st.post_mail(entry("/w/fw-abc-1/"), D0);
         let other = st.post_mail(entry("/w/fw"), D0);

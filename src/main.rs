@@ -5,6 +5,7 @@
 mod claude;
 mod brief;
 mod client;
+mod closeout;
 mod connectors;
 mod db;
 mod events;

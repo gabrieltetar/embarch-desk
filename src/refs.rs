@@ -41,6 +41,11 @@ pub struct RefIssue {
     pub title: String,
     /// The workflow state's name: `Done`, `In Progress`, `Canceled`.
     pub state: String,
+    /// Linear's state type (`completed`, `canceled`, `started`...), which
+    /// the close-out reads instead of a team's names; empty where the
+    /// connector does not say, and in an index from before it was read.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state_type: String,
     pub url: String,
 }
 
@@ -235,6 +240,35 @@ impl Store {
         v
     }
 
+    /// The index's row for an issue, from whichever desk holds it.
+    pub fn issue(&self, key: &str) -> Option<RefIssue> {
+        let inner = self.lock();
+        inner.desks.values().flat_map(|e| &e.index.issues).find(|i| i.key.eq_ignore_ascii_case(key)).cloned()
+    }
+
+    /// An issue moved here, through the desk: its row says so until the next
+    /// refresh, so a stale fetch is not read as the issue moving back.
+    pub fn set_issue_state(&self, key: &str, state: &str, state_type: &str) {
+        let changed = {
+            let mut inner = self.lock();
+            let mut changed = false;
+            for i in inner.desks.values_mut().flat_map(|e| &mut e.index.issues).filter(|i| i.key.eq_ignore_ascii_case(key)) {
+                if i.state != state || i.state_type != state_type {
+                    i.state = state.to_string();
+                    i.state_type = state_type.to_string();
+                    changed = true;
+                }
+            }
+            if changed {
+                inner.version += 1;
+            }
+            changed
+        };
+        if changed {
+            self.persist();
+        }
+    }
+
     pub fn synced_ms(&self, desk_id: &str) -> Option<i64> {
         self.lock().desks.get(desk_id).and_then(|e| e.index.synced_ms)
     }
@@ -364,7 +398,7 @@ mod tests {
     use std::cell::Cell;
 
     fn issue(key: &str, state: &str) -> RefIssue {
-        RefIssue { key: key.into(), title: format!("{key} title"), state: state.into(), url: format!("https://linear.app/ws/issue/{key}") }
+        RefIssue { key: key.into(), title: format!("{key} title"), state: state.into(), state_type: String::new(), url: format!("https://linear.app/ws/issue/{key}") }
     }
 
     fn pr(repo: &str, number: u64, title: &str, branch: &str) -> RefPr {

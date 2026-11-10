@@ -510,6 +510,7 @@ fn ref_issue_from(i: &Value) -> Option<RefIssue> {
         key: i["id"].as_str()?.to_string(),
         title: i["title"].as_str().unwrap_or_default().to_string(),
         state: i["status"].as_str().unwrap_or_default().to_string(),
+        state_type: String::new(),
         url: i["url"].as_str().unwrap_or_default().to_string(),
     })
 }

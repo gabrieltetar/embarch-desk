@@ -453,7 +453,7 @@ pub async fn scope_issues(accounts: &[Account], b: &LinearBinding, cap: usize) -
     }
     let q = format!(
         "query($p: ID, $a: String) {{ issues(first: 250, after: $a, orderBy: updatedAt, includeArchived: true, \
-         filter: {{ {field}: {{ id: {{ eq: $p }} }} }}) {{ nodes {{ identifier title url trashed state {{ name }} }} \
+         filter: {{ {field}: {{ id: {{ eq: $p }} }} }}) {{ nodes {{ identifier title url trashed state {{ name type }} }} \
          pageInfo {{ hasNextPage endCursor }} }} }}"
     );
     let q = q.as_str();
@@ -475,6 +475,7 @@ fn ref_issue_from(n: &Value) -> Option<crate::refs::RefIssue> {
         key: n["identifier"].as_str()?.to_string(),
         title: n["title"].as_str().unwrap_or_default().to_string(),
         state: n["state"]["name"].as_str().unwrap_or_default().to_string(),
+        state_type: n["state"]["type"].as_str().unwrap_or_default().to_string(),
         url: n["url"].as_str().unwrap_or_default().to_string(),
     })
 }

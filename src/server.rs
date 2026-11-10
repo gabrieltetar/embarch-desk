@@ -177,6 +177,7 @@ pub fn router(app: Shared) -> Router {
         .route("/harvest/entry/{account}/{id}", axum::routing::patch(edit_entry).delete(remove_entry))
         .route("/pickup", get(pickup))
         .route("/items/{id}/start", post(start_work))
+        .route("/items/{id}/finish", post(finish_item))
         .route("/items/{id}/repos", post(add_repo))
         .route("/items/{id}/brief", get(item_brief))
         .route("/items/{id}/notes", get(item_notes))
@@ -507,6 +508,7 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, desk: Op
                 "id": item.id,
                 "title": item.title,
                 "issue": item.issue,
+                "close_out": item.close_out,
                 "repo_path": item.repo_path.clone().or_else(|| {
                     item.desk_id.as_ref().and_then(|k| st.desks.get(k)).and_then(|d| d.firmware_repos.first().cloned())
                 }),
@@ -845,7 +847,7 @@ async fn get_session(Ax(app): Ax<Shared>, Path(sid): Path<String>) -> ApiResult 
                 "cwd": s.cwd,
                 "untracked": s.ignored,
                 "client": s.client,
-                "work_item": item.map(|i| json!({ "id": i.id, "title": i.title, "issue": i.issue, "repo_path": i.repo_path })),
+                "work_item": item.map(|i| json!({ "id": i.id, "title": i.title, "issue": i.issue, "close_out": i.close_out, "repo_path": i.repo_path })),
                 "today_tile": s.item_id.as_ref().map(|i| tile_json(st, i, &today)),
                 "desk_id": desk,
                 "desk_notes": desk.as_deref().map(|k| st.desk_notes_of(k)).unwrap_or_default(),
@@ -1806,14 +1808,19 @@ async fn linear_status(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<St
         Ok(u) => u,
         Err(e) => return Err(key_error(&app, &headers, &accounts, b.key.trim(), e).await),
     };
-    app.db.write(|st| {
-        if let Some(id) = st.item_by_key(&updated.key).map(|i| i.id.clone()) {
-            if let Some(i) = st.items.get_mut(&id) {
-                i.issue = Some(updated.clone());
-                i.last_activity_ms = now;
-            }
+    let item_id = app.db.write(|st| {
+        let id = st.item_by_key(&updated.key).map(|i| i.id.clone())?;
+        if let Some(i) = st.items.get_mut(&id) {
+            i.issue = Some(updated.clone());
+            i.last_activity_ms = now;
         }
+        Some(id)
     });
+    // The index says so too until its next refresh, which a pass must not read as a move back.
+    app.refs.set_issue_state(&updated.key, &updated.state_name, &updated.state_type);
+    if let (Some(id), Some(suite)) = (item_id, crate::suite::Suite::from_env()) {
+        note_state(&app, &suite, &id, &updated.state_type).await;
+    }
     Ok(Json(json!({ "key": updated.key, "state": updated.state_name })))
 }
 
@@ -2752,10 +2759,118 @@ fn start_entry(item_id: &str, folder: &str, prompt: &str) -> MailboxEntry {
         session_id: None,
         folder: folder.to_string(),
         prompt: Some(prompt.to_string()),
-        created_ms: 0,
-        expires_ms: 0,
-        taken_ms: None,
+        ..Default::default()
     }
+}
+
+// ---------------------------------------------------------------- close-out (decision 77)
+
+/// Run the checks on an item's issue folder and tell its window: an `end`
+/// when every one passes, an `unfinished` naming each failure otherwise. The
+/// result is kept on the item. `None` when the item has no folder of the
+/// suite's, which a close-out does not concern.
+async fn close_out(app: &App, suite: &crate::suite::Suite, item_id: &str, outcome: &'static str) -> Option<store::CloseOut> {
+    let (key, window) = app.db.read(|st| {
+        st.items.get(item_id).and_then(|i| i.issue.as_ref().map(|r| (r.key.clone(), i.repo_path.clone())))
+    })?;
+    let dir = suite.issue_dir(&key).ok().filter(|d| d.is_dir())?;
+    let window = window.filter(|w| std::path::Path::new(w).starts_with(&dir))?;
+    let checked = dir.clone();
+    let blockers = tokio::task::spawn_blocking(move || crate::closeout::check(&checked, outcome)).await.ok()?;
+    let done = store::CloseOut { outcome: outcome.to_string(), blockers };
+    let entry = MailboxEntry {
+        kind: if done.blockers.is_empty() { "end" } else { "unfinished" }.into(),
+        item_id: Some(item_id.to_string()),
+        folder: window,
+        issue_key: Some(key),
+        outcome: Some(outcome.to_string()),
+        blockers: (!done.blockers.is_empty()).then(|| done.blockers.clone()),
+        ..Default::default()
+    };
+    let now = now_ms();
+    app.db.write(|st| {
+        if let Some(i) = st.items.get_mut(item_id) {
+            i.close_out = Some(done.clone());
+        }
+        st.post_mail(entry, now);
+    });
+    Some(done)
+}
+
+/// An item's issue is now in a state of this type. Done or Canceled closes
+/// it out, once per move; an open state clears the record.
+async fn note_state(app: &App, suite: &crate::suite::Suite, item_id: &str, state_type: &str) {
+    let recorded = app.db.read(|st| st.items.get(item_id).map(|i| i.close_out.as_ref().map(|c| c.outcome.clone())));
+    let Some(recorded) = recorded else { return };
+    match (crate::closeout::outcome_of(state_type), recorded) {
+        (None, Some(_)) => {
+            app.db.write(|st| st.items.get_mut(item_id).map(|i| i.close_out = None));
+        }
+        (Some(outcome), recorded) if recorded.as_deref() != Some(outcome) => {
+            close_out(app, suite, item_id, outcome).await;
+        }
+        _ => {}
+    }
+}
+
+/// The reference index's pass over the items with a folder: a move made in
+/// Linear itself closes out at the refresh that sees it (decision 77). The
+/// index's state type is read first; where the connector gives none, the
+/// issue is read again when its state's name differs from the item's.
+async fn close_out_pass(app: &App, suite: &crate::suite::Suite, accounts: &[crate::connectors::Account]) {
+    let items: Vec<(String, store::IssueRef)> = app.db.read(|st| {
+        st.items.values().filter(|i| !i.archived).filter_map(|i| i.issue.clone().map(|r| (i.id.clone(), r))).collect()
+    });
+    for (id, issue) in items {
+        if !suite.issue_dir(&issue.key).is_ok_and(|d| d.is_dir()) {
+            continue;
+        }
+        let Some(row) = app.refs.issue(&issue.key) else { continue };
+        let state_type = if !row.state_type.is_empty() {
+            row.state_type
+        } else if row.state == issue.state_name {
+            issue.state_type
+        } else {
+            match linear::refresh_issue(accounts, &issue, now_ms()).await {
+                Ok(Some(u)) => {
+                    let t = u.state_type.clone();
+                    app.db.write(|st| st.items.get_mut(&id).map(|i| i.issue = Some(u)));
+                    t
+                }
+                _ => continue,
+            }
+        };
+        note_state(app, suite, &id, &state_type).await;
+    }
+}
+
+/// Re-run the close-out checks for an item whose issue is Done or Canceled
+/// and post a fresh `end` or `unfinished` for its folder. The window acts on
+/// the mailbox entry, so a Finish pressed anywhere reaches it the same way.
+async fn finish_core(app: &App, suite: &crate::suite::Suite, id: &str) -> ApiResult {
+    let issue = app
+        .db
+        .read(|st| st.items.get(id).map(|i| i.issue.clone()))
+        .ok_or_else(|| missing("no such work item"))?
+        .ok_or_else(|| bad("Finish needs a Linear issue on the card"))?;
+    let outcome = crate::closeout::outcome_of(&issue.state_type)
+        .ok_or_else(|| ApiError(StatusCode::CONFLICT, format!("{} is {}, not Done or Canceled", issue.key, issue.state_name)))?;
+    let done = close_out(app, suite, id, outcome)
+        .await
+        .ok_or_else(|| ApiError(StatusCode::CONFLICT, format!("{} has no folder here to finish", issue.key)))?;
+    Ok(Json(if done.blockers.is_empty() { json!({ "ended": true }) } else { json!({ "ended": false, "blockers": done.blockers }) }))
+}
+
+async fn finish_item(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
+    let suite = crate::suite::Suite::from_env().ok_or_else(|| ApiError(StatusCode::CONFLICT, "this desk has no suite layout".into()))?;
+    // Fresh from Linear when it answers: the issue may have moved since the card last read it.
+    let issue = app.db.read(|st| st.items.get(&id).and_then(|i| i.issue.clone()));
+    if let (Some(issue), Ok(accounts)) = (issue, linear_accounts()) {
+        if let Ok(Some(u)) = linear::refresh_issue(&accounts, &issue, now_ms()).await {
+            app.db.write(|st| st.items.get_mut(&id).map(|i| i.issue = Some(u)));
+        }
+    }
+    finish_core(&app, &suite, &id).await
 }
 
 // ---------------------------------------------------------------- the chat panel
@@ -2787,6 +2902,7 @@ async fn post_mailbox(Ax(app): Ax<Shared>, Json(b): Json<NewMail>) -> ApiResult 
         "focus" => Some(clean(&b.session_id).ok_or_else(|| bad("a focus needs session_id"))?),
         "open" => None,
         "start" => return Err(bad("a start is left by Start work (POST /items/{id}/start), not posted")),
+        "end" | "unfinished" => return Err(bad("an end or unfinished is left by the desk when an issue goes Done or Canceled (POST /items/{id}/finish), not posted")),
         k => return Err(bad(format!("unknown kind {k:?}; focus or open"))),
     };
     let entry = MailboxEntry {
@@ -2796,9 +2912,7 @@ async fn post_mailbox(Ax(app): Ax<Shared>, Json(b): Json<NewMail>) -> ApiResult 
         session_id,
         folder: folder.to_string(),
         prompt: None,
-        created_ms: 0,
-        expires_ms: 0,
-        taken_ms: None,
+        ..Default::default()
     };
     let id = app.db.write(|st| st.post_mail(entry, now_ms()));
     let mut out = json!({ "id": id });
@@ -3178,6 +3292,9 @@ pub async fn refs_loop(app: Shared) {
         let gh = conns.github_accounts();
         let (linear, gh) = (&conns.linear, &gh);
         refresh_refs(&app, |scope| async move { refs::fetch(linear, gh, &scope).await }).await;
+        if let Some(suite) = crate::suite::Suite::from_env() {
+            close_out_pass(&app, &suite, linear).await;
+        }
     })
     .await
 }
@@ -4253,6 +4370,7 @@ mod tests {
                 key: "ABC-12".into(),
                 title: "Add the widget".into(),
                 state: "Done".into(),
+                state_type: String::new(),
                 url: "https://linear.app/ws/issue/ABC-12".into(),
             }]),
             prs: vec![(
@@ -4727,5 +4845,187 @@ mod tests {
         let got = st.take_mail(&m, D0 + 1).unwrap();
         assert_eq!((got.kind.as_str(), got.item_id.as_deref(), got.folder.as_str(), got.prompt.as_deref()), ("start", Some("w3"), "/w/fw-abc-7", Some("Read ABC-7")));
         assert_eq!(got.expires_ms, D0 + store::LAUNCH_CLAIM_MS);
+    }
+
+    // ------------------------------------------------------------ close-out
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let o = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    /// An item on ABC-1 whose suite folder holds one worktree on a branch
+    /// of a repo with an origin. Returns (app, scratch dir, suite, item id,
+    /// the window's folder).
+    fn closeout_fixture(state_type: &str) -> (Shared, std::path::PathBuf, crate::suite::Suite, String, String) {
+        let (app, dir) = scratch_app();
+        let clone = dir.join("fw");
+        let origin = dir.join("origin.git");
+        std::fs::create_dir_all(&clone).unwrap();
+        git_in(&dir, &["init", "--bare", "-b", "main", origin.to_str().unwrap()]);
+        git_in(&clone, &["init", "-b", "main"]);
+        git_in(&clone, &["config", "user.email", "t@example.com"]);
+        git_in(&clone, &["config", "user.name", "t"]);
+        git_in(&clone, &["commit", "--allow-empty", "-m", "first"]);
+        git_in(&clone, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git_in(&clone, &["push", "origin", "main"]);
+        let suite = crate::suite::Suite { root: dir.clone(), docs_repo: None };
+        let folder = suite.issue_dir("ABC-1").unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        let wt = folder.join("fw");
+        git_in(&clone, &["worktree", "add", "-b", "abc-1", wt.to_str().unwrap()]);
+        let issue = store::IssueRef { key: "ABC-1".into(), state_name: "Shipped".into(), state_type: state_type.into(), ..Default::default() };
+        let id = app.db.write(|st| {
+            let id = st.create_item("x", Some(issue), D0);
+            st.items.get_mut(&id).unwrap().repo_path = Some(wt.display().to_string());
+            id
+        });
+        (app, dir, suite, id, wt.display().to_string())
+    }
+
+    fn mail(app: &Shared, folder: &str) -> Vec<store::MailboxEntry> {
+        app.db.read(|st| st.mail_for(folder, now_ms()).into_iter().cloned().collect())
+    }
+
+    #[tokio::test]
+    async fn done_with_every_check_passed_posts_an_end_for_the_folder() {
+        let (app, dir, suite, id, window) = closeout_fixture("completed");
+        note_state(&app, &suite, &id, "completed").await;
+        let m = mail(&app, &window);
+        assert_eq!(m.len(), 1);
+        let (m, now) = (&m[0], now_ms());
+        assert_eq!((m.kind.as_str(), m.outcome.as_deref(), m.issue_key.as_deref(), m.blockers.clone()), ("end", Some("done"), Some("ABC-1"), None));
+        assert_eq!(m.item_id.as_deref(), Some(id.as_str()));
+        assert!(m.expires_ms > now + store::LAUNCH_CLAIM_MS * 1000, "a close-out waits for its window, not for a clock");
+        assert_eq!(app.db.read(|st| st.items[&id].close_out.clone()), Some(store::CloseOut { outcome: "done".into(), blockers: vec![] }));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn done_with_a_dirty_worktree_or_an_unlanded_branch_posts_an_unfinished_naming_each() {
+        let (app, dir, suite, id, window) = closeout_fixture("completed");
+        let wt = std::path::PathBuf::from(&window);
+        git_in(&wt, &["config", "user.email", "t@example.com"]);
+        git_in(&wt, &["config", "user.name", "t"]);
+        git_in(&wt, &["commit", "--allow-empty", "-m", "work"]);
+        std::fs::write(wt.join("scratch.txt"), "x").unwrap();
+        note_state(&app, &suite, &id, "completed").await;
+        let m = mail(&app, &window);
+        assert_eq!((m.len(), m[0].kind.as_str()), (1, "unfinished"));
+        let b = m[0].blockers.clone().unwrap();
+        assert_eq!(b.len(), 2, "{b:?}");
+        assert!(b.iter().all(|b| b.repo == "fw"));
+        assert!(b[0].reason.contains("uncommitted") && b[1].reason.contains("abc-1 is not on origin/main"), "{b:?}");
+        // The answer for the item carries it.
+        let c = app.db.read(|st| st.items[&id].close_out.clone()).unwrap();
+        assert_eq!((c.outcome.as_str(), c.blockers.len()), ("done", 2));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn canceled_checks_only_uncommitted_files() {
+        let (app, dir, suite, id, window) = closeout_fixture("canceled");
+        let wt = std::path::PathBuf::from(&window);
+        git_in(&wt, &["config", "user.email", "t@example.com"]);
+        git_in(&wt, &["config", "user.name", "t"]);
+        git_in(&wt, &["commit", "--allow-empty", "-m", "work"]);
+        note_state(&app, &suite, &id, "canceled").await;
+        assert_eq!(mail(&app, &window)[0].kind, "end", "an unlanded branch does not hold a canceled issue");
+        std::fs::write(wt.join("scratch.txt"), "x").unwrap();
+        // Same outcome again is once per move: nothing new.
+        note_state(&app, &suite, &id, "canceled").await;
+        assert_eq!(mail(&app, &window)[0].kind, "end");
+        // Finish re-runs and replaces the untaken entry.
+        let Json(v) = finish_core(&app, &suite, &id).await.unwrap_or_else(|e| panic!("{}", e.1));
+        assert_eq!(v["ended"], false);
+        assert_eq!(v["blockers"][0]["repo"], "fw");
+        let m = mail(&app, &window);
+        assert_eq!((m.len(), m[0].kind.as_str()), (1, "unfinished"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn finish_answers_ended_when_clean_and_refuses_an_open_issue() {
+        let (app, dir, suite, id, window) = closeout_fixture("canceled");
+        let Json(v) = finish_core(&app, &suite, &id).await.unwrap_or_else(|e| panic!("{}", e.1));
+        assert_eq!(v, json!({ "ended": true }));
+        assert_eq!(mail(&app, &window)[0].kind, "end");
+        app.db.write(|st| st.items.get_mut(&id).unwrap().issue.as_mut().unwrap().state_type = "started".into());
+        assert_eq!(finish_core(&app, &suite, &id).await.err().unwrap().0, StatusCode::CONFLICT);
+        assert_eq!(finish_core(&app, &suite, "nope").await.err().unwrap().0, StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_open_state_clears_the_record_so_the_next_move_posts_again() {
+        let (app, dir, suite, id, window) = closeout_fixture("completed");
+        note_state(&app, &suite, &id, "completed").await;
+        note_state(&app, &suite, &id, "started").await;
+        assert_eq!(app.db.read(|st| st.items[&id].close_out.clone()), None);
+        let first = mail(&app, &window)[0].id.clone();
+        note_state(&app, &suite, &id, "canceled").await;
+        let m = mail(&app, &window);
+        assert_eq!((m.len(), m[0].id != first, m[0].outcome.as_deref()), (1, true, Some("canceled")), "a newer entry replaces the untaken one");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_refresh_pass_closes_out_a_move_made_in_linear_once() {
+        let (app, dir, suite, id, window) = closeout_fixture("started");
+        let (scope, mut got) = refs_index();
+        got.issues = Some(vec![refs::RefIssue { key: "ABC-1".into(), state: "Shipped".into(), state_type: "completed".into(), ..Default::default() }]);
+        app.refs.apply("k1", &scope, got, D0);
+        close_out_pass(&app, &suite, &[]).await;
+        let first = mail(&app, &window);
+        assert_eq!((first.len(), first[0].kind.as_str()), (1, "end"));
+        // Taken by the window, and the next refresh sees the same move: nothing again.
+        let taken = first[0].id.clone();
+        app.db.write(|st| st.take_mail(&taken, now_ms())).unwrap();
+        close_out_pass(&app, &suite, &[]).await;
+        assert!(mail(&app, &window).is_empty(), "one close-out per move");
+        // Back to open clears; Linear's next state is a new move.
+        let (scope, mut got) = refs_index();
+        got.issues = Some(vec![refs::RefIssue { key: "ABC-1".into(), state: "In Progress".into(), state_type: "started".into(), ..Default::default() }]);
+        app.refs.apply("k1", &scope, got, D0 + 1);
+        close_out_pass(&app, &suite, &[]).await;
+        assert_eq!(app.db.read(|st| st.items[&id].close_out.clone()), None);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_issue_with_no_folder_here_is_left_alone() {
+        let (app, dir, suite, id, window) = closeout_fixture("completed");
+        std::fs::remove_dir_all(suite.issue_dir("ABC-1").unwrap()).unwrap();
+        note_state(&app, &suite, &id, "completed").await;
+        assert!(mail(&app, &window).is_empty());
+        assert_eq!(app.db.read(|st| st.items[&id].close_out.clone()), None);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_mailbox_refuses_an_end_and_an_unfinished() {
+        let (app, dir) = scratch_app();
+        let post = |b: Value| post_mailbox(Ax(app.clone()), Json(serde_json::from_value(b).unwrap()));
+        for kind in ["end", "unfinished"] {
+            assert!(post(json!({"kind": kind, "folder": "/w/fw", "outcome": "done"})).await.is_err(), "{kind}");
+        }
+        assert!(app.db.read(|st| st.mailbox.is_empty()));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_close_out_goes_when_its_folder_does_or_a_claim_after_it_was_taken() {
+        let mut st = State::default();
+        let here = std::env::temp_dir().display().to_string();
+        let end = |folder: &str| MailboxEntry { kind: "end".into(), folder: folder.into(), ..Default::default() };
+        let waiting = st.post_mail(end(&here), D0);
+        st.post_mail(end("/no/such/folder/here"), D0);
+        st.prune(D0 + 10 * store::LAUNCH_CLAIM_MS);
+        assert_eq!(st.mailbox.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), [waiting.as_str()], "untaken waits as long as its folder is there");
+        st.take_mail(&waiting, D0 + 11 * store::LAUNCH_CLAIM_MS).unwrap();
+        st.prune(D0 + 11 * store::LAUNCH_CLAIM_MS + store::LAUNCH_CLAIM_MS / 2);
+        assert_eq!(st.mailbox.len(), 1, "a taken one is kept for a claim's time, so a second take is told");
+        st.prune(D0 + 12 * store::LAUNCH_CLAIM_MS + 1);
+        assert!(st.mailbox.is_empty());
     }
 }
