@@ -79,10 +79,11 @@ fn is_git_commit(input: &Option<Value>) -> bool {
 }
 
 /// The line a session is shown when it has no work item.
-pub fn ask_text(state: &State, session_id: &str, now: i64, window_days: i64) -> String {
-    // The session's own desk's cards, the ones it is most likely to be; on
-    // no desk, every desk's. Never the UI's (EMB-94).
-    let scope = state.sessions.get(session_id).and_then(|s| s.desk_id.clone());
+pub fn ask_text(state: &State, session_id: &str, cwd: &str, now: i64, window_days: i64) -> String {
+    // The cards of the desk this start resolves for `cwd`, the one its notes
+    // name (decision 74), not the desk its first event found; on no desk,
+    // every desk's. Never the UI's (EMB-94).
+    let scope = state.session_desk(session_id, cwd);
     let mut items: Vec<_> = state
         .items
         .values()
@@ -169,6 +170,7 @@ fn start_notes(state: &mut State, session_id: &str, cwd: &str) -> Option<String>
     let desk = state.session_desk(session_id, cwd);
     if let Some(s) = state.sessions.get_mut(session_id) {
         s.start_desk = desk.clone();
+        s.start_cwd = Some(cwd.to_string());
     }
     desk_notes_text(state, &desk?)
 }
@@ -285,7 +287,7 @@ pub fn apply(
     let main = match (ev.hook_event_name.as_str(), item) {
         ("SessionStart", Some(i)) => Some(assigned_text(state, &ev.session_id, &i)),
         // Asking exists so time has somewhere to land (decision 72).
-        ("SessionStart" | "UserPromptSubmit", None) if time_on => Some(ask_text(state, &ev.session_id, now, window_days)),
+        ("SessionStart" | "UserPromptSubmit", None) if time_on => Some(ask_text(state, &ev.session_id, &cwd, now, window_days)),
         ("SessionStart", None) => Some(unasked_text(&ev.session_id)),
         _ => None,
     };
@@ -729,6 +731,23 @@ mod tests {
         assert!(out.contains("flash over SWD") && !out.contains("board Z"), "{out}");
         assert_eq!((st.sessions["s"].cwd.as_str(), st.sessions["s"].desk_id.as_deref()), ("/w/x", Some(a.as_str())));
         assert_eq!(st.notes_desk("s").as_deref(), Some(b.as_str()), "what it reads back and writes to is the desk it was told of");
+    }
+
+    #[test]
+    fn one_start_block_lists_the_cards_of_the_desk_it_resolved_not_its_first_folders() {
+        let mut st = State::default();
+        let a = desk_with_notes(&mut st);
+        let b = st.put_desk(crate::store::Desk { name: "Beta".into(), firmware_repos: vec!["/w/b".into()], ..Default::default() }, D0);
+        st.add_desk_note(&b, "on board Q, flash over SWD only", "user", None, D0).unwrap();
+        let wa = st.create_item("alpha card", None, D0);
+        st.items.get_mut(&wa).unwrap().desk_id = Some(a);
+        let wb = st.create_item("beta card", None, D0);
+        st.items.get_mut(&wb).unwrap().desk_id = Some(b);
+        let git = FakeGit::default();
+        apply(&mut st, &ev("SessionStart", "s", "/w/x"), D0, &UtcDays, &git, 7);
+        let out = apply(&mut st, &ev("SessionStart", "s", "/w/b/app"), D0 + H, &UtcDays, &git, 7).unwrap();
+        assert!(out.contains("beta card") && !out.contains("alpha card"), "{out}");
+        assert!(out.contains("standing notes for the desk \"Beta\""), "{out}");
     }
 
     #[test]

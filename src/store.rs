@@ -434,6 +434,11 @@ pub struct Session {
     /// what it reads back and an agent's note go to the desk it was told of.
     #[serde(default)]
     pub start_desk: Option<String>,
+    /// The folder that start ran in, so a start that resolved no desk
+    /// (`start_desk` None) stays no desk for every reader instead of falling
+    /// back to the desk its first folder held. None before any start.
+    #[serde(default)]
+    pub start_cwd: Option<String>,
 }
 
 impl Session {
@@ -458,6 +463,7 @@ impl Session {
             busy: false,
             client: None,
             start_desk: None,
+            start_cwd: None,
         }
     }
 }
@@ -1404,7 +1410,7 @@ impl State {
         sess.start_desk
             .clone()
             .filter(|k| self.desks.contains_key(k))
-            .or_else(|| self.session_desk(session_id, &sess.cwd))
+            .or_else(|| self.session_desk(session_id, sess.start_cwd.as_deref().unwrap_or(&sess.cwd)))
     }
 
     /// A desk's notes, oldest first.
@@ -1433,7 +1439,10 @@ impl State {
             )));
         }
         let others: usize = self.desk_notes_of(desk_id).iter().filter(|x| x.id != note.id).map(DeskNote::cost).sum();
-        if others + note.cost() > DESK_NOTES_MAX_CHARS {
+        // An edit that does not grow the note is always accepted: a desk can
+        // stand over the cap with notes written before the costs changed.
+        let before = self.desk_notes_of(desk_id).iter().find(|x| x.id == note.id).map(DeskNote::cost);
+        if others + note.cost() > DESK_NOTES_MAX_CHARS && before.is_none_or(|b| note.cost() > b) {
             return Err(DeskNoteError::Refused(format!(
                 "a desk's notes hold at most {DESK_NOTES_MAX_CHARS} characters as a session reads them, and this would \
                  make {}: shorten or delete one on the Desk tab first",
@@ -2409,5 +2418,45 @@ mod tests {
         assert_eq!(st.notes_desk("s").as_deref(), Some(a.as_str()), "a deleted desk falls back");
         st.hide_session("s");
         assert_eq!(st.notes_desk("s"), None);
+    }
+
+    #[test]
+    fn a_start_that_resolved_no_desk_is_no_desk_for_notes_and_an_old_state_file_reads() {
+        let mut st = State::default();
+        alpha(&mut st);
+        st.sessions.insert("s".into(), Session::new("s", "/w/x", D0));
+        // Resumed in a folder with no desk: the start is recorded as such.
+        let s = st.sessions.get_mut("s").unwrap();
+        s.start_desk = None;
+        s.start_cwd = Some("/w/nowhere".into());
+        assert_eq!(st.notes_desk("s"), None, "not the desk its first folder held");
+        let old: Session = serde_json::from_value(serde_json::json!({
+            "id": "s", "cwd": "/w/x", "started_ms": 0, "last_ms": 0
+        }))
+        .unwrap();
+        assert_eq!(old.start_cwd, None);
+    }
+
+    #[test]
+    fn a_desk_over_the_cap_accepts_an_edit_that_does_not_grow_a_note_and_refuses_one_that_does() {
+        let mut st = State::default();
+        let k = alpha(&mut st);
+        let long = "x".repeat(DESK_NOTE_MAX_CHARS - 1);
+        let mut ids = vec![];
+        for _ in 0..7 {
+            ids.push(st.add_desk_note(&k, &long, "user", None, D0).unwrap().id);
+        }
+        let mut extra = st.desk_notes_of(&k)[0].clone();
+        extra.id = "kn-old".into();
+        st.desk_notes.get_mut(&k).unwrap().push(extra);
+        // Notes written before the costs changed: the desk now stands over the cap.
+        st.desk_notes.get_mut(&k).unwrap()[0].text = "y".repeat(DESK_NOTE_MAX_CHARS);
+        st.desk_notes.get_mut(&k).unwrap()[1].text = "y".repeat(DESK_NOTE_MAX_CHARS);
+        assert!(st.desk_notes_used(&k) > DESK_NOTES_MAX_CHARS);
+        let shrunk = "y".repeat(DESK_NOTE_MAX_CHARS - 10);
+        assert!(st.edit_desk_note(&k, &ids[0], &shrunk, D0 + 1).is_ok(), "shrinking is accepted");
+        assert!(st.edit_desk_note(&k, &ids[1], &"y".repeat(DESK_NOTE_MAX_CHARS), D0 + 1).is_ok(), "the same cost is accepted");
+        let grown = "y".repeat(DESK_NOTE_MAX_CHARS);
+        assert!(matches!(st.edit_desk_note(&k, &ids[0], &grown, D0 + 2), Err(DeskNoteError::Refused(_))), "growing past the cap is refused");
     }
 }
