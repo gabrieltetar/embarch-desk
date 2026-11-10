@@ -1588,8 +1588,15 @@ fn linear_accounts() -> Result<Vec<crate::connectors::Account>, ApiError> {
     Ok(c.linear)
 }
 
-async fn linear_issue(Path(key): Path<String>) -> ApiResult {
-    Ok(Json(linear::read_issue(&linear_accounts()?, key.trim()).await?))
+/// `skip` is how many of the newest comments to pass over, to read older ones.
+#[derive(Default, serde::Deserialize)]
+struct IssueQuery {
+    #[serde(default)]
+    skip: usize,
+}
+
+async fn linear_issue(Path(key): Path<String>, Query(q): Query<IssueQuery>) -> ApiResult {
+    Ok(Json(linear::read_issue(&linear_accounts()?, key.trim(), q.skip).await?))
 }
 
 /// Who a call comes from (EMB-94): the session and folder a `DeskClient`
@@ -1774,7 +1781,7 @@ async fn create_draft(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<New
     // An edit remembers the description it was drafted against, so a Send
     // after someone else changed the issue cannot overwrite their change.
     let base = match (b.kind.as_str(), issue_key.as_deref()) {
-        ("linear_edit", Some(k)) => Some(described(&linear::read_issue(&linear_accounts()?, k).await?)),
+        ("linear_edit", Some(k)) => Some(described(&linear::read_issue(&linear_accounts()?, k, 0).await?)),
         _ => None,
     };
     let id = app.db.write(|st| {
@@ -1869,7 +1876,7 @@ async fn send_draft(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
         }
         "linear_edit" => {
             if let Some(base) = &d.base {
-                let now = described(&linear::read_issue(&accounts, key).await?);
+                let now = described(&linear::read_issue(&accounts, key, 0).await?);
                 if &now != base {
                     return Err(ApiError(
                         StatusCode::CONFLICT,
@@ -2724,7 +2731,7 @@ async fn item_brief(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
     let (issue, issue_error) = match key {
         None => (None, None),
         Some(k) => match linear_accounts() {
-            Ok(accounts) => match linear::read_issue(&accounts, &k).await {
+            Ok(accounts) => match linear::read_issue(&accounts, &k, 0).await {
                 Ok(v) => (Some(v), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             },

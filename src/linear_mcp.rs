@@ -318,31 +318,33 @@ pub async fn move_state(acct: &Account, issue: &IssueRef, state_id: &str, now: i
     issue_ref(acct, &issue.id, now).await?.ok_or_else(|| anyhow!("Linear returned no issue"))
 }
 
-/// As many comments as the GraphQL side reads.
-const COMMENTS: usize = 25;
-
 /// An issue as an agent reads it, in `linear::read_issue`'s shape; `None`
 /// when this workspace has no such key.
-pub async fn issue_detail(acct: &Account, key: &str) -> Result<Option<Value>> {
+pub async fn issue_detail(acct: &Account, key: &str, skip: usize) -> Result<Option<Value>> {
     let fields = ["title", "url", "description", "priority", "status", "project", "assignee", "labels", "updatedAt"];
     let Some(i) = call_on_issue(acct, "get_issue", json!({ "id": key, "fields": fields })).await? else {
         return Ok(None);
     };
-    let c = call(acct, "list_comments", json!({ "issueId": key, "limit": COMMENTS, "orderBy": "createdAt" })).await?;
-    Ok(Some(detail_from(acct, &i, &c)))
+    // The server lists comments newest first (assumed, not measured).
+    let (rows, cut) = crate::connectors::take_capped(crate::linear::COMMENTS_CAP, |after: Option<String>| async move {
+        let mut args = json!({ "issueId": key, "limit": crate::linear::COMMENTS_FETCH, "orderBy": "createdAt" });
+        if let Some(a) = after {
+            args["cursor"] = json!(a);
+        }
+        let c = call(acct, "list_comments", args).await?;
+        Ok((c["comments"].as_array().cloned().unwrap_or_default(), next_cursor(&c)))
+    })
+    .await?;
+    Ok(Some(detail_from(acct, &i, &rows, cut, skip)))
 }
 
-fn detail_from(acct: &Account, i: &Value, c: &Value) -> Value {
-    // The server lists comments newest first; an agent reads them oldest first.
-    let comments: Vec<Value> = c["comments"]
-        .as_array()
-        .into_iter()
-        .flatten()
+fn detail_from(acct: &Account, i: &Value, rows: &[Value], cut: bool, skip: usize) -> Value {
+    let comments: Vec<Value> = rows
+        .iter()
         .map(|c| json!({ "id": c["id"], "parent": parent_of(c), "author": c["author"]["name"], "at": c["createdAt"], "body": c["body"] }))
-        .rev()
         .collect();
     let key = i["id"].as_str().unwrap_or_default();
-    json!({
+    let mut v = json!({
         "workspace": acct.label,
         "key": key, "title": i["title"], "url": i["url"],
         "state": i["status"], "priority": i["priority"]["name"],
@@ -350,9 +352,10 @@ fn detail_from(acct: &Account, i: &Value, c: &Value) -> Value {
         "team": key.rsplit_once('-').map(|(team, _)| team), "project": i["project"], "assignee": i["assignee"],
         "labels": i["labels"],
         "description": i["description"],
-        "comments": comments,
         "updated": i["updatedAt"],
-    })
+    });
+    crate::linear::merge(&mut v, crate::linear::comment_fields(&comments, cut, skip));
+    v
 }
 
 /// A page as big as the GraphQL side's.
@@ -582,8 +585,8 @@ mod tests {
         assert_eq!(parent_of(&json!({"parent": {"id": "c1"}})), json!("c1"));
         assert_eq!(parent_of(&json!({"parent": "c1"})), json!("c1"));
         assert_eq!(parent_of(&json!({"parentId": null})), Value::Null);
-        let c = json!({"comments": [{"id": "c2", "parentId": "c1", "author": {"name": "G"}, "createdAt": "2", "body": "r"}]});
-        let v = detail_from(&acct(), &json!({"id": "ABC-1"}), &c);
+        let rows = vec![json!({"id": "c2", "parentId": "c1", "author": {"name": "G"}, "createdAt": "2", "body": "r"})];
+        let v = detail_from(&acct(), &json!({"id": "ABC-1"}), &rows, false, 0);
         assert_eq!((v["comments"][0]["id"].as_str(), v["comments"][0]["parent"].as_str()), (Some("c2"), Some("c1")));
     }
 
@@ -639,11 +642,12 @@ mod tests {
             "id": "ABC-94", "title": "T", "url": "u", "description": "D", "priority": {"value": 0, "name": "No priority"},
             "status": "Todo", "project": "V2", "assignee": "me", "labels": ["Bug"], "updatedAt": "2026-10-28"
         });
-        let c = json!({ "comments": [
-            {"body": "second", "createdAt": "2026-10-02", "author": {"name": "Rob"}},
-            {"body": "first", "createdAt": "2026-10-01", "author": {"name": "Ana"}},
-        ]});
-        let d = detail_from(&acct(), &i, &c);
+        let rows = vec![
+            json!({"body": "second", "createdAt": "2026-10-02", "author": {"name": "Rob"}}),
+            json!({"body": "first", "createdAt": "2026-10-01", "author": {"name": "Ana"}}),
+        ];
+        let d = detail_from(&acct(), &i, &rows, false, 0);
+        assert_eq!((d["comments_total"].as_u64(), d["comments_truncated"].as_bool()), (Some(2), Some(false)));
         assert_eq!((d["key"].as_str(), d["team"].as_str(), d["priority"].as_str()), (Some("ABC-94"), Some("ABC"), Some("No priority")));
         assert_eq!((d["comments"][0]["body"].as_str(), d["comments"][0]["author"].as_str()), (Some("first"), Some("Ana")));
         assert_eq!(d["labels"][0], "Bug");

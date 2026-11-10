@@ -108,9 +108,12 @@ pub struct LinkParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct KeyParams {
+pub struct IssueParams {
     /// A Linear issue key, e.g. ABC-123.
     pub key: String,
+    /// How many of the newest comments to skip, to read older ones: the answer's `comments_note` gives the number. Default 0.
+    #[serde(default)]
+    pub skip: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -341,10 +344,10 @@ impl DeskMcp {
 
 #[tool_router(router = linear_router, vis = "pub")]
 impl DeskMcp {
-    #[tool(description = "Read a Linear issue: title, state, team, project, assignee, labels, description and its latest comments, each with its id and the id of the comment it replies under. Works across every connected Linear workspace.")]
-    async fn linear_get_issue(&self, Parameters(p): Parameters<KeyParams>) -> Result<CallToolResult, McpError> {
+    #[tool(description = "Read a Linear issue: title, state, team, project, assignee, labels, description and its newest 25 comments, oldest first, each with its id and the id of the comment it replies under. The answer carries comments_total and, when some are not returned, comments_truncated and a comments_note; read older ones by calling again with skip. Works across every connected Linear workspace.")]
+    async fn linear_get_issue(&self, Parameters(p): Parameters<IssueParams>) -> Result<CallToolResult, McpError> {
         let key = crate::uri::encode(p.key.trim());
-        match self.client.get(&format!("/linear/issue/{key}")).await {
+        match self.client.get(&format!("/linear/issue/{key}?skip={}", p.skip.unwrap_or(0))).await {
             Ok(v) => ok(v),
             Err(e) => err(e),
         }

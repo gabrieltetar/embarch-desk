@@ -168,52 +168,100 @@ where
     Err(last_err.unwrap_or_else(|| anyhow!("no connected Linear workspace has {key}")))
 }
 
+/// Comments an issue read returns at once: the newest of them.
+pub const COMMENTS_PAGE: usize = 25;
+/// Most comments one issue read counts (decision 59); past it the total is a lower bound.
+pub const COMMENTS_CAP: usize = 500;
+/// Comments one request asks for, on either account type.
+pub const COMMENTS_FETCH: usize = 50;
+
 /// One workspace's issue as GraphQL gives it, for `read_issue`; `None` when
 /// it has no such key.
-async fn gql_detail(acct: &Account, key: &str) -> Result<Option<Value>> {
+async fn gql_detail(acct: &Account, key: &str, skip: usize) -> Result<Option<Value>> {
     let q = "query($id: String!) { issue(id: $id) { id identifier title url description priorityLabel \
              createdAt updatedAt state { id name type } team { id key name } assignee { name } \
-             project { name } labels { nodes { name } } \
-             comments(first: 25) { nodes { id body createdAt user { name } parent { id } } } } }";
-    match gql(acct, q, json!({ "id": key })).await {
-        Ok(d) if d["issue"].is_object() => Ok(Some(detail_from(acct, &d["issue"]))),
-        Ok(_) => Ok(None),
-        Err(e) if not_found(&e) => Ok(None),
-        Err(e) => Err(e),
-    }
+             project { name } labels { nodes { name } } } }";
+    let i = match gql(acct, q, json!({ "id": key })).await {
+        Ok(d) if d["issue"].is_object() => d["issue"].clone(),
+        Ok(_) => return Ok(None),
+        Err(e) if not_found(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // Assumed, not measured: `comments` lists newest first, as `.rev()` below
+    // and the MCP side's `list_comments` both take it.
+    let (rows, cut) = crate::connectors::take_capped(COMMENTS_CAP, |after: Option<String>| async move {
+        let q = "query($id: String!, $a: String) { issue(id: $id) { comments(first: 50, after: $a) { \
+                 nodes { id body createdAt user { name } parent { id } } pageInfo { hasNextPage endCursor } } } }";
+        let d = gql(acct, q, json!({ "id": key, "a": after })).await?;
+        let c = &d["issue"]["comments"];
+        let rows: Vec<Value> = c["nodes"].as_array().cloned().unwrap_or_default();
+        let next = (c["pageInfo"]["hasNextPage"] == true).then(|| c["pageInfo"]["endCursor"].as_str().map(str::to_string)).flatten();
+        Ok((rows, next))
+    })
+    .await?;
+    Ok(Some(detail_from(acct, &i, &rows, cut, skip)))
 }
 
-/// An issue as an agent reads it: description, assignee, labels and the
-/// latest comments, oldest first.
-pub async fn read_issue(accounts: &[Account], key: &str) -> Result<Value> {
+/// An issue as an agent reads it: description, assignee, labels and one
+/// window of its comments (`COMMENTS_PAGE`, the newest after `skip` newer
+/// ones), oldest first, with how many there are in all.
+pub async fn read_issue(accounts: &[Account], key: &str, skip: usize) -> Result<Value> {
     first_with(accounts, key, |acct| async move {
         if acct.mcp.is_some() {
-            linear_mcp::issue_detail(acct, key).await
+            linear_mcp::issue_detail(acct, key, skip).await
         } else {
-            gql_detail(acct, key).await
+            gql_detail(acct, key, skip).await
         }
     })
     .await
 }
 
-fn detail_from(acct: &Account, i: &Value) -> Value {
-    let comments: Vec<Value> = i["comments"]["nodes"]
-        .as_array()
-        .into_iter()
-        .flatten()
+/// The comment fields of an issue read. `all` is every comment read, newest
+/// first, `cut` whether the cap stopped the reading. The window skips the
+/// `skip` newest and keeps `COMMENTS_PAGE`, returned oldest first; the
+/// answer carries `comments_total` (a lower bound when `comments_capped`),
+/// `comments_truncated` and a `comments_note` when some are not returned.
+pub fn comment_fields(all: &[Value], cut: bool, skip: usize) -> Value {
+    let total = all.len();
+    let start = skip.min(total);
+    let end = (start + COMMENTS_PAGE).min(total);
+    let window: Vec<Value> = all[start..end].iter().rev().cloned().collect();
+    let truncated = start > 0 || end < total || cut;
+    let mut v = json!({ "comments": window, "comments_total": total, "comments_truncated": truncated, "comments_capped": cut });
+    if truncated {
+        let older = if cut { format!("at least {}", total - end) } else { (total - end).to_string() };
+        v["comments_note"] = json!(format!(
+            "Returned {} of {}{} comments: the newest after skipping {start}. {older} older and {start} newer ones are not returned; \
+             read the older ones with `skip` set to {end}.",
+            window.len(), total, if cut { "+" } else { "" }
+        ));
+    }
+    v
+}
+
+fn detail_from(acct: &Account, i: &Value, rows: &[Value], cut: bool, skip: usize) -> Value {
+    let comments: Vec<Value> = rows
+        .iter()
         .map(|c| json!({ "id": c["id"], "parent": c["parent"]["id"], "author": c["user"]["name"], "at": c["createdAt"], "body": c["body"] }))
-        .rev()
         .collect();
-    json!({
+    let mut v = json!({
         "workspace": acct.label,
         "key": i["identifier"], "title": i["title"], "url": i["url"],
         "state": i["state"]["name"], "priority": i["priorityLabel"],
         "team": i["team"]["key"], "project": i["project"]["name"], "assignee": i["assignee"]["name"],
         "labels": i["labels"]["nodes"].as_array().map(|l| l.iter().map(|x| x["name"].clone()).collect::<Vec<_>>()),
         "description": i["description"],
-        "comments": comments,
         "updated": i["updatedAt"],
-    })
+    });
+    merge(&mut v, comment_fields(&comments, cut, skip));
+    v
+}
+
+/// Copy `from`'s fields into `into`.
+pub fn merge(into: &mut Value, from: Value) {
+    if let (Some(a), Some(b)) = (into.as_object_mut(), from.as_object()) {
+        a.extend(b.clone());
+    }
 }
 
 fn issue_rows(acct: &Account, nodes: &Value) -> Vec<Value> {
@@ -418,7 +466,7 @@ pub(crate) fn team_rows(acct: &Account, nodes: &[Value]) -> Vec<Value> {
 /// when it has one — or the one a key names, wherever it is.
 pub async fn search(accounts: &[Account], query: &str, scope: Option<&LinearBinding>) -> Result<Vec<Value>> {
     if let Some(key) = crate::store::issue_key_in(query).filter(|k| k.eq_ignore_ascii_case(query.trim())) {
-        return Ok(match read_issue(accounts, &key).await {
+        return Ok(match read_issue(accounts, &key, 0).await {
             Ok(v) => vec![v],
             Err(_) => vec![],
         });
@@ -710,8 +758,47 @@ mod tests {
                 {"id": "c1", "body": "head", "createdAt": "1", "user": {"name": "G"}, "parent": null}
             ]}
         });
-        let v = detail_from(&Account::new("work", "t"), &i);
+        let rows: Vec<Value> = i["comments"]["nodes"].as_array().unwrap().clone();
+        let v = detail_from(&Account::new("work", "t"), &i, &rows, false, 0);
         assert_eq!((v["comments"][0]["id"].as_str(), v["comments"][0]["parent"].as_str()), (Some("c1"), None));
         assert_eq!((v["comments"][1]["id"].as_str(), v["comments"][1]["parent"].as_str()), (Some("c2"), Some("c1")));
+    }
+
+    fn numbered(n: usize) -> Vec<Value> {
+        // Newest first, as the server lists them.
+        (0..n).rev().map(|i| json!({ "body": format!("c{i}") })).collect()
+    }
+
+    #[test]
+    fn an_uncut_comment_list_says_nothing_is_missing() {
+        let v = comment_fields(&numbered(3), false, 0);
+        assert_eq!((v["comments_total"].as_u64(), v["comments_truncated"].as_bool()), (Some(3), Some(false)));
+        assert!(v.get("comments_note").is_none());
+        assert_eq!((v["comments"][0]["body"].as_str(), v["comments"][2]["body"].as_str()), (Some("c0"), Some("c2")));
+    }
+
+    #[test]
+    fn a_cut_comment_list_gives_the_total_and_the_skip_that_reads_the_rest() {
+        let all = numbered(60);
+        let v = comment_fields(&all, false, 0);
+        assert_eq!((v["comments_total"].as_u64(), v["comments_truncated"].as_bool()), (Some(60), Some(true)));
+        assert_eq!(v["comments"].as_array().unwrap().len(), 25);
+        assert_eq!((v["comments"][0]["body"].as_str(), v["comments"][24]["body"].as_str()), (Some("c35"), Some("c59")));
+        assert!(v["comments_note"].as_str().unwrap().contains("`skip` set to 25"));
+        let v = comment_fields(&all, false, 25);
+        assert_eq!((v["comments"][0]["body"].as_str(), v["comments"][24]["body"].as_str()), (Some("c10"), Some("c34")));
+        let v = comment_fields(&all, false, 50);
+        assert_eq!(v["comments"].as_array().unwrap().len(), 10);
+        assert_eq!(v["comments"][0]["body"], "c0");
+        assert_eq!(v["comments_truncated"], true, "newer ones are still not returned");
+        // Exactly one window and nothing else is not a cut.
+        assert_eq!(comment_fields(&numbered(25), false, 0)["comments_truncated"], false);
+    }
+
+    #[test]
+    fn a_comment_count_stopped_by_the_cap_is_a_lower_bound() {
+        let v = comment_fields(&numbered(COMMENTS_CAP), true, 0);
+        assert_eq!((v["comments_capped"].as_bool(), v["comments_truncated"].as_bool()), (Some(true), Some(true)));
+        assert!(v["comments_note"].as_str().unwrap().contains("500+"));
     }
 }
