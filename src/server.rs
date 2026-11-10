@@ -381,7 +381,8 @@ fn session_rows(cache: &Cache, sessions: &[&store::Session], now: i64, window_da
                     "last_reply_ms": s.last_reply_ms,
                     "cwd": s.cwd,
                     "answer_url": format!("https://claude.ai/code/{}", s.id),
-                    "folder_uri": (!s.cwd.is_empty()).then(|| uri::folder_uri(&s.cwd, cache.wsl_distro.as_deref())),
+                    "folder_uri": folder_link(&s.cwd, cache),
+                    "folder_missing": folder_missing(&s.cwd),
                     "session_uri": format!("vscode://anthropic.claude-code/open?session={}", uri::encode(&s.id)),
                 }),
             )
@@ -389,6 +390,17 @@ fn session_rows(cache: &Cache, sessions: &[&store::Session], now: i64, window_da
         .collect();
     rows.sort_by_key(|(ms, _)| std::cmp::Reverse(*ms));
     rows.into_iter().map(|(_, v)| v).collect()
+}
+
+/// A session's `cwd` is set but no longer a directory on disk (decision 71).
+fn folder_missing(cwd: &str) -> bool {
+    !cwd.is_empty() && !std::path::Path::new(cwd).is_dir()
+}
+
+/// The link opening a session's folder: none when `cwd` is unset or gone,
+/// since a window opened on a missing folder cannot resume the chat.
+fn folder_link(cwd: &str, cache: &Cache) -> Option<String> {
+    (!cwd.is_empty() && !folder_missing(cwd)).then(|| uri::folder_uri(cwd, cache.wsl_distro.as_deref()))
 }
 
 fn session_name(cache: &Cache, s: &store::Session) -> String {
@@ -425,7 +437,8 @@ fn view_sessions(st: &State, cache: &Cache, now: i64) -> Vec<Value> {
                 "last_ms": s.last_ms,
                 "cwd": s.cwd,
                 "client": s.client,
-                "folder_uri": (!s.cwd.is_empty()).then(|| uri::folder_uri(&s.cwd, cache.wsl_distro.as_deref())),
+                "folder_uri": folder_link(&s.cwd, cache),
+                "folder_missing": folder_missing(&s.cwd),
                 "session_uri": format!("vscode://anthropic.claude-code/open?session={}", uri::encode(&s.id)),
             })
         })
@@ -3626,7 +3639,10 @@ mod tests {
         let w = st.create_item("x", None, D0);
         let mut s1 = crate::store::testing::session("abc-123");
         s1.item_id = Some(w.clone());
-        s1.cwd = "/w/fw-abc-1".into();
+        let dir = std::env::temp_dir().join(format!("desk-folder-{}", crate::paths::random_hex(4).unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+        s1.cwd = cwd.clone();
         s1.last_reply = Some("Here is the summary.".into());
         crate::store::record_activity(&mut s1, D0 + H, &UtcDays);
         st.sessions.insert("abc-123".into(), s1);
@@ -3637,11 +3653,31 @@ mod tests {
         assert_eq!((row["status"].as_str(), row["waiting_for"].as_str()), (Some("waiting"), Some("permission prompt")));
         assert_eq!(row["answer_url"], "https://claude.ai/code/abc-123");
         assert_eq!(row["session_uri"], "vscode://anthropic.claude-code/open?session=abc-123");
-        assert_eq!(row["folder_uri"], "vscode://vscode-remote/wsl+Ubuntu/w/fw-abc-1?windowId=_blank");
+        assert_eq!(row["folder_uri"], uri::folder_uri(&cwd, Some("Ubuntu")));
+        assert_eq!(row["folder_missing"], false);
         assert_eq!(row["last_reply"], "Here is the summary.");
         let listed = &v["sessions"][0];
         assert_eq!(listed["folder_uri"], row["folder_uri"], "the session list carries the links too (decision 71)");
         assert_eq!(listed["session_uri"], row["session_uri"]);
+    }
+
+    #[test]
+    fn a_session_whose_folder_is_gone_says_so_and_carries_no_folder_link() {
+        let mut st = State::default();
+        let w = st.create_item("x", None, D0);
+        let mut s1 = crate::store::testing::session("gone-1");
+        s1.item_id = Some(w.clone());
+        s1.cwd = std::env::temp_dir().join(format!("desk-gone-{}", crate::paths::random_hex(4).unwrap())).to_string_lossy().into_owned();
+        crate::store::record_activity(&mut s1, D0 + H, &UtcDays);
+        st.sessions.insert("gone-1".into(), s1);
+        let mut cache = Cache { wsl_distro: Some("Ubuntu".into()), agents_ms: D0 + 2 * H, ..Default::default() };
+        cache.agents.insert("gone-1".into(), json!({"sessionId": "gone-1", "status": "idle"}));
+        let v = view_json(&st, &cache, D0 + 2 * H, 7, None, &UtcDays);
+        for row in [&v["cards"][0]["live_sessions"][0], &v["sessions"][0]] {
+            assert_eq!(row["folder_missing"], true, "{row}");
+            assert!(row["folder_uri"].is_null(), "{row}");
+            assert!(row["session_uri"].is_string(), "the session link stays: {row}");
+        }
     }
 
     #[test]
