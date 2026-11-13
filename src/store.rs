@@ -537,6 +537,18 @@ pub struct Span {
     pub last_ms: i64,
 }
 
+/// Why a session could not take a line back.
+#[derive(Debug, PartialEq)]
+pub enum UnlineError {
+    /// No tile holds a line with that id (archived lines count as sent, but
+    /// are not searched: they left the tiles).
+    NoSuchLine,
+    /// Another session, the user or a commit wrote it.
+    NotYours,
+    /// Its tile is approved, folded or discarded.
+    Sent,
+}
+
 /// A note — notes and tile lines are one stream (proposal 43): a tile line
 /// is a note of kind `done`. Lines written before notes existed read as
 /// `done` and get an id when the state loads.
@@ -1139,6 +1151,29 @@ impl State {
             }
         }
         true
+    }
+
+    /// Takes back the line `session_id` wrote, by note id, while its tile is
+    /// still open; answers the tile's id (decision 85).
+    pub fn remove_session_line(&mut self, session_id: &str, note_id: &str, now: i64) -> Result<String, UnlineError> {
+        let (tile_id, idx) = self
+            .tiles
+            .iter()
+            .find_map(|(k, t)| t.lines.iter().position(|l| l.id == note_id).map(|i| (k.clone(), i)))
+            .ok_or(UnlineError::NoSuchLine)?;
+        let tile = &self.tiles[&tile_id];
+        let line = &tile.lines[idx];
+        if line.source != "agent" || line.session_id.as_deref() != Some(session_id) {
+            return Err(UnlineError::NotYours);
+        }
+        if tile.status != TileStatus::Open {
+            return Err(UnlineError::Sent);
+        }
+        let item = tile.item_id.clone();
+        let before = self.notes_ms(&item);
+        self.tiles.get_mut(&tile_id).expect("found above").lines.remove(idx);
+        self.notes_moved(&item, before, now);
+        Ok(tile_id)
     }
 
     /// Every note on an item, newest first: its tiles' lines, its memory

@@ -143,6 +143,7 @@ pub fn router(app: Shared) -> Router {
         .route("/sessions/{sid}", get(get_session))
         .route("/sessions/{sid}/assign", post(assign_session))
         .route("/sessions/{sid}/line", post(session_line))
+        .route("/sessions/{sid}/line/{nid}", delete(session_unline))
         .route("/sessions/{sid}/desk-note", post(session_desk_note))
         .route("/tiles/{id}", axum::routing::patch(patch_tile))
         .route("/tiles/{id}/line", post(tile_line))
@@ -922,11 +923,23 @@ struct LineBody {
     /// or a desk item id, on any desk (decision 78). Absent: the session's own.
     #[serde(default)]
     item: Option<String>,
+    /// Every field the desk does not know. A desk older or newer than its
+    /// caller would otherwise drop one silently and misfile the note
+    /// (decision 85), so any is a 400.
+    #[serde(flatten)]
+    unknown: std::collections::BTreeMap<String, Value>,
 }
 
 impl LineBody {
-    /// The note it makes, its kind checked.
+    /// The note it makes, its kind checked and no unknown field present.
     fn note(&self, ms: i64, source: &str) -> Result<store::Line, ApiError> {
+        if !self.unknown.is_empty() {
+            let names: Vec<&str> = self.unknown.keys().map(String::as_str).collect();
+            return Err(bad(format!(
+                "unknown field {}; a line takes text, kind and item, and nothing was written",
+                names.join(", ")
+            )));
+        }
         let mut note = store::Line::new(ms, self.text.trim(), source);
         if let Some(k) = clean(&self.kind) {
             let k = k.to_ascii_lowercase();
@@ -968,6 +981,27 @@ async fn session_line(Ax(app): Ax<Shared>, Path(sid): Path<String>, Json(b): Jso
         })
     })?;
     landed.map(Json).ok_or_else(|| missing("the desk has not seen this session"))
+}
+
+/// An agent takes back a line its own session wrote, behind
+/// `desk_remove_line` (decision 85): by note id, only while its tile is
+/// unsent, and never another session's.
+async fn session_unline(Ax(app): Ax<Shared>, Path((sid, nid)): Path<(String, String)>) -> ApiResult {
+    let now = now_ms();
+    let tile = app.db.update(|st| {
+        let r = if st.sessions.contains_key(&sid) {
+            st.remove_session_line(&sid, &nid, now).map_err(|e| match e {
+                store::UnlineError::NoSuchLine => missing(format!("no line {nid:?} on any tile of this desk")),
+                store::UnlineError::NotYours => ApiError(StatusCode::FORBIDDEN, "that line was written by another session, or by the user; only the session that wrote a line takes it back".into()),
+                store::UnlineError::Sent => bad("that line's tile is already sent to Harvest, folded or discarded, so the line is part of a record and stays; add a correcting line instead"),
+            })
+        } else {
+            Err(missing("the desk has not seen this session"))
+        };
+        let removed = r.is_ok();
+        (r, removed)
+    })?;
+    Ok(Json(json!({ "removed": nid, "tile": tile })))
 }
 
 /// An agent's standing note on the desk whose notes its session's last start
@@ -4206,6 +4240,59 @@ mod tests {
         let Ok(Json(v)) = session_line(Ax(app.clone()), Path("bare".into()), Json(line_body(json!({"text": "held", "item": "  "})))).await else { panic!("held") };
         assert_eq!(v["held"], true, "a blank item is no item");
         assert_eq!(app.db.read(|st| st.sessions["bare"].held_lines.len()), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_line_body_with_a_field_the_desk_does_not_know_is_a_400_naming_it_and_writes_nothing() {
+        let (app, dir) = scratch_app();
+        app.db.write(|st| {
+            let w = st.create_item("own", None, D0);
+            let mut s = crate::store::testing::session("s");
+            s.item_id = Some(w);
+            st.sessions.insert("s".into(), s);
+            st.sessions.insert("s2".into(), crate::store::testing::session("s2"));
+        });
+        let Err(ApiError(code, msg)) = session_line(Ax(app.clone()), Path("s".into()), Json(line_body(json!({"text": "x", "target": "w1", "later": 1})))).await else { panic!("took a note") };
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("later, target"), "{msg}");
+        let tile = app.db.read(|st| st.tiles.values().map(|t| t.lines.len()).sum::<usize>());
+        assert_eq!(tile, 0);
+        let Err(ApiError(code, _)) = tile_line(Ax(app.clone()), Path("w1@2026-01-01".into()), Json(line_body(json!({"text": "x", "bogus": true})))).await else { panic!("tile took it") };
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_session_takes_back_its_own_line_while_the_tile_is_unsent_and_no_one_elses() {
+        let (app, dir) = scratch_app();
+        app.db.write(|st| {
+            let w = st.create_item("own", None, D0);
+            let mut s = crate::store::testing::session("s");
+            s.item_id = Some(w);
+            st.sessions.insert("s".into(), s);
+            st.sessions.insert("s2".into(), crate::store::testing::session("s2"));
+        });
+        let Ok(Json(v)) = session_line(Ax(app.clone()), Path("s".into()), Json(line_body(json!({"text": "mine"})))).await else { panic!("own") };
+        let nid = v["note_id"].as_str().unwrap().to_string();
+        let tile = v["tile"].as_str().unwrap().to_string();
+        let un = |sid: &str, n: &str| session_unline(Ax(app.clone()), Path((sid.to_string(), n.to_string())));
+        let Err(ApiError(c, _)) = un("other", &nid).await else { panic!("another session's") };
+        assert_eq!(c, StatusCode::NOT_FOUND, "a session the desk never saw");
+        let Err(ApiError(c, _)) = un("s2", &nid).await else { panic!("took another session's line") };
+        assert_eq!(c, StatusCode::FORBIDDEN);
+        let Err(ApiError(c, _)) = un("s", "n-none").await else { panic!("no such") };
+        assert_eq!(c, StatusCode::NOT_FOUND);
+        app.db.write(|st| { st.tiles.get_mut(&tile).unwrap().status = store::TileStatus::Approved; });
+        let Err(ApiError(c, m)) = un("s", &nid).await else { panic!("sent tile") };
+        assert_eq!(c, StatusCode::BAD_REQUEST);
+        assert!(m.contains("Harvest"), "{m}");
+        app.db.write(|st| { st.tiles.get_mut(&tile).unwrap().status = store::TileStatus::Open; });
+        let Ok(Json(v)) = un("s", &nid).await else { panic!("own line stayed") };
+        assert_eq!(v["removed"], nid.as_str());
+        assert_eq!(app.db.read(|st| st.tiles[&tile].lines.len()), 0);
+        let Err(ApiError(c, _)) = un("s", &nid).await else { panic!("twice") };
+        assert_eq!(c, StatusCode::NOT_FOUND);
         std::fs::remove_dir_all(dir).ok();
     }
 

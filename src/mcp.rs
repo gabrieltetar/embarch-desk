@@ -65,6 +65,14 @@ pub struct AddRepoParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UnlineParams {
+    /// The desk session id given in this session's context.
+    pub session_id: String,
+    /// The note id `desk_add_line` answered with.
+    pub note_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct LineParams {
     /// The desk session id given in this session's context.
     pub session_id: String,
@@ -322,6 +330,14 @@ impl DeskMcp {
         }
     }
 
+    #[tool(description = "Take back a note this session wrote with desk_add_line, by the note_id it answered with: use it when a note landed on the wrong work item or was wrong. Only a note this session wrote, and only while its tile is not yet sent to Harvest; a sent tile's note stays, so add a correcting note instead.")]
+    async fn desk_remove_line(&self, Parameters(p): Parameters<UnlineParams>) -> Result<CallToolResult, McpError> {
+        match self.client.delete(&format!("/sessions/{}/line/{}", p.session_id, p.note_id)).await {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
     #[tool(description = "Add a standing note to the desk this session belongs to: a working agreement that should hold for every future session in this desk's repos — the user said always, never, from now on or in this repo, or agreed when you asked. Never progress, findings or task state (that is desk_add_line). Never part of Harvest. One rule per note, at most 500 characters; a desk holds 4,000.")]
     async fn desk_add_desk_note(&self, Parameters(p): Parameters<DeskNoteParams>) -> Result<CallToolResult, McpError> {
         match self.client.post(&format!("/sessions/{}/desk-note", p.session_id), json!({ "text": p.text })).await {
@@ -559,6 +575,8 @@ mod tests {
         assert!(line["properties"]["kind"].is_object(), "{line}");
         assert!(line["properties"]["item"].is_object(), "{line}");
         assert_eq!(line["required"], json!(["session_id", "text"]));
+        let unline = serde_json::to_value(&tool("desk_remove_line").input_schema).unwrap();
+        assert_eq!(unline["required"], json!(["session_id", "note_id"]));
         let add = serde_json::to_value(&tool("desk_add_repo").input_schema).unwrap();
         assert_eq!(add["required"], json!(["session_id", "repo"]));
         let desk_note = tool("desk_add_desk_note");

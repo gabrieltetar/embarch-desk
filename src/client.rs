@@ -69,4 +69,8 @@ impl DeskClient {
     pub async fn post(&self, path: &str, body: Value) -> Result<Value> {
         self.call(reqwest::Method::POST, path, Some(body)).await
     }
+
+    pub async fn delete(&self, path: &str) -> Result<Value> {
+        self.call(reqwest::Method::DELETE, path, None).await
+    }
 }
