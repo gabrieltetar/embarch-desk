@@ -108,7 +108,7 @@ pub fn ask_text(state: &State, session_id: &str, cwd: &str, now: i64, window_day
          "EmbArch Desk: this session (desk session id `{session_id}`) is not on a work item, so \
          its time has nowhere to land. First look in what you already have: an issue key in the \
          user's opening prompt or a handoff, of a team the desk's workspaces hold (`linear_teams` \
-         lists the keys; a lookalike in prose is not one). If there is one, call the \
+         lists the keys; the desk refuses a key no workspace has). If there is one, call the \
          `desk_set_work_item` tool with session_id `{session_id}` and that key, say in one line \
          which item you chose, and do not ask. If there is none, ask the user in one line which \
          work item it is — {choices} — or a Linear issue key, or a title for a new standalone \

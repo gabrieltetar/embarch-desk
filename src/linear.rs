@@ -12,9 +12,23 @@ use serde_json::{json, Value};
 
 const URL: &str = "https://api.linear.app/graphql";
 
+#[cfg(test)]
+thread_local! {
+    /// A fake Linear for the current test thread; tests run on one thread each.
+    pub(crate) static TEST_URL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn url() -> String {
+    #[cfg(test)]
+    if let Some(u) = TEST_URL.with(|u| u.borrow().clone()) {
+        return u;
+    }
+    URL.to_string()
+}
+
 async fn gql(acct: &Account, query: &str, vars: Value) -> Result<Value> {
     let resp = http()
-        .post(URL)
+        .post(url())
         // A personal API key goes bare; `Bearer` is for OAuth tokens.
         .header("Authorization", acct.token.as_str())
         .json(&json!({ "query": query, "variables": vars }))

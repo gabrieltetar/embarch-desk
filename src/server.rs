@@ -112,7 +112,8 @@ async fn no_key(app: &App, headers: &HeaderMap, accounts: &[crate::connectors::A
         let desks: Vec<&store::Desk> = st.desks.values().collect();
         linear::no_key_message(key, teams.as_deref(), &desks, caller.as_deref())
     });
-    missing(msg)
+    let tried: Vec<&str> = accounts.iter().map(|a| a.label.as_str()).collect();
+    missing(format!("{msg} (workspaces asked: {})", tried.join(", ")))
 }
 
 /// An error from a call on `key`: [`no_key`]'s message when no workspace has
@@ -663,6 +664,22 @@ struct NewItem {
     desk: Option<String>,
 }
 
+/// Make the card for a key no card carries, after a connected workspace has
+/// answered that it is an issue. A key none has is a 404 naming the key and
+/// the workspaces asked; Linear failing to answer is the 502 carrying its
+/// error, since that says nothing about the key, and no card is made.
+async fn adopt_key(app: &App, headers: &HeaderMap, accounts: &[crate::connectors::Account], key: &str, now: i64) -> Result<String, ApiError> {
+    if accounts.is_empty() {
+        return Err(bad("no Linear workspace is connected; add a Linear API key on the Desk tab first"));
+    }
+    let issue = match linear::find_issue(accounts, key, now).await? {
+        Some(i) => i,
+        None => return Err(no_key(app, headers, accounts, key).await),
+    };
+    let title = issue.title.clone();
+    Ok(app.db.write(|st| st.create_item(&title, Some(issue), now)))
+}
+
 /// Make (or find) the work item for an issue key, or a standalone one.
 async fn ensure_item(app: &App, headers: &HeaderMap, title: Option<&str>, issue_key: Option<&str>, desk: Option<&str>) -> Result<String, ApiError> {
     let now = now_ms();
@@ -674,15 +691,7 @@ async fn ensure_item(app: &App, headers: &HeaderMap, title: Option<&str>, issue_
             return Ok(id);
         }
         let conns = Connectors::load()?;
-        if conns.linear.is_empty() {
-            return Err(bad("no Linear workspace is connected; add a Linear API key on the Desk tab first"));
-        }
-        let issue = match linear::find_issue(&conns.linear, &key, now).await? {
-            Some(i) => i,
-            None => return Err(no_key(app, headers, &conns.linear, &key).await),
-        };
-        let title = issue.title.clone();
-        return Ok(app.db.write(|st| st.create_item(&title, Some(issue), now)));
+        return adopt_key(app, headers, &conns.linear, &key, now).await;
     }
     let title = title.map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("give an issue key or a title"))?;
     // A standalone item's desk is asked when it is made (decision 11).
@@ -4228,6 +4237,49 @@ mod tests {
             login: None,
         });
         (app, dir)
+    }
+
+    /// A Linear that has one issue, ABC-1, and says "Entity not found" for any
+    /// other id, the way a workspace says "not mine"; its URL.
+    async fn fake_linear() -> String {
+        async fn gql(Json(b): Json<Value>) -> Json<Value> {
+            if b["variables"]["id"] == "ABC-1" {
+                Json(json!({"data": {"issue": {"id": "i1", "identifier": "ABC-1", "title": "Bring-up", "url": "https://linear.app/x/issue/ABC-1",
+                    "state": {"id": "s", "name": "Todo", "type": "unstarted"}, "team": {"id": "t", "key": "ABC"}}}}))
+            } else {
+                Json(json!({"errors": [{"message": "Entity not found: Issue"}]}))
+            }
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/graphql", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, Router::new().route("/graphql", post(gql))).await.ok() });
+        url
+    }
+
+    #[tokio::test]
+    async fn the_desk_adopts_a_key_only_after_a_workspace_has_it() {
+        let (app, dir) = scratch_app();
+        let accts = [crate::connectors::Account::new("work", "k")];
+        let hdr = HeaderMap::new();
+        let live = fake_linear().await;
+        crate::linear::TEST_URL.with(|u| *u.borrow_mut() = Some(live));
+        let id = adopt_key(&app, &hdr, &accts, "ABC-1", D0).await.ok().expect("a real key is adopted");
+        assert_eq!(app.db.read(|st| st.items[&id].title.clone()), "Bring-up");
+        // A key-shaped string that is not an issue: refused, naming it and the workspace; no card.
+        let Err(ApiError(code, m)) = adopt_key(&app, &hdr, &accts, "V1-2", D0).await else { panic!("a lookalike was adopted") };
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert!(m.contains("V1-2") && m.contains("workspaces asked: work"), "{m}");
+        assert_eq!(app.db.read(|st| st.items.len()), 1);
+        // Linear unreachable: refused as a gateway failure that does not blame the key; no card.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = format!("http://{}/graphql", l.local_addr().unwrap());
+        drop(l);
+        crate::linear::TEST_URL.with(|u| *u.borrow_mut() = Some(dead));
+        let Err(ApiError(code, m)) = adopt_key(&app, &hdr, &accts, "ABC-2", D0).await else { panic!("adopted unchecked") };
+        assert_eq!(code, StatusCode::BAD_GATEWAY);
+        assert!(!m.contains("no connected Linear workspace has"), "{m}");
+        assert_eq!(app.db.read(|st| st.items.len()), 1);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     fn line_body(v: Value) -> LineBody {
