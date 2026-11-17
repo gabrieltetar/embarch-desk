@@ -446,7 +446,7 @@ impl DeskMcp {
         }
     }
 
-    #[tool(description = "List a team's Linear issues that are in one workflow state, by the state's name (\"Fleet Ready\"), optionally only those of one project (by name); most recently updated first. Not limited to this session's desk: any connected workspace's team, by its key. A state the team does not have is an error that lists the ones it has. The answer carries truncated, and a note when the 500-issue cap cut the list.")]
+    #[tool(description = "List a team's Linear issues that are in one workflow state, by the state's name (\"Fleet Ready\"), optionally only those of one project (by name); most recently updated first. Only a team in the Linear workspace this session's desk follows (any connected workspace's when it is on no desk); a team outside it is an error naming it. A state the team does not have is an error that lists the ones it has. The answer carries truncated, and a note when the 500-issue cap cut the list.")]
     async fn linear_list_issues(&self, Parameters(p): Parameters<StateListParams>) -> Result<CallToolResult, McpError> {
         match self.client.post("/linear/issues", json!({ "team": p.team_key, "state": p.state, "project": p.project })).await {
             Ok(v) => ok(v),

@@ -1815,12 +1815,23 @@ struct StateListBody {
     project: Option<String>,
 }
 
-/// A team's issues in a named state, in whichever workspace has the team (decision 79).
-async fn linear_issues(Json(b): Json<StateListBody>) -> ApiResult {
+/// The Linear workspace a team list is confined to (EMB-127): the account
+/// label the caller's desk follows. `None` on no desk, or on a desk with no
+/// Linear binding, which reads any workspace, as `/linear/search` does.
+fn list_workspace(app: &App, headers: &HeaderMap) -> Option<String> {
+    caller_linear(app, headers, None).map(|l| l.account)
+}
+
+/// A team's issues in a named state (decision 79), only from the workspace
+/// [`list_workspace`] names.
+async fn linear_issues(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<StateListBody>) -> ApiResult {
     if b.team.trim().is_empty() || b.state.trim().is_empty() {
         return Err(bad("a team key and a state name are both needed"));
     }
-    let l = linear::issues_in_state(&linear_accounts()?, &b.team, &b.state, b.project.as_deref()).await.map_err(|e| bad(e.to_string()))?;
+    let workspace = list_workspace(&app, &headers);
+    let l = linear::issues_in_state(&linear_accounts()?, workspace.as_deref(), &b.team, &b.state, b.project.as_deref())
+        .await
+        .map_err(|e| bad(e.to_string()))?;
     let mut v = json!({
         "workspace": l.workspace, "team": l.team, "state": l.state, "project": b.project,
         "issues": l.issues, "truncated": l.truncated,
@@ -4723,6 +4734,37 @@ mod tests {
         assert!(v["session"].is_null() && v.get("session").is_some(), "on no desk: null, not absent");
         let Ok(Json(v)) = list_desks(Ax(app.clone()), HeaderMap::new()).await else { panic!("desks") };
         assert!(v.get("session").is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_team_list_reads_only_the_workspace_its_callers_desk_follows() {
+        let (app, dir) = scratch_app();
+        let desk = |name: &str, repo: &str, account: Option<&str>| store::Desk {
+            name: name.into(),
+            firmware_repos: vec![repo.into()],
+            linear: account.map(|a| store::LinearBinding { account: a.into(), team_key: "AAA".into(), ..Default::default() }),
+            ..Default::default()
+        };
+        let a = app.db.write(|st| st.put_desk(desk("Alpha", "/w/a", Some("work")), D0));
+        app.db.write(|st| st.put_desk(desk("Beta", "/w/b", Some("other")), D0));
+        app.db.write(|st| st.put_desk(desk("Gamma", "/w/c", None), D0));
+        app.db.write(|st| {
+            st.ui_desk = Some(a.clone());
+            for (sid, cwd) in [("s", "/w/b/app"), ("t", "/tmp/x"), ("u", "/w/c")] {
+                st.sessions.insert(sid.into(), store::Session::new(sid, cwd, D0));
+            }
+        });
+        let from = |sid: &str, cwd: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(crate::client::SESSION_HEADER, sid.parse().unwrap());
+            h.insert(crate::client::CWD_HEADER, cwd.parse().unwrap());
+            h
+        };
+        assert_eq!(list_workspace(&app, &from("s", "/w/b/app")).as_deref(), Some("other"), "its own desk's, not the UI's");
+        assert_eq!(list_workspace(&app, &from("t", "/tmp/x")), None, "on no desk: any workspace, as search");
+        assert_eq!(list_workspace(&app, &from("u", "/w/c")), None, "a desk with no Linear binding: as search");
+        assert_eq!(list_workspace(&app, &HeaderMap::new()).as_deref(), Some("work"), "a call naming no session: the UI's desk");
         std::fs::remove_dir_all(dir).ok();
     }
 

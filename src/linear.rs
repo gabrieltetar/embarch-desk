@@ -559,22 +559,50 @@ fn state_query(project: bool) -> String {
     )
 }
 
+/// The team a key names (case ignored) among `rows` as [`teams`] answers
+/// them. `workspace` is the account label the caller's desk follows (EMB-127):
+/// only that workspace's teams count, and a miss names the team and that
+/// workspace, never whether another workspace has it. With none, any
+/// connected workspace's team answers.
+fn team_named<'a>(rows: &'a [Value], key: &str, workspace: Option<&str>) -> Result<&'a Value> {
+    let ours: Vec<&Value> = rows.iter().filter(|t| workspace.is_none_or(|w| t["account"].as_str() == Some(w))).collect();
+    if let Some(team) = ours.iter().find(|t| t["key"].as_str().is_some_and(|k| k.eq_ignore_ascii_case(key))) {
+        return Ok(team);
+    }
+    let keys: Vec<&str> = ours.iter().filter_map(|t| t["key"].as_str()).collect();
+    match workspace {
+        Some(w) => bail!(
+            "team {key:?} is not in workspace {w:?}, which this session's desk follows, and a session lists \
+             only its desk's workspace; that workspace's teams are: {}",
+            keys.join(", ")
+        ),
+        None => bail!("no connected workspace has a team {key:?}; the teams are: {}", keys.join(", ")),
+    }
+}
+
 /// Every issue of a team (by key) in a workflow state (by name, as the team
 /// defines it, case ignored), optionally in one project (by name), newest
 /// update first, up to `MINE_CAP`; and whether that cap cut the list. The
-/// team is looked up in every connected workspace; the state must be one it
-/// has, so a misspelling is an error and never an empty list.
-pub async fn issues_in_state(accounts: &[Account], team_key: &str, state: &str, project: Option<&str>) -> Result<StateList> {
-    let all = teams(accounts).await?;
-    let key = team_key.trim();
-    let Some(team) = all.iter().find(|t| t["key"].as_str().is_some_and(|k| k.eq_ignore_ascii_case(key))) else {
-        let keys: Vec<&str> = all.iter().filter_map(|t| t["key"].as_str()).collect();
-        bail!("no connected workspace has a team {key:?}; the teams are: {}", keys.join(", "));
-    };
+/// team is looked up in `workspace`, the account label the caller's desk
+/// follows, else in every connected workspace ([`team_named`]); the state
+/// must be one it has, so a misspelling is an error and never an empty list.
+pub async fn issues_in_state(
+    accounts: &[Account],
+    workspace: Option<&str>,
+    team_key: &str,
+    state: &str,
+    project: Option<&str>,
+) -> Result<StateList> {
+    let reach: Vec<Account> = accounts.iter().filter(|a| workspace.is_none_or(|w| a.label == w)).cloned().collect();
+    if let (Some(w), true) = (workspace, reach.is_empty()) {
+        bail!("workspace {w:?}, the one this session's desk follows, is not connected; connect it on the Desk tab");
+    }
+    let all = teams(&reach).await?;
+    let team = team_named(&all, team_key.trim(), workspace)?;
     let label = team["account"].as_str().unwrap_or_default();
     let team_id = team["id"].as_str().unwrap_or_default();
     let team_key = team["key"].as_str().unwrap_or_default().to_string();
-    let acct = accounts.iter().find(|a| a.label == label).ok_or_else(|| anyhow!("no Linear account {label:?} connected"))?;
+    let acct = reach.iter().find(|a| a.label == label).ok_or_else(|| anyhow!("no Linear account {label:?} connected"))?;
     let state = state_named(&team_states(acct, team_id).await?, &team_key, state)?;
     let project = project.map(str::trim).filter(|p| !p.is_empty());
     let (issues, truncated) = if acct.mcp.is_some() {
@@ -861,6 +889,37 @@ mod tests {
         assert_eq!(state_named(&states, "EMB", " fleet ready ").unwrap(), "Fleet Ready");
         let e = state_named(&states, "EMB", "Ready").unwrap_err().to_string();
         assert!(e.contains("EMB") && e.contains("Backlog, Fleet Ready"), "{e}");
+    }
+
+    #[test]
+    fn a_team_list_is_confined_to_the_desks_workspace_and_a_team_outside_it_is_named() {
+        let rows = [
+            json!({ "account": "work", "id": "t1", "key": "AAA" }),
+            json!({ "account": "work", "id": "t2", "key": "BBB" }),
+            json!({ "account": "other", "id": "t3", "key": "ZZZ" }),
+        ];
+        // Inside the desk's workspace: found, case ignored.
+        assert_eq!(team_named(&rows, "bbb", Some("work")).unwrap()["id"], "t2");
+        // Outside it: an error naming the team and the desk's workspace, and
+        // nothing of the workspace that does have it.
+        let e = team_named(&rows, "ZZZ", Some("work")).unwrap_err().to_string();
+        assert!(e.contains("\"ZZZ\"") && e.contains("\"work\"") && e.contains("AAA, BBB"), "{e}");
+        assert!(!e.contains("other") && !e.contains("no connected workspace"), "{e}");
+        // A team no workspace has reads the same, so a miss says nothing of elsewhere.
+        let none = team_named(&rows, "QQQ", Some("work")).unwrap_err().to_string();
+        assert_eq!(none.replace("QQQ", "ZZZ"), e);
+        // On no desk: any connected workspace's team answers.
+        assert_eq!(team_named(&rows, "zzz", None).unwrap()["id"], "t3");
+        let e = team_named(&rows, "QQQ", None).unwrap_err().to_string();
+        assert!(e.contains("no connected workspace has a team \"QQQ\"") && e.contains("AAA, BBB, ZZZ"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_team_list_for_a_desk_whose_workspace_is_not_connected_says_so_before_any_read() {
+        // Only "other" is connected, so no request is made: the error comes first.
+        let accounts = [Account::new("other", "t")];
+        let e = issues_in_state(&accounts, Some("work"), "ZZZ", "Done", None).await.err().unwrap().to_string();
+        assert!(e.contains("\"work\"") && e.contains("not connected") && !e.contains("other"), "{e}");
     }
 
     #[test]
