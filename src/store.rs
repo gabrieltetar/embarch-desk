@@ -687,7 +687,8 @@ pub struct More {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Draft {
     pub id: String,
-    /// `linear_comment`, `linear_issue` or `linear_edit` (decision 75).
+    /// `linear_comment`, `linear_issue` or `linear_edit` (decision 75), or
+    /// `github_replies`.
     pub kind: String,
     /// The issue a comment answers, or an edit changes.
     #[serde(default)]
@@ -719,6 +720,25 @@ pub struct Draft {
     /// issue's description has changed since (75).
     #[serde(default)]
     pub base: Option<String>,
+    /// A `github_replies` draft's repository, `owner/name`.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// A `github_replies` draft's pull request number.
+    #[serde(default)]
+    pub pr: Option<u64>,
+    /// A `github_replies` draft's replies, one per review thread, posted by
+    /// one Send; each keeps its URL once posted so a retry skips it.
+    #[serde(default)]
+    pub gh_replies: Vec<GhReply>,
+}
+
+/// One reply to an existing GitHub review comment, and where it landed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GhReply {
+    pub comment_id: u64,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

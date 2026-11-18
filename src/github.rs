@@ -7,7 +7,7 @@ use crate::store::PrRef;
 use anyhow::{bail, Result};
 use serde_json::Value;
 
-const API: &str = "https://api.github.com";
+pub const API: &str = "https://api.github.com";
 
 async fn get(acct: &Account, url: &str) -> Result<Value> {
     let resp = http()
@@ -23,6 +23,88 @@ async fn get(acct: &Account, url: &str) -> Result<Value> {
         bail!("github: HTTP {status}: {}", body["message"]);
     }
     Ok(body)
+}
+
+async fn post(acct: &Account, url: &str, body: &Value) -> Result<Value> {
+    let resp = http()
+        .post(url)
+        .bearer_auth(&acct.token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(body)
+        .send()
+        .await?;
+    let status = resp.status();
+    let out: Value = resp.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        bail!("github: HTTP {status}: {}", out["message"]);
+    }
+    Ok(out)
+}
+
+/// What a batch of replies did: the (draft index, URL) of each posted, and
+/// the error that stopped it, if one did.
+pub struct Posted {
+    pub posted: Vec<(usize, String)>,
+    pub error: Option<String>,
+}
+
+/// The thread root each of `ids` belongs to, or a message naming the ids that
+/// are not review comments on the PR whose comments these are. GitHub takes a
+/// reply only under a thread's root, so a reply's id resolves to its root.
+pub fn thread_roots(comments: &[Value], ids: &[u64]) -> Result<Vec<u64>, String> {
+    let parent: std::collections::HashMap<u64, Option<u64>> =
+        comments.iter().filter_map(|c| Some((c["id"].as_u64()?, c["in_reply_to_id"].as_u64()))).collect();
+    let missing: Vec<String> = ids.iter().filter(|i| !parent.contains_key(i)).map(u64::to_string).collect();
+    if !missing.is_empty() {
+        return Err(format!("not review comments on this pull request: {}; nothing was posted", missing.join(", ")));
+    }
+    Ok(ids
+        .iter()
+        .map(|&i| {
+            let mut at = i;
+            // Bounded by the number of comments, so a malformed cycle ends.
+            for _ in 0..parent.len() {
+                match parent.get(&at).copied().flatten() {
+                    Some(p) if parent.contains_key(&p) => at = p,
+                    _ => break,
+                }
+            }
+            at
+        })
+        .collect())
+}
+
+/// Post `replies` (draft index, comment id, body) each in its comment's
+/// thread on `repo`#`number`, through the first account that can read the PR.
+/// Every id is checked against the PR's review comments first; one that is
+/// not on it is an `Err` and nothing is posted. `api` is GitHub's base URL.
+pub async fn post_replies(accounts: &[Account], api: &str, repo: &str, number: u64, replies: &[(usize, u64, &str)]) -> Result<Posted> {
+    let mut last_err = None;
+    for acct in accounts {
+        let comments = match all_pages(acct, &format!("{api}/repos/{repo}/pulls/{number}/comments")).await {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let ids: Vec<u64> = replies.iter().map(|r| r.1).collect();
+        let roots = thread_roots(&comments, &ids).map_err(|m| anyhow::anyhow!(m))?;
+        let mut out = Posted { posted: vec![], error: None };
+        for ((idx, _, body), root) in replies.iter().zip(roots) {
+            let url = format!("{api}/repos/{repo}/pulls/{number}/comments/{root}/replies");
+            match post(acct, &url, &serde_json::json!({ "body": body })).await {
+                Ok(v) => out.posted.push((*idx, v["html_url"].as_str().unwrap_or_default().to_string())),
+                Err(e) => {
+                    out.error = Some(format!("{e:#}"));
+                    break;
+                }
+            }
+        }
+        return Ok(out);
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no GitHub account connected")))
 }
 
 pub async fn whoami(acct: &Account) -> Result<String> {

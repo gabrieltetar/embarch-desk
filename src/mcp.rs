@@ -174,6 +174,27 @@ pub struct StatusParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ReviewReply {
+    /// The id of the review comment (from github_pr_threads) to reply under.
+    pub comment_id: u64,
+    /// The reply, in Markdown, as it should be posted.
+    pub body: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ReviewRepliesParams {
+    /// The repository, owner/name.
+    pub repo: String,
+    /// The pull request's number.
+    pub number: u64,
+    /// One reply per review thread, each with the id of a review comment on that pull request.
+    pub replies: Vec<ReviewReply>,
+    /// The desk session id from this session's context, so the draft shows on its card.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct CommentDraftParams {
     /// The issue the comment goes on.
     pub issue_key: String,
@@ -520,6 +541,16 @@ impl DeskMcp {
         }
     }
 
+    #[tool(description = "Propose replies to review threads on one GitHub pull request as a single draft: the repository, the PR number, and a list of (comment_id, body), each comment_id a review comment from github_pr_threads. Nothing is posted: the draft waits on the user's Desk tab, where they edit it and press Send, so tell the user it is waiting there. On Send every comment id is checked to be a review comment on that PR (one that is not stops the whole send before anything is posted), then each body is posted in its own thread and every posted URL is recorded. A desk set to write directly posts at once and the reply says so.")]
+    async fn github_draft_review_replies(&self, Parameters(p): Parameters<ReviewRepliesParams>) -> Result<CallToolResult, McpError> {
+        let replies: Vec<Value> = p.replies.iter().map(|r| json!({ "comment_id": r.comment_id, "body": r.body })).collect();
+        let body = json!({ "kind": "github_replies", "repo": p.repo, "pr": p.number, "gh_replies": replies, "session_id": p.session_id });
+        match self.client.post("/drafts", body).await {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
     #[tool(description = "Move a Linear issue to another workflow state by name (\"In Progress\", \"In Review\"). A status move goes straight through; the error lists the team's states if the name is wrong.")]
     async fn linear_set_status(&self, Parameters(p): Parameters<StatusParams>) -> Result<CallToolResult, McpError> {
         match self.client.post("/linear/status", json!({ "key": p.key, "status": p.status })).await {
@@ -641,7 +672,7 @@ impl ServerHandler for DeskMcp {
             "embarch-desk: the one access point to Linear and Harvest, and the work item this session's \
              time and notes belong to. desk_work_item returns everything the desk holds about the session's \
              item. Read Linear with linear_get_issue, linear_my_issues, linear_search and linear_list_issues, an issue's images and files with linear_get_file, and list the \
-             connected workspaces' team keys with linear_teams; read a pull request's review threads with github_pr_threads; restack a stacked branch onto its moved base with desk_restack and its resolve, continue and abort steps; \
+             connected workspaces' team keys with linear_teams; read a pull request's review threads with github_pr_threads and propose replies to them with github_draft_review_replies; restack a stacked branch onto its moved base with desk_restack and its resolve, continue and abort steps; \
              move a status with linear_set_status; propose a comment, an issue or a change to one with linear_draft_comment, \
              linear_draft_issue or linear_draft_edit — they wait for the user's Send on the Desk tab. Read Harvest with \
              harvest_entries and harvest_projects; time is never logged from a session: add notes with \

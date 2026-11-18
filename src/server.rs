@@ -1894,9 +1894,18 @@ struct NewDraft {
     team_key: Option<String>,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
     body: String,
     #[serde(default)]
     session_id: Option<String>,
+    /// A `github_replies` draft's repository, `owner/name`, pull request and
+    /// replies (one per review thread).
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    pr: Option<u64>,
+    #[serde(default)]
+    gh_replies: Vec<store::GhReply>,
     /// The name of the Project a new issue goes in, in `team_key`'s team.
     #[serde(default)]
     project: Option<String>,
@@ -1959,8 +1968,14 @@ async fn create_draft(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<New
             return Err(bad("an edit draft needs a new title, a new description or both"))
         }
         "linear_comment" | "linear_issue" | "linear_edit" => {}
-        k => return Err(bad(format!("unknown draft kind {k:?}; linear_comment, linear_issue or linear_edit"))),
+        "github_replies" => {}
+        k => return Err(bad(format!("unknown draft kind {k:?}; linear_comment, linear_issue, linear_edit or github_replies"))),
     }
+    let (repo, pr, gh_replies) = if b.kind == "github_replies" {
+        github_replies_shape(b.repo.as_deref(), b.pr, &b.gh_replies).map_err(bad)?
+    } else {
+        (None, None, vec![])
+    };
     if b.body.trim().is_empty() && b.kind == "linear_comment" {
         return Err(bad("an empty comment"));
     }
@@ -2000,6 +2015,9 @@ async fn create_draft(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<New
                 reply_to,
                 replies: b.replies.iter().map(|r| r.trim().to_string()).collect(),
                 base,
+                repo,
+                pr,
+                gh_replies,
             },
         );
         id
@@ -2018,6 +2036,56 @@ async fn create_draft(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<New
     Ok(Json(json!({ "draft_id": id, "status": "waiting for the user's Send on the Desk tab; nothing was posted" })))
 }
 
+/// The shape of a `github_replies` draft, checked before it is stored: an
+/// `owner/name` repository, a PR number and at least one non-empty reply.
+type GhShape = (Option<String>, Option<u64>, Vec<store::GhReply>);
+
+fn github_replies_shape(repo: Option<&str>, pr: Option<u64>, replies: &[store::GhReply]) -> Result<GhShape, String> {
+    let repo = repo.map(str::trim).filter(|r| r.split('/').count() == 2 && r.split('/').all(|p| !p.is_empty())).ok_or("a github_replies draft needs repo as owner/name")?;
+    let pr = pr.ok_or("a github_replies draft needs the pull request number")?;
+    if replies.is_empty() {
+        return Err("a github_replies draft needs at least one reply".into());
+    }
+    if replies.iter().any(|r| r.body.trim().is_empty()) {
+        return Err("an empty reply".into());
+    }
+    let replies = replies.iter().map(|r| store::GhReply { comment_id: r.comment_id, body: r.body.trim().to_string(), url: None }).collect();
+    Ok((Some(repo.to_string()), Some(pr), replies))
+}
+
+/// The user's Send of a `github_replies` draft: every comment id is checked to
+/// be a review comment on the PR before the first reply is posted, then each
+/// body is posted in its comment's thread. A reply that fails leaves the
+/// draft open with the URLs already posted kept, so the next Send posts only
+/// the rest.
+async fn send_github_replies(app: &Shared, accounts: &[crate::connectors::Account], api: &str, d: &store::Draft) -> ApiResult {
+    let (Some(repo), Some(pr)) = (d.repo.as_deref(), d.pr) else { return Err(bad("a github_replies draft lost its repository or PR")) };
+    if accounts.is_empty() {
+        return Err(bad("no GitHub account is connected, and no gh login"));
+    }
+    let todo: Vec<(usize, u64, &str)> = d.gh_replies.iter().enumerate().filter(|(_, r)| r.url.is_none()).map(|(i, r)| (i, r.comment_id, r.body.as_str())).collect();
+    let out = github::post_replies(accounts, api, repo, pr, &todo).await.map_err(|e| bad(e.to_string()))?;
+    app.db.write(|st| {
+        if let Some(x) = st.drafts.get_mut(&d.id) {
+            for (i, url) in &out.posted {
+                x.gh_replies[*i].url = Some(url.clone());
+            }
+            if out.error.is_none() {
+                x.status = "sent".into();
+                x.url = x.gh_replies.first().and_then(|r| r.url.clone());
+            }
+        }
+    });
+    if let Some(e) = out.error {
+        return Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            format!("posted {} of {} replies on {repo}#{pr}; the rest stay as this draft: {e}", out.posted.len(), todo.len()),
+        ));
+    }
+    let urls: Vec<String> = app.db.read(|st| st.drafts.get(&d.id).map(|x| x.gh_replies.iter().filter_map(|r| r.url.clone()).collect()).unwrap_or_default());
+    Ok(Json(json!({ "url": urls.first(), "urls": urls })))
+}
+
 #[derive(Deserialize)]
 struct DraftPatch {
     #[serde(default)]
@@ -2026,6 +2094,9 @@ struct DraftPatch {
     body: Option<String>,
     #[serde(default)]
     replies: Option<Vec<String>>,
+    /// A `github_replies` draft's replies as edited on the tab.
+    #[serde(default)]
+    gh_replies: Option<Vec<store::GhReply>>,
 }
 
 /// An issue's description as `read_issue` gives it, none read as empty.
@@ -2046,6 +2117,10 @@ async fn patch_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<
             // A reply emptied on the tab is one the user took out of the thread.
             d.replies = replies.into_iter().map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect();
         }
+        if let Some(replies) = b.gh_replies.filter(|_| d.kind == "github_replies") {
+            // One emptied on the tab is a thread the user took out of the batch.
+            d.gh_replies = replies.into_iter().filter(|r| !r.body.trim().is_empty()).map(|r| store::GhReply { body: r.body.trim().to_string(), ..r }).collect();
+        }
         Ok::<_, ApiError>(())
     })?;
     Ok(Json(json!({ "ok": true })))
@@ -2058,6 +2133,10 @@ async fn send_draft(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
         .db
         .read(|st| st.drafts.get(&id).filter(|d| d.status == "open").cloned())
         .ok_or_else(|| missing("no open draft with that id"))?;
+    if d.kind == "github_replies" {
+        let accounts = Connectors::load()?.github_accounts();
+        return send_github_replies(&app, &accounts, github::API, &d).await;
+    }
     let accounts = linear_accounts()?;
     let key = d.issue_key.as_deref().unwrap_or_default();
     let mut comment_id = None;
@@ -3683,7 +3762,7 @@ mod tests {
             st.drafts.insert(id.into(), store::Draft {
                 id: id.into(), kind: "linear_comment".into(), issue_key: Some("ABC-1".into()), team_key: None,
                 title: None, body: "x".into(), item_id: None, created_ms: D0, status: status.into(), url: None,
-                project_id: None, reply_to: None, replies: vec![], base: None,
+                project_id: None, reply_to: None, replies: vec![], base: None, repo: None, pr: None, gh_replies: vec![],
             });
         }
         st.start_timer(&a, D0 + H, &UtcDays);
@@ -5461,5 +5540,116 @@ mod tests {
         assert_eq!(st.mailbox.len(), 1, "a taken one is kept for a claim's time, so a second take is told");
         st.prune(D0 + 12 * store::LAUNCH_CLAIM_MS + 1);
         assert!(st.mailbox.is_empty());
+    }
+
+    /// A GitHub stand-in for PR 5 of `o/r`: comments 11 (a root), 12 (a reply
+    /// under 11) and 21 (another root). Records each reply posted.
+    async fn github_stub() -> (String, Arc<Mutex<Vec<(u64, String)>>>) {
+        use axum::routing::get as aget;
+        let posted: Arc<Mutex<Vec<(u64, String)>>> = Default::default();
+        let log = posted.clone();
+        let router = Router::new()
+            .route(
+                "/repos/o/r/pulls/5/comments",
+                aget(|| async {
+                    Json(json!([
+                        {"id": 11, "in_reply_to_id": null}, {"id": 12, "in_reply_to_id": 11}, {"id": 21, "in_reply_to_id": null}
+                    ]))
+                }),
+            )
+            .route(
+                "/repos/o/r/pulls/5/comments/{root}/replies",
+                post(move |Path(root): Path<u64>, Json(b): Json<Value>| {
+                    let log = log.clone();
+                    async move {
+                        let body = b["body"].as_str().unwrap_or_default().to_string();
+                        if body == "boom" {
+                            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"message": "nope"})));
+                        }
+                        let n = { let mut l = log.lock().unwrap(); l.push((root, body)); l.len() };
+                        (StatusCode::CREATED, Json(json!({"html_url": format!("https://github.com/o/r/pull/5#discussion_r{n}")})))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router).await.ok() });
+        (base, posted)
+    }
+
+    fn gh_account() -> Vec<crate::connectors::Account> {
+        vec![crate::connectors::Account { label: "stub".into(), token: "t".into(), mcp: None }]
+    }
+
+    async fn gh_draft(app: &Shared, replies: Value) -> store::Draft {
+        let body = json!({"kind": "github_replies", "repo": "o/r", "pr": 5, "gh_replies": replies});
+        let Ok(Json(v)) = create_draft(Ax(app.clone()), HeaderMap::new(), Json(serde_json::from_value(body).unwrap())).await else { panic!("draft refused") };
+        assert!(v["status"].as_str().unwrap().contains("waiting"), "{v}");
+        let id = v["draft_id"].as_str().unwrap().to_string();
+        app.db.read(|st| st.drafts[&id].clone())
+    }
+
+    #[tokio::test]
+    async fn review_replies_wait_for_send_then_land_each_in_its_thread_with_urls() {
+        let (app, dir) = scratch_app();
+        let (api, posted) = github_stub().await;
+        let d = gh_draft(&app, json!([{"comment_id": 12, "body": " one "}, {"comment_id": 21, "body": "two"}])).await;
+        assert_eq!(d.status, "open");
+        assert!(posted.lock().unwrap().is_empty(), "creating the draft posts nothing");
+        let Ok(Json(v)) = send_github_replies(&app, &gh_account(), &api, &d).await else { panic!("send failed") };
+        assert_eq!(v["urls"].as_array().unwrap().len(), 2);
+        assert_eq!(*posted.lock().unwrap(), vec![(11, "one".to_string()), (21, "two".to_string())], "a reply to a reply goes under its thread's root");
+        let after = app.db.read(|st| st.drafts[&d.id].clone());
+        assert_eq!(after.status, "sent");
+        assert!(after.gh_replies.iter().all(|r| r.url.is_some()));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_comment_id_off_the_pr_stops_the_send_before_anything_is_posted() {
+        let (app, dir) = scratch_app();
+        let (api, posted) = github_stub().await;
+        let d = gh_draft(&app, json!([{"comment_id": 11, "body": "a"}, {"comment_id": 999, "body": "b"}])).await;
+        let Err(ApiError(_, m)) = send_github_replies(&app, &gh_account(), &api, &d).await else { panic!("sent") };
+        assert!(m.contains("999") && m.contains("nothing was posted"), "{m}");
+        assert!(posted.lock().unwrap().is_empty());
+        assert_eq!(app.db.read(|st| st.drafts[&d.id].status.clone()), "open");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_reply_keeps_the_draft_and_a_retry_skips_what_posted() {
+        let (app, dir) = scratch_app();
+        let (api, posted) = github_stub().await;
+        let d = gh_draft(&app, json!([{"comment_id": 11, "body": "a"}, {"comment_id": 21, "body": "boom"}])).await;
+        let Err(ApiError(c, m)) = send_github_replies(&app, &gh_account(), &api, &d).await else { panic!("sent") };
+        assert_eq!(c, StatusCode::BAD_GATEWAY);
+        assert!(m.contains("1 of 2"), "{m}");
+        let mid = app.db.read(|st| st.drafts[&d.id].clone());
+        assert_eq!(mid.status, "open");
+        assert!(mid.gh_replies[0].url.is_some() && mid.gh_replies[1].url.is_none());
+        let patch = DraftPatch { title: None, body: None, replies: None, gh_replies: Some(vec![mid.gh_replies[0].clone(), store::GhReply { body: "fixed".into(), ..mid.gh_replies[1].clone() }]) };
+        let _ = patch_draft(Ax(app.clone()), Path(d.id.clone()), Json(patch)).await.ok().unwrap();
+        let again = app.db.read(|st| st.drafts[&d.id].clone());
+        let Ok(Json(v)) = send_github_replies(&app, &gh_account(), &api, &again).await else { panic!("retry failed") };
+        assert_eq!(v["urls"].as_array().unwrap().len(), 2);
+        assert_eq!(posted.lock().unwrap().len(), 2, "the first reply was not posted twice");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_review_replies_draft_needs_a_repo_a_pr_and_non_empty_replies() {
+        let (app, dir) = scratch_app();
+        let make = |b: Value| create_draft(Ax(app.clone()), HeaderMap::new(), Json(serde_json::from_value(b).unwrap()));
+        for b in [
+            json!({"kind": "github_replies", "pr": 5, "gh_replies": [{"comment_id": 1, "body": "x"}]}),
+            json!({"kind": "github_replies", "repo": "o/r", "gh_replies": [{"comment_id": 1, "body": "x"}]}),
+            json!({"kind": "github_replies", "repo": "o/r", "pr": 5, "gh_replies": []}),
+            json!({"kind": "github_replies", "repo": "o/r", "pr": 5, "gh_replies": [{"comment_id": 1, "body": " "}]}),
+        ] {
+            assert!(make(b).await.is_err());
+        }
+        assert_eq!(app.db.read(|st| st.drafts.len()), 0);
+        std::fs::remove_dir_all(dir).ok();
     }
 }
