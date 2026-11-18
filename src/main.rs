@@ -13,6 +13,7 @@ mod files;
 mod github;
 mod harvest;
 mod hook;
+mod inspect;
 mod linear;
 mod linear_mcp;
 mod localrepo;
@@ -50,6 +51,28 @@ enum Cmd {
     Hook,
     /// Serve the agent-facing tools over MCP stdio (what the plugin runs).
     Mcp,
+    /// Print the shape of a desk route's answer: top-level keys, list lengths, one
+    /// sample row. Secrets are masked. Reaches a named instance with --config-dir
+    /// and --port (or EMBARCH_DESK_CONFIG_DIR / EMBARCH_DESK_PORT).
+    Get {
+        /// The route, e.g. /view
+        route: String,
+        /// POST this JSON body instead of a GET
+        #[arg(long)]
+        post: Option<String>,
+        /// Count the rows of each list by this field
+        #[arg(long)]
+        count_by: Option<String>,
+        /// Print the JSON as returned (secrets still masked)
+        #[arg(long)]
+        raw: bool,
+        /// The instance's config folder, where its desk-token is
+        #[arg(long)]
+        config_dir: Option<std::path::PathBuf>,
+        /// The instance's port
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Install, remove or show the systemd user service.
     Service {
         #[command(subcommand)]
@@ -142,6 +165,11 @@ fn main() -> Result<()> {
             ServiceAction::Uninstall { instance } => service::uninstall(instance.as_deref()),
             ServiceAction::Status { instance } => service::status(instance.as_deref()),
         },
+        Cmd::Get { route, post, count_by, raw, config_dir, port } => runtime()?.block_on(async {
+            let c = client::DeskClient::for_instance(Duration::from_secs(30), config_dir.as_deref(), port)?;
+            println!("{}", inspect::get(&c, &route, post.as_deref(), count_by.as_deref(), raw).await?);
+            Ok(())
+        }),
         Cmd::Mcp => runtime()?.block_on(mcp::serve()),
         Cmd::Serve => runtime()?.block_on(serve()),
         Cmd::Connect { kind, label, mcp: true } => {

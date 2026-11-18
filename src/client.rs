@@ -36,6 +36,32 @@ impl DeskClient {
         })
     }
 
+    /// A client for one named instance: its own config folder (where its
+    /// `desk-token` is) and port, each falling back to the environment and then
+    /// the default instance, the way `serve` resolves them. The token is read,
+    /// never generated: an instance that never ran has none to read.
+    pub fn for_instance(timeout: Duration, config_dir: Option<&std::path::Path>, port: Option<u16>) -> Result<Self> {
+        let token = match config_dir {
+            None => paths::desk_token()?,
+            Some(d) => {
+                let f = d.join("desk-token");
+                let t = std::fs::read_to_string(&f).map_err(|e| anyhow!("no desk token at {}: {e} (has that instance run?)", f.display()))?;
+                t.trim().to_string()
+            }
+        };
+        Ok(Self {
+            http: reqwest::Client::builder().timeout(timeout).build()?,
+            base: port.map_or_else(paths::base_url, |p| format!("http://127.0.0.1:{p}")),
+            token,
+            caller: caller(),
+        })
+    }
+
+    /// The bearer this client presents, so `get` can keep it out of its output.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     pub async fn call(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value> {
         let mut req = self.http.request(method, format!("{}{path}", self.base)).bearer_auth(&self.token);
         if let Some((sid, cwd)) = &self.caller {
