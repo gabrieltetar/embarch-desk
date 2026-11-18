@@ -1999,6 +1999,7 @@ async fn create_draft(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<New
             .and_then(|k| st.item_by_key(k).map(|i| i.id.clone()))
             .or_else(|| b.session_id.as_deref().and_then(|s| st.sessions.get(s)).and_then(|s| s.item_id.clone()));
         let id = st.new_id("d");
+        let first_text = if b.kind == "github_replies" { store::render_replies(&gh_replies) } else { b.body.trim().to_string() };
         st.drafts.insert(
             id.clone(),
             store::Draft {
@@ -2020,7 +2021,7 @@ async fn create_draft(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<New
                 pr,
                 gh_replies,
                 agent_body: Some(b.body.trim().to_string()),
-                versions: if b.kind == "github_replies" { vec![] } else { vec![store::DraftVersion { n: 1, by: "agent".into(), at_ms: now, text: b.body.trim().to_string() }] },
+                versions: vec![store::DraftVersion { n: 1, by: "agent".into(), at_ms: now, text: first_text }],
             },
         );
         id
@@ -2052,7 +2053,7 @@ fn github_replies_shape(repo: Option<&str>, pr: Option<u64>, replies: &[store::G
     if replies.iter().any(|r| r.body.trim().is_empty()) {
         return Err("an empty reply".into());
     }
-    let replies = replies.iter().map(|r| store::GhReply { comment_id: r.comment_id, body: r.body.trim().to_string(), url: None }).collect();
+    let replies = replies.iter().map(|r| store::GhReply { comment_id: r.comment_id, body: r.body.trim().to_string(), url: None, agent_body: Some(r.body.trim().to_string()) }).collect();
     Ok((Some(repo.to_string()), Some(pr), replies))
 }
 
@@ -2114,7 +2115,7 @@ async fn patch_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<
             d.title = Some(t);
         }
         if let Some(body) = b.body {
-            if body != d.body && d.kind != "github_replies" {
+            if body != d.body {
                 d.push_version("owner", body.clone(), now_ms());
             }
             d.body = body;
@@ -2125,7 +2126,21 @@ async fn patch_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<
         }
         if let Some(replies) = b.gh_replies.filter(|_| d.kind == "github_replies") {
             // One emptied on the tab is a thread the user took out of the batch.
-            d.gh_replies = replies.into_iter().filter(|r| !r.body.trim().is_empty()).map(|r| store::GhReply { body: r.body.trim().to_string(), ..r }).collect();
+            // The agent's version of a reply is the desk's to keep, not the tab's.
+            let before = store::render_replies(&d.gh_replies);
+            let kept = d.gh_replies.clone();
+            d.gh_replies = replies
+                .into_iter()
+                .filter(|r| !r.body.trim().is_empty())
+                .map(|r| store::GhReply { body: r.body.trim().to_string(), agent_body: kept.iter().find(|k| k.comment_id == r.comment_id).and_then(|k| k.agent_body.clone()), ..r })
+                .collect();
+            let after = store::render_replies(&d.gh_replies);
+            if after != before {
+                if d.versions.is_empty() {
+                    d.versions = vec![store::DraftVersion { n: 1, by: "agent".into(), at_ms: d.created_ms, text: before }];
+                }
+                d.push_version("owner", after, now_ms());
+            }
         }
         Ok::<_, ApiError>(())
     })?;
@@ -2134,6 +2149,9 @@ async fn patch_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<
 
 #[derive(Deserialize)]
 struct Revision {
+    /// A `github_replies` draft's reply to replace, by its review comment id.
+    #[serde(default)]
+    comment_id: Option<u64>,
     /// The heading whose section is replaced; omit it to append.
     #[serde(default)]
     section: Option<String>,
@@ -2149,6 +2167,9 @@ async fn revise_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json
     if b.text.trim().is_empty() {
         return Err(bad("an empty revision"));
     }
+    if b.comment_id.is_some() && b.section.is_some() {
+        return Err(bad("a reply is replaced whole: give comment_id or section, not both"));
+    }
     let change = match b.section.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(name) => draftedit::Change::Section { name, text: &b.text },
         None => draftedit::Change::Append(&b.text),
@@ -2156,7 +2177,10 @@ async fn revise_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json
     let out = app.db.write(|st| {
         let d = st.drafts.get_mut(&id).filter(|d| d.status == "open").ok_or_else(|| missing("no open draft with that id"))?;
         if d.kind == "github_replies" {
-            return Err(bad("a github_replies draft has one body per thread, not sections; discard it and draft again"));
+            return revise_reply(d, b.comment_id, b.text.trim());
+        }
+        if b.comment_id.is_some() {
+            return Err(bad("comment_id names a reply of a github_replies draft; this draft has none"));
         }
         let agent = d.agent_body.clone().unwrap_or_else(|| d.body.clone());
         let (a, o) = draftedit::revise(&agent, &d.body, &change).map_err(|r| match r {
@@ -2171,6 +2195,39 @@ async fn revise_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json
     Ok(Json(json!({ "ok": true, "owner_edits_kept": out })))
 }
 
+/// One reply of a `github_replies` draft replaced by the agent (EMB-212): its
+/// own version always, the owner's text too where the owner left the reply
+/// alone. A reply the owner edited, or already posted, is a 409 and nothing
+/// changes; every other reply is untouched.
+fn revise_reply(d: &mut store::Draft, comment_id: Option<u64>, text: &str) -> Result<bool, ApiError> {
+    let Some(id) = comment_id else {
+        return Err(bad("a github_replies draft is revised one reply at a time: give comment_id"));
+    };
+    let Some(i) = d.gh_replies.iter().position(|r| r.comment_id == id) else {
+        let have = d.gh_replies.iter().map(|r| r.comment_id.to_string()).collect::<Vec<_>>().join(", ");
+        return Err(bad(format!("the draft has no reply to comment {id}; it has {have}")));
+    };
+    let r = &d.gh_replies[i];
+    if let Some(url) = &r.url {
+        return Err(ApiError(StatusCode::CONFLICT, format!("the reply to comment {id} is already posted ({url}) and cannot be revised")));
+    }
+    let agent = r.agent_body.clone().unwrap_or_else(|| r.body.clone());
+    if agent != r.body {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!("the owner changed the reply to comment {id}; nothing was changed. The owner's text is:\n{}\n\nThe agent's version of it is:\n{agent}\n\nRevise another reply or ask the owner.", r.body),
+        ));
+    }
+    if d.versions.is_empty() {
+        d.versions = vec![store::DraftVersion { n: 1, by: "agent".into(), at_ms: d.created_ms, text: store::render_replies(&d.gh_replies) }];
+    }
+    d.gh_replies[i].body = text.to_string();
+    d.gh_replies[i].agent_body = Some(text.to_string());
+    let rendered = store::render_replies(&d.gh_replies);
+    d.push_version("agent", rendered, now_ms());
+    Ok(false)
+}
+
 /// A draft in any state, with the agent's last version and the diff of it
 /// against the body: after Send, what the owner changed before sending.
 async fn get_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> ApiResult {
@@ -2178,12 +2235,12 @@ async fn get_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Query(q): Query<
     let agent = d.agent_body.clone().unwrap_or_else(|| d.body.clone());
     let diff = draftedit::owner_diff(&agent, &d.body);
     let mut v = serde_json::to_value(&d).map_err(|e| bad(e.to_string()))?;
-    v["versions"] = if d.kind == "github_replies" { json!([]) } else { json!(d.history()) };
+    let versions = if d.kind == "github_replies" { d.versions.clone() } else { d.history() };
+    v["versions"] = json!(versions);
     v["agent_body"] = json!(agent);
     v["owner_diff"] = json!(diff);
     v["owner_edited"] = json!(!diff.is_empty());
     if q.contains_key("from") || q.contains_key("to") {
-        let versions = d.history();
         let num = |k: &str| q.get(k).map(|x| x.parse::<u32>().map_err(|_| bad(format!("{k} must be a version number")))).transpose();
         let to = num("to")?.unwrap_or_else(|| versions.last().map_or(1, |v| v.n));
         let from = num("from")?.unwrap_or_else(|| versions.iter().rev().find(|v| v.n < to).map_or(to, |v| v.n));
@@ -5733,7 +5790,7 @@ mod tests {
     }
 
     fn rev(section: Option<&str>, text: &str) -> Json<Revision> {
-        Json(Revision { section: section.map(Into::into), text: text.into() })
+        Json(Revision { comment_id: None, section: section.map(Into::into), text: text.into() })
     }
 
     #[tokio::test]
@@ -5838,6 +5895,54 @@ mod tests {
         assert_eq!((d["owner_diff"].as_str(), d["owner_edited"].as_bool()), (Some(""), Some(false)));
         let g = gh_draft(&app, json!([{"comment_id": 1, "body": "x"}])).await;
         assert!(revise_draft(Ax(app.clone()), Path(g.id), rev(None, "y")).await.is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn rev_reply(comment_id: Option<u64>, text: &str) -> Json<Revision> {
+        Json(Revision { comment_id, section: None, text: text.into() })
+    }
+
+    #[tokio::test]
+    async fn one_reply_is_revised_and_an_owner_edited_or_posted_one_is_refused() {
+        let (app, dir) = scratch_app();
+        let g = gh_draft(&app, json!([{"comment_id": 1, "body": "one"}, {"comment_id": 2, "body": "two"}, {"comment_id": 3, "body": "three"}])).await;
+        let id = g.id.clone();
+        let edit = |app: &Shared, id: &str, replies: Vec<store::GhReply>| {
+            let patch = DraftPatch { title: None, body: None, replies: None, gh_replies: Some(replies) };
+            let (app, id) = (app.clone(), id.to_string());
+            async move { let _ = patch_draft(Ax(app), Path(id), Json(patch)).await.ok().unwrap(); }
+        };
+        let get = |app: &Shared, id: &str| app.db.read(|st| st.drafts.get(id).cloned().unwrap());
+        // Owner edits reply 2 on the tab.
+        let mut rs = get(&app, &id).gh_replies;
+        rs[1].body = "two, tightened".into();
+        edit(&app, &id, rs).await;
+        // Revising reply 1 changes only reply 1.
+        assert!(revise_draft(Ax(app.clone()), Path(id.clone()), rev_reply(Some(1), "one, better")).await.is_ok());
+        let d = get(&app, &id);
+        let bodies: Vec<_> = d.gh_replies.iter().map(|r| r.body.as_str()).collect();
+        assert_eq!(bodies, ["one, better", "two, tightened", "three"]);
+        assert_eq!(d.gh_replies[0].agent_body.as_deref(), Some("one, better"));
+        assert_eq!(d.gh_replies[1].agent_body.as_deref(), Some("two"));
+        let by: Vec<_> = d.versions.iter().map(|v| (v.n, v.by.as_str())).collect();
+        assert_eq!(by, [(1, "agent"), (2, "owner"), (3, "agent")]);
+        // The edited reply is refused, naming it and both texts, and nothing changes.
+        let Err(ApiError(c, m)) = revise_draft(Ax(app.clone()), Path(id.clone()), rev_reply(Some(2), "x")).await else { panic!("applied") };
+        assert_eq!(c, StatusCode::CONFLICT);
+        assert!(m.contains("comment 2") && m.contains("two, tightened") && m.contains("two"), "{m}");
+        assert_eq!(get(&app, &id), d);
+        // A posted reply is refused.
+        let mut rs = d.gh_replies.clone();
+        rs[2].url = Some("https://x/3".into());
+        app.db.write(|st| { st.drafts.get_mut(&id).unwrap().gh_replies = rs; Ok::<_, ApiError>(()) }).ok().unwrap();
+        let Err(ApiError(c, m)) = revise_draft(Ax(app.clone()), Path(id.clone()), rev_reply(Some(3), "x")).await else { panic!("applied") };
+        assert_eq!(c, StatusCode::CONFLICT);
+        assert!(m.contains("posted"), "{m}");
+        // No comment_id, an unknown one: 400.
+        for r in [rev_reply(None, "x"), rev_reply(Some(9), "x")] {
+            let Err(ApiError(c, _)) = revise_draft(Ax(app.clone()), Path(id.clone()), r).await else { panic!("applied") };
+            assert_eq!(c, StatusCode::BAD_REQUEST);
+        }
         std::fs::remove_dir_all(dir).ok();
     }
 }

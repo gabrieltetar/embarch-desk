@@ -201,7 +201,10 @@ pub struct ReviseDraftParams {
     /// The heading (without its #) whose section is replaced, keeping the heading. Omit it to append `text` after the end of the draft.
     #[serde(default)]
     pub section: Option<String>,
-    /// The new text of that section, or the text to append, in Markdown.
+    /// For a github_replies draft: the review comment id of the one reply to replace (whole). Required there; not used otherwise.
+    #[serde(default)]
+    pub comment_id: Option<u64>,
+    /// The new text of that section or reply, or the text to append, in Markdown.
     pub text: String,
 }
 
@@ -592,9 +595,9 @@ impl DeskMcp {
         }
     }
 
-    #[tool(description = "Revise a draft you proposed that is still waiting on the user's Desk tab, without disturbing what the user edited there: give the heading of one section to replace (its heading stays) or none to append text at the end. It is applied to your own version and to the user's current text, so their other edits survive. If the user changed the section you ask to replace, nothing is changed and the reply says what collided: revise another section, append, or ask them. Only an open comment, issue or edit draft can be revised.")]
+    #[tool(description = "Revise a draft you proposed that is still waiting on the user's Desk tab, without disturbing what the user edited there: give the heading of one section to replace (its heading stays) or none to append text at the end. It is applied to your own version and to the user's current text, so their other edits survive. If the user changed the section you ask to replace, nothing is changed and the reply says what collided: revise another section, append, or ask them. For a github_replies draft give `comment_id` (the reply's review comment) instead of a section: that one reply is replaced and the others are untouched; a reply the user edited or that is already posted is refused. Only a draft still waiting can be revised.")]
     async fn desk_revise_draft(&self, Parameters(p): Parameters<ReviseDraftParams>) -> Result<CallToolResult, McpError> {
-        match self.client.post(&format!("/drafts/{}/revise", p.draft_id), json!({ "section": p.section, "text": p.text })).await {
+        match self.client.post(&format!("/drafts/{}/revise", p.draft_id), json!({ "section": p.section, "comment_id": p.comment_id, "text": p.text })).await {
             Ok(v) => ok(v),
             Err(e) => err(e),
         }

@@ -794,6 +794,17 @@ pub struct GhReply {
     pub body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// The agent's own version of `body`: set when the draft is made, moved
+    /// only by an agent's revision of this reply, never by the owner's edit
+    /// on the tab (EMB-212). Absent on a reply stored before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_body: Option<String>,
+}
+
+/// A `github_replies` draft's replies as one text: the form its version
+/// history keeps, one block per reply headed by its comment id.
+pub fn render_replies(replies: &[GhReply]) -> String {
+    replies.iter().map(|r| format!("comment {}:\n{}", r.comment_id, r.body)).collect::<Vec<_>>().join("\n\n")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
