@@ -16,7 +16,7 @@ use crate::connectors::Connectors;
 use crate::db::Db;
 use crate::events::{self, HookEvent};
 use crate::store::{self, Days, HarvestTarget, LocalDays, MailboxEntry, PendingLaunch, RealGit, State, TakeError, TileStatus};
-use crate::{brief, github, harvest, linear, linear_mcp, localrepo, mcpreg, refs, uri};
+use crate::{brief, draftedit, github, harvest, linear, linear_mcp, localrepo, mcpreg, refs, uri};
 use axum::extract::{Path, Query, State as Ax};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -167,7 +167,8 @@ pub fn router(app: Shared) -> Router {
         .route("/linear/issues", post(linear_issues))
         .route("/linear/status", post(linear_status))
         .route("/drafts", post(create_draft))
-        .route("/drafts/{id}", axum::routing::patch(patch_draft))
+        .route("/drafts/{id}", axum::routing::patch(patch_draft).get(get_draft))
+        .route("/drafts/{id}/revise", post(revise_draft))
         .route("/drafts/{id}/send", post(send_draft))
         .route("/drafts/{id}/discard", post(discard_draft))
         .route("/harvest/entries", post(harvest_entries))
@@ -2018,6 +2019,7 @@ async fn create_draft(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<New
                 repo,
                 pr,
                 gh_replies,
+                agent_body: Some(b.body.trim().to_string()),
             },
         );
         id
@@ -2126,6 +2128,57 @@ async fn patch_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+struct Revision {
+    /// The heading whose section is replaced; omit it to append.
+    #[serde(default)]
+    section: Option<String>,
+    /// The new text of the section, or the text to append.
+    text: String,
+}
+
+/// A session's revision of its own pending draft (EMB-165): applied to the
+/// agent version and, where the owner left the spot alone, to the owner's
+/// body. A revision the owner's edit stands in the way of is a 409 naming
+/// what collided, and changes nothing.
+async fn revise_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<Revision>) -> ApiResult {
+    if b.text.trim().is_empty() {
+        return Err(bad("an empty revision"));
+    }
+    let change = match b.section.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => draftedit::Change::Section { name, text: &b.text },
+        None => draftedit::Change::Append(&b.text),
+    };
+    let out = app.db.write(|st| {
+        let d = st.drafts.get_mut(&id).filter(|d| d.status == "open").ok_or_else(|| missing("no open draft with that id"))?;
+        if d.kind == "github_replies" {
+            return Err(bad("a github_replies draft has one body per thread, not sections; discard it and draft again"));
+        }
+        let agent = d.agent_body.clone().unwrap_or_else(|| d.body.clone());
+        let (a, o) = draftedit::revise(&agent, &d.body, &change).map_err(|r| match r {
+            draftedit::Refusal::Section(m) => bad(m),
+            c => ApiError(StatusCode::CONFLICT, c.message()),
+        })?;
+        d.agent_body = Some(a);
+        d.body = o;
+        Ok::<_, ApiError>(d.body != d.agent_body.clone().unwrap_or_default())
+    })?;
+    Ok(Json(json!({ "ok": true, "owner_edits_kept": out })))
+}
+
+/// A draft in any state, with the agent's last version and the diff of it
+/// against the body: after Send, what the owner changed before sending.
+async fn get_draft(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
+    let d = app.db.read(|st| st.drafts.get(&id).cloned()).ok_or_else(|| missing("no draft with that id"))?;
+    let agent = d.agent_body.clone().unwrap_or_else(|| d.body.clone());
+    let diff = draftedit::owner_diff(&agent, &d.body);
+    let mut v = serde_json::to_value(&d).map_err(|e| bad(e.to_string()))?;
+    v["agent_body"] = json!(agent);
+    v["owner_diff"] = json!(diff);
+    v["owner_edited"] = json!(!diff.is_empty());
+    Ok(Json(v))
+}
+
 /// The user's Send. The text sent is the draft as it stands now — edited on
 /// the tab, or as the agent left it if the user left it alone.
 async fn send_draft(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
@@ -2222,6 +2275,7 @@ async fn send_thread(app: &Shared, accounts: &[crate::connectors::Account], d: &
                 if let Some(x) = st.drafts.get_mut(&d.id) {
                     x.reply_to = Some(parent.clone());
                     x.body = reply.clone();
+                    x.agent_body = Some(reply.clone());
                     x.replies = d.replies[n + 1..].to_vec();
                 }
             });
@@ -3762,7 +3816,7 @@ mod tests {
             st.drafts.insert(id.into(), store::Draft {
                 id: id.into(), kind: "linear_comment".into(), issue_key: Some("ABC-1".into()), team_key: None,
                 title: None, body: "x".into(), item_id: None, created_ms: D0, status: status.into(), url: None,
-                project_id: None, reply_to: None, replies: vec![], base: None, repo: None, pr: None, gh_replies: vec![],
+                project_id: None, reply_to: None, replies: vec![], base: None, repo: None, pr: None, gh_replies: vec![], agent_body: None,
             });
         }
         st.start_timer(&a, D0 + H, &UtcDays);
@@ -5650,6 +5704,69 @@ mod tests {
             assert!(make(b).await.is_err());
         }
         assert_eq!(app.db.read(|st| st.drafts.len()), 0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    async fn comment_draft(app: &Shared, body: &str) -> String {
+        let b = json!({"kind": "linear_comment", "issue_key": "ABC-1", "body": body});
+        let Ok(Json(v)) = create_draft(Ax(app.clone()), HeaderMap::new(), Json(serde_json::from_value(b).unwrap())).await else { panic!("draft refused") };
+        v["draft_id"].as_str().unwrap().to_string()
+    }
+
+    async fn owner_edits(app: &Shared, id: &str, body: &str) {
+        let patch = DraftPatch { title: None, body: Some(body.into()), replies: None, gh_replies: None };
+        let _ = patch_draft(Ax(app.clone()), Path(id.into()), Json(patch)).await.ok().unwrap();
+    }
+
+    fn rev(section: Option<&str>, text: &str) -> Json<Revision> {
+        Json(Revision { section: section.map(Into::into), text: text.into() })
+    }
+
+    #[tokio::test]
+    async fn a_revision_keeps_the_owners_edits_and_the_diff_after_send_is_theirs_alone() {
+        let (app, dir) = scratch_app();
+        let id = comment_draft(&app, "## Summary\nfirst\n\n## Plan\nstep one").await;
+        owner_edits(&app, &id, "## Summary\nfirst, tightened\n\n## Plan\nstep one").await;
+        let Ok(Json(v)) = revise_draft(Ax(app.clone()), Path(id.clone()), rev(Some("Plan"), "step one\nstep two")).await else { panic!("refused") };
+        assert_eq!(v["owner_edits_kept"], true);
+        let Ok(Json(v)) = revise_draft(Ax(app.clone()), Path(id.clone()), rev(None, "## Risks\nnone")).await else { panic!("refused") };
+        assert_eq!(v["ok"], true);
+        // Send marks it sent without a network call here; the record is the same.
+        app.db.write(|st| st.drafts.get_mut(&id).unwrap().status = "sent".into());
+        let Ok(Json(d)) = get_draft(Ax(app.clone()), Path(id.clone())).await else { panic!() };
+        assert!(d["body"].as_str().unwrap().contains("first, tightened") && d["body"].as_str().unwrap().contains("step two"));
+        assert!(d["agent_body"].as_str().unwrap().contains("step two") && d["agent_body"].as_str().unwrap().contains("\nfirst\n"));
+        assert_eq!(d["owner_diff"], "- first\n+ first, tightened");
+        assert_eq!(d["owner_edited"], true);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_revision_over_an_owner_edit_is_a_409_naming_it_and_changes_nothing() {
+        let (app, dir) = scratch_app();
+        let id = comment_draft(&app, "## Plan\nstep one").await;
+        owner_edits(&app, &id, "## Plan\nmy step").await;
+        let Err(ApiError(c, m)) = revise_draft(Ax(app.clone()), Path(id.clone()), rev(Some("Plan"), "x")).await else { panic!("applied") };
+        assert_eq!(c, StatusCode::CONFLICT);
+        assert!(m.contains("Plan") && m.contains("my step") && m.contains("step one"), "{m}");
+        let d = app.db.read(|st| st.drafts[&id].clone());
+        assert_eq!((d.body.as_str(), d.agent_body.as_deref()), ("## Plan\nmy step", Some("## Plan\nstep one")));
+        let Err(ApiError(c, _)) = revise_draft(Ax(app.clone()), Path(id.clone()), rev(Some("Nope"), "x")).await else { panic!() };
+        assert_eq!(c, StatusCode::BAD_REQUEST);
+        app.db.write(|st| st.drafts.get_mut(&id).unwrap().status = "discarded".into());
+        let Err(ApiError(c, _)) = revise_draft(Ax(app.clone()), Path(id), rev(None, "x")).await else { panic!() };
+        assert_eq!(c, StatusCode::NOT_FOUND, "only an open draft is revised");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unedited_draft_reports_no_owner_diff_and_a_replies_draft_is_not_revised() {
+        let (app, dir) = scratch_app();
+        let id = comment_draft(&app, "just text").await;
+        let Ok(Json(d)) = get_draft(Ax(app.clone()), Path(id)).await else { panic!() };
+        assert_eq!((d["owner_diff"].as_str(), d["owner_edited"].as_bool()), (Some(""), Some(false)));
+        let g = gh_draft(&app, json!([{"comment_id": 1, "body": "x"}])).await;
+        assert!(revise_draft(Ax(app.clone()), Path(g.id), rev(None, "y")).await.is_err());
         std::fs::remove_dir_all(dir).ok();
     }
 }

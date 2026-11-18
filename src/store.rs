@@ -730,6 +730,12 @@ pub struct Draft {
     /// one Send; each keeps its URL once posted so a retry skips it.
     #[serde(default)]
     pub gh_replies: Vec<GhReply>,
+    /// The agent's own version of `body`: set when the draft is made and
+    /// moved only by an agent's revision, never by the owner's edit on the
+    /// tab. After Send its diff against `body` is the owner's edits alone
+    /// (EMB-165). Absent on a draft made before this field existed.
+    #[serde(default)]
+    pub agent_body: Option<String>,
 }
 
 /// One reply to an existing GitHub review comment, and where it landed.

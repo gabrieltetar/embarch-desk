@@ -8,6 +8,7 @@ mod client;
 mod closeout;
 mod connectors;
 mod db;
+mod draftedit;
 mod events;
 mod files;
 mod github;

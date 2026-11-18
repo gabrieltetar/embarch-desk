@@ -195,6 +195,23 @@ pub struct ReviewRepliesParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ReviseDraftParams {
+    /// The draft's id, as the draft tool answered it (`draft_id`).
+    pub draft_id: String,
+    /// The heading (without its #) whose section is replaced, keeping the heading. Omit it to append `text` after the end of the draft.
+    #[serde(default)]
+    pub section: Option<String>,
+    /// The new text of that section, or the text to append, in Markdown.
+    pub text: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DraftIdParams {
+    /// The draft's id, as the draft tool answered it (`draft_id`).
+    pub draft_id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct CommentDraftParams {
     /// The issue the comment goes on.
     pub issue_key: String,
@@ -569,6 +586,22 @@ impl DeskMcp {
         }
     }
 
+    #[tool(description = "Revise a draft you proposed that is still waiting on the user's Desk tab, without disturbing what the user edited there: give the heading of one section to replace (its heading stays) or none to append text at the end. It is applied to your own version and to the user's current text, so their other edits survive. If the user changed the section you ask to replace, nothing is changed and the reply says what collided: revise another section, append, or ask them. Only an open comment, issue or edit draft can be revised.")]
+    async fn desk_revise_draft(&self, Parameters(p): Parameters<ReviseDraftParams>) -> Result<CallToolResult, McpError> {
+        match self.client.post(&format!("/drafts/{}/revise", p.draft_id), json!({ "section": p.section, "text": p.text })).await {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "A draft in any state (waiting, sent or discarded): its text as the user has it, `agent_body` (your last version, which only your revisions move), and `owner_diff`, the lines the user removed (-) and added (+) against your version, so after a Send it is what they changed before sending, to learn from.")]
+    async fn desk_get_draft(&self, Parameters(p): Parameters<DraftIdParams>) -> Result<CallToolResult, McpError> {
+        match self.client.get(&format!("/drafts/{}", p.draft_id)).await {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
     #[tool(description = "Propose a change to a Linear issue's title, description or both; a description given replaces the whole current one, so read the issue first and send it complete. On a work desk nothing changes until the user's Send on the Desk tab (a desk set to write directly applies it at once and the reply says so). The Send is refused if someone changed the description after the draft was made.")]
     async fn linear_draft_edit(&self, Parameters(p): Parameters<EditDraftParams>) -> Result<CallToolResult, McpError> {
         let body = json!({ "kind": "linear_edit", "issue_key": p.issue_key, "title": p.title,
@@ -674,7 +707,7 @@ impl ServerHandler for DeskMcp {
              item. Read Linear with linear_get_issue, linear_my_issues, linear_search and linear_list_issues, an issue's images and files with linear_get_file, and list the \
              connected workspaces' team keys with linear_teams; read a pull request's review threads with github_pr_threads and propose replies to them with github_draft_review_replies; restack a stacked branch onto its moved base with desk_restack and its resolve, continue and abort steps; \
              move a status with linear_set_status; propose a comment, an issue or a change to one with linear_draft_comment, \
-             linear_draft_issue or linear_draft_edit — they wait for the user's Send on the Desk tab. Read Harvest with \
+             linear_draft_issue or linear_draft_edit — they wait for the user's Send on the Desk tab; change one still waiting with desk_revise_draft, which keeps the user's edits, and read what the user changed with desk_get_draft. Read Harvest with \
              harvest_entries and harvest_projects; time is never logged from a session: add notes with \
              desk_add_line and the user sends the tile. A rule the user sets for every session in this desk's \
              repos (always, never, from now on, in this repo) is a desk note, added with desk_add_desk_note, \
