@@ -206,9 +206,15 @@ pub struct ReviseDraftParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct DraftIdParams {
+pub struct GetDraftParams {
     /// The draft's id, as the draft tool answered it (`draft_id`).
     pub draft_id: String,
+    /// A version number from `versions` to diff from. With only `to` given, the version before it.
+    #[serde(default)]
+    pub from_version: Option<u32>,
+    /// A version number to diff to. With only `from_version` given, the latest.
+    #[serde(default)]
+    pub to_version: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -594,9 +600,17 @@ impl DeskMcp {
         }
     }
 
-    #[tool(description = "A draft in any state (waiting, sent or discarded): its text as the user has it, `agent_body` (your last version, which only your revisions move), and `owner_diff`, the lines the user removed (-) and added (+) against your version, so after a Send it is what they changed before sending, to learn from.")]
-    async fn desk_get_draft(&self, Parameters(p): Parameters<DraftIdParams>) -> Result<CallToolResult, McpError> {
-        match self.client.get(&format!("/drafts/{}", p.draft_id)).await {
+    #[tool(description = "A draft in any state (waiting, sent or discarded): its text as the user has it, `agent_body` (your last version, which only your revisions move), and `owner_diff`, the lines the user removed (-) and added (+) against your version, so after a Send it is what they changed before sending, to learn from. `versions` lists every agent revision and owner edit (number, who, when, text). Name `from_version` and/or `to_version` to get `version_diff`, the diff between any two of them.")]
+    async fn desk_get_draft(&self, Parameters(p): Parameters<GetDraftParams>) -> Result<CallToolResult, McpError> {
+        let mut q = vec![];
+        if let Some(n) = p.from_version {
+            q.push(format!("from={n}"));
+        }
+        if let Some(n) = p.to_version {
+            q.push(format!("to={n}"));
+        }
+        let query = if q.is_empty() { String::new() } else { format!("?{}", q.join("&")) };
+        match self.client.get(&format!("/drafts/{}{query}", p.draft_id)).await {
             Ok(v) => ok(v),
             Err(e) => err(e),
         }

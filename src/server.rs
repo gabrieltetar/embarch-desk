@@ -2020,6 +2020,7 @@ async fn create_draft(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<New
                 pr,
                 gh_replies,
                 agent_body: Some(b.body.trim().to_string()),
+                versions: if b.kind == "github_replies" { vec![] } else { vec![store::DraftVersion { n: 1, by: "agent".into(), at_ms: now, text: b.body.trim().to_string() }] },
             },
         );
         id
@@ -2113,6 +2114,9 @@ async fn patch_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<
             d.title = Some(t);
         }
         if let Some(body) = b.body {
+            if body != d.body && d.kind != "github_replies" {
+                d.push_version("owner", body.clone(), now_ms());
+            }
             d.body = body;
         }
         if let Some(replies) = b.replies {
@@ -2159,6 +2163,7 @@ async fn revise_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json
             draftedit::Refusal::Section(m) => bad(m),
             c => ApiError(StatusCode::CONFLICT, c.message()),
         })?;
+        d.push_version("agent", a.clone(), now_ms());
         d.agent_body = Some(a);
         d.body = o;
         Ok::<_, ApiError>(d.body != d.agent_body.clone().unwrap_or_default())
@@ -2168,14 +2173,23 @@ async fn revise_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json
 
 /// A draft in any state, with the agent's last version and the diff of it
 /// against the body: after Send, what the owner changed before sending.
-async fn get_draft(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
+async fn get_draft(Ax(app): Ax<Shared>, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> ApiResult {
     let d = app.db.read(|st| st.drafts.get(&id).cloned()).ok_or_else(|| missing("no draft with that id"))?;
     let agent = d.agent_body.clone().unwrap_or_else(|| d.body.clone());
     let diff = draftedit::owner_diff(&agent, &d.body);
     let mut v = serde_json::to_value(&d).map_err(|e| bad(e.to_string()))?;
+    v["versions"] = if d.kind == "github_replies" { json!([]) } else { json!(d.history()) };
     v["agent_body"] = json!(agent);
     v["owner_diff"] = json!(diff);
     v["owner_edited"] = json!(!diff.is_empty());
+    if q.contains_key("from") || q.contains_key("to") {
+        let versions = d.history();
+        let num = |k: &str| q.get(k).map(|x| x.parse::<u32>().map_err(|_| bad(format!("{k} must be a version number")))).transpose();
+        let to = num("to")?.unwrap_or_else(|| versions.last().map_or(1, |v| v.n));
+        let from = num("from")?.unwrap_or_else(|| versions.iter().rev().find(|v| v.n < to).map_or(to, |v| v.n));
+        let text = |n: u32| versions.iter().find(|v| v.n == n).map(|v| v.text.clone()).ok_or_else(|| missing(format!("the draft has no version {n}; it has {}", versions.iter().map(|v| v.n.to_string()).collect::<Vec<_>>().join(", "))));
+        v["version_diff"] = json!({ "from": from, "to": to, "diff": draftedit::owner_diff(&text(from)?, &text(to)?) });
+    }
     Ok(Json(v))
 }
 
@@ -3816,7 +3830,7 @@ mod tests {
             st.drafts.insert(id.into(), store::Draft {
                 id: id.into(), kind: "linear_comment".into(), issue_key: Some("ABC-1".into()), team_key: None,
                 title: None, body: "x".into(), item_id: None, created_ms: D0, status: status.into(), url: None,
-                project_id: None, reply_to: None, replies: vec![], base: None, repo: None, pr: None, gh_replies: vec![], agent_body: None,
+                project_id: None, reply_to: None, replies: vec![], base: None, repo: None, pr: None, gh_replies: vec![], agent_body: None, versions: vec![],
             });
         }
         st.start_timer(&a, D0 + H, &UtcDays);
@@ -5733,7 +5747,7 @@ mod tests {
         assert_eq!(v["ok"], true);
         // Send marks it sent without a network call here; the record is the same.
         app.db.write(|st| st.drafts.get_mut(&id).unwrap().status = "sent".into());
-        let Ok(Json(d)) = get_draft(Ax(app.clone()), Path(id.clone())).await else { panic!() };
+        let Ok(Json(d)) = get_draft(Ax(app.clone()), Path(id.clone()), no_query()).await else { panic!() };
         assert!(d["body"].as_str().unwrap().contains("first, tightened") && d["body"].as_str().unwrap().contains("step two"));
         assert!(d["agent_body"].as_str().unwrap().contains("step two") && d["agent_body"].as_str().unwrap().contains("\nfirst\n"));
         assert_eq!(d["owner_diff"], "- first\n+ first, tightened");
@@ -5759,11 +5773,68 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    fn no_query() -> Query<HashMap<String, String>> {
+        Query(HashMap::new())
+    }
+
+    #[tokio::test]
+    async fn every_revision_and_owner_edit_is_a_version_and_a_no_op_patch_adds_none() {
+        let (app, dir) = scratch_app();
+        let id = comment_draft(&app, "## Plan\none").await;
+        owner_edits(&app, &id, "## Plan\none").await;
+        owner_edits(&app, &id, "## Plan\nmine").await;
+        let _ = revise_draft(Ax(app.clone()), Path(id.clone()), rev(None, "tail")).await.ok().unwrap();
+        owner_edits(&app, &id, "## Plan\nmine again").await;
+        let Ok(Json(d)) = get_draft(Ax(app.clone()), Path(id.clone()), no_query()).await else { panic!() };
+        let by: Vec<_> = d["versions"].as_array().unwrap().iter().map(|v| (v["n"].as_u64().unwrap(), v["by"].as_str().unwrap().to_string())).collect();
+        assert_eq!(by, [(1, "agent".to_string()), (2, "owner".into()), (3, "agent".into()), (4, "owner".into())]);
+        assert_eq!(d["agent_body"], "## Plan\none\n\ntail");
+        assert_eq!(d["owner_diff"], "- one\n- \n- tail\n+ mine again");
+        let q = Query(HashMap::from([("from".to_string(), "1".to_string()), ("to".to_string(), "3".to_string())]));
+        let Ok(Json(d)) = get_draft(Ax(app.clone()), Path(id.clone()), q).await else { panic!() };
+        assert_eq!(d["version_diff"]["diff"], "+ \n+ tail");
+        let q = Query(HashMap::from([("to".to_string(), "4".to_string())]));
+        let Ok(Json(d)) = get_draft(Ax(app.clone()), Path(id.clone()), q).await else { panic!() };
+        assert_eq!((d["version_diff"]["from"].as_u64(), d["version_diff"]["to"].as_u64()), (Some(3), Some(4)));
+        let q = Query(HashMap::from([("to".to_string(), "9".to_string())]));
+        assert!(get_draft(Ax(app.clone()), Path(id), q).await.is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_draft_stored_before_versions_reads_with_a_synthesized_history_and_grows_from_it() {
+        let (app, dir) = scratch_app();
+        let id = comment_draft(&app, "agent text").await;
+        app.db.write(|st| {
+            let d = st.drafts.get_mut(&id).unwrap();
+            d.versions.clear();
+            d.body = "owner text".into();
+        });
+        let Ok(Json(d)) = get_draft(Ax(app.clone()), Path(id.clone()), no_query()).await else { panic!() };
+        let v = d["versions"].as_array().unwrap();
+        assert_eq!((v.len(), v[0]["text"].as_str(), v[1]["by"].as_str(), v[1]["text"].as_str()), (2, Some("agent text"), Some("owner"), Some("owner text")));
+        assert_eq!(d["owner_diff"], "- agent text\n+ owner text");
+        owner_edits(&app, &id, "owner text 2").await;
+        let n = app.db.read(|st| st.drafts[&id].versions.iter().map(|v| v.n).collect::<Vec<_>>());
+        assert_eq!(n, [1, 2, 3]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_history_is_bounded_keeping_version_one_and_the_newest() {
+        let mut d = store::Draft { id: "d".into(), kind: "linear_comment".into(), issue_key: None, team_key: None, title: None, body: "b".into(), item_id: None, created_ms: 0, status: "open".into(), url: None, project_id: None, reply_to: None, replies: vec![], base: None, repo: None, pr: None, gh_replies: vec![], agent_body: None, versions: vec![] };
+        for i in 0..80 {
+            d.push_version("agent", format!("t{i}"), i);
+        }
+        assert_eq!(d.versions.len(), store::MAX_VERSIONS);
+        assert_eq!((d.versions[0].n, d.versions.last().unwrap().n), (1, 81));
+    }
+
     #[tokio::test]
     async fn an_unedited_draft_reports_no_owner_diff_and_a_replies_draft_is_not_revised() {
         let (app, dir) = scratch_app();
         let id = comment_draft(&app, "just text").await;
-        let Ok(Json(d)) = get_draft(Ax(app.clone()), Path(id)).await else { panic!() };
+        let Ok(Json(d)) = get_draft(Ax(app.clone()), Path(id), no_query()).await else { panic!() };
         assert_eq!((d["owner_diff"].as_str(), d["owner_edited"].as_bool()), (Some(""), Some(false)));
         let g = gh_draft(&app, json!([{"comment_id": 1, "body": "x"}])).await;
         assert!(revise_draft(Ax(app.clone()), Path(g.id), rev(None, "y")).await.is_err());

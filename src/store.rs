@@ -736,6 +736,55 @@ pub struct Draft {
     /// (EMB-165). Absent on a draft made before this field existed.
     #[serde(default)]
     pub agent_body: Option<String>,
+    /// Every agent revision and owner edit of `body`, oldest first, version 1
+    /// being the draft as made (EMB-211). Empty on a draft stored before this
+    /// field existed: read it through `history`.
+    #[serde(default)]
+    pub versions: Vec<DraftVersion>,
+}
+
+/// One version of a draft's text, and who left it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DraftVersion {
+    /// 1 for the draft as made; numbers are never reused.
+    pub n: u32,
+    /// `agent` (made or revised by a session) or `owner` (edited on the tab).
+    pub by: String,
+    pub at_ms: i64,
+    pub text: String,
+}
+
+/// Versions kept per draft: the first and the newest `MAX_VERSIONS - 1`.
+pub const MAX_VERSIONS: usize = 50;
+
+impl Draft {
+    /// The version history; a draft stored before versions existed gets one
+    /// synthesized from what it holds: the agent's version, then the owner's
+    /// body if it differs (dated at creation, the edit time not being known).
+    pub fn history(&self) -> Vec<DraftVersion> {
+        if !self.versions.is_empty() {
+            return self.versions.clone();
+        }
+        let agent = self.agent_body.clone().unwrap_or_else(|| self.body.clone());
+        let mut v = vec![DraftVersion { n: 1, by: "agent".into(), at_ms: self.created_ms, text: agent.clone() }];
+        if self.body != agent {
+            v.push(DraftVersion { n: 2, by: "owner".into(), at_ms: self.created_ms, text: self.body.clone() });
+        }
+        v
+    }
+
+    /// Adds a version after the history so far (synthesizing it first for an
+    /// old draft). Past `MAX_VERSIONS` the oldest after version 1 is dropped.
+    pub fn push_version(&mut self, by: &str, text: String, at_ms: i64) {
+        if self.versions.is_empty() {
+            self.versions = self.history();
+        }
+        let n = self.versions.last().map_or(1, |v| v.n + 1);
+        self.versions.push(DraftVersion { n, by: by.into(), at_ms, text });
+        if self.versions.len() > MAX_VERSIONS {
+            self.versions.remove(1);
+        }
+    }
 }
 
 /// One reply to an existing GitHub review comment, and where it landed.
