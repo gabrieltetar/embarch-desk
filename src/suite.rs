@@ -10,6 +10,10 @@
 //!   <other repo>   symlink to its main clone, until the work needs to change it
 //! ```
 //!
+//! The folder also holds `<key>.code-workspace`, the window Start work opens:
+//! every entry above as one root each, the code repo's worktree first,
+//! because a chat runs in a window's first folder (decision 91).
+//!
 //! A desk is a suite desk when `EMBARCH_DESK_SUITE_ROOT` is set in its
 //! environment. With none, Start work is the single worktree it always was.
 
@@ -65,8 +69,9 @@ impl Suite {
         Ok(project_name.to_string())
     }
 
-    /// Make (or find) an issue's folder. The answer's path is the code
-    /// repo's worktree, which is what a window opens.
+    /// Make (or find) an issue's folder and write its window file. The
+    /// answer's path is the code repo's worktree, where the window's chat
+    /// runs; [`Suite::workspace_for`] finds the file the window opens.
     pub fn start(&self, issue_key: &str, code_repo: &str, branch: &str) -> Result<Prepared> {
         let mut prepared = self.add_repo(issue_key, code_repo, branch)?;
         prepared.how = format!("{code_repo}: {}", prepared.how);
@@ -75,7 +80,52 @@ impl Suite {
             prepared.how = format!("{}; {docs}: {}", prepared.how, d.how);
             prepared.warnings.extend(d.warnings);
         }
+        if let Err(e) = self.write_workspace(issue_key, code_repo) {
+            prepared.warnings.push(format!("no window file, so the window shows {code_repo} alone: {e:#}"));
+        }
         Ok(prepared)
+    }
+
+    /// Write the issue folder's window file, replacing any earlier one so a
+    /// clone linked since is listed: the code repo, then the docs repo, then
+    /// every other entry by name.
+    pub fn write_workspace(&self, issue_key: &str, code_repo: &str) -> Result<PathBuf> {
+        let dir = self.issue_dir(issue_key)?;
+        let mut rest: Vec<String> = std::fs::read_dir(&dir)
+            .with_context(|| format!("reading {}", dir.display()))?
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| is_plain_name(n))
+            .collect();
+        rest.sort();
+        let mut order = vec![code_repo];
+        order.extend(self.docs_repo.as_deref().filter(|d| *d != code_repo));
+        rest.retain(|n| !order.contains(&n.as_str()));
+        order.extend(rest.iter().map(String::as_str));
+        let folders: Vec<_> = order.iter().filter(|n| dir.join(n).is_dir()).map(|n| serde_json::json!({ "path": n })).collect();
+        // The main workspace's exclusions: a build folder per repo is too much
+        // to watch and to search.
+        let body = serde_json::json!({
+            "folders": folders,
+            "settings": {
+                "files.watcherExclude": { "**/target/**": true },
+                "search.exclude": { "**/target": true },
+            },
+        });
+        let file = workspace_in(&dir).context("the issue folder has no name")?;
+        std::fs::write(&file, serde_json::to_string_pretty(&body)? + "\n").with_context(|| format!("writing {}", file.display()))?;
+        Ok(file)
+    }
+
+    /// The window file of the issue folder holding `path`, once Start work
+    /// has written it, so a link to any folder in it brings up that window
+    /// rather than opening a second one on the folder alone.
+    pub fn workspace_for(&self, path: &Path) -> Option<PathBuf> {
+        let worktrees = self.root.join(WORKTREES);
+        let name = path.strip_prefix(&worktrees).ok()?.components().next()?;
+        let file = workspace_in(&worktrees.join(name))?;
+        file.is_file().then_some(file)
     }
 
     /// Give a repo a worktree in the issue's folder, replacing its symlink.
@@ -117,6 +167,13 @@ impl Suite {
         }
         Ok(())
     }
+}
+
+/// An issue folder's window file, named for the folder, so a path inside it
+/// finds the file without knowing the issue's key.
+fn workspace_in(dir: &Path) -> Option<PathBuf> {
+    let name = dir.file_name()?.to_str()?;
+    Some(dir.join(format!("{name}.code-workspace")))
 }
 
 #[cfg(unix)]
@@ -181,6 +238,33 @@ mod tests {
     }
 
     #[test]
+    fn start_writes_a_window_file_with_the_code_repo_first_and_every_entry_after() {
+        let (suite, base) = fixture();
+        let dir = suite.root.join(".dev-worktrees/abc-1");
+        assert_eq!(suite.workspace_for(&dir.join("lib")), None, "no folder, no file");
+        suite.start("ABC-1", "lib", "me/abc-1-x").unwrap();
+        let file = dir.join("abc-1.code-workspace");
+        let w: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        let paths: Vec<&str> = w["folders"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+        assert_eq!(paths, ["lib", "docs", "app"], "code repo, docs, then the links by name");
+        for at in [dir.join("lib"), dir.join("app/src"), dir.clone()] {
+            assert_eq!(suite.workspace_for(&at).as_deref(), Some(file.as_path()), "{}", at.display());
+        }
+        assert_eq!(suite.workspace_for(&suite.root.join("lib")), None, "a main clone opens as itself");
+        assert_eq!(suite.workspace_for(&suite.root.join(".dev-worktrees")), None);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_folder_made_by_hand_has_no_window_file() {
+        let (suite, base) = fixture();
+        let dir = suite.root.join(".dev-worktrees/by-hand");
+        std::fs::create_dir_all(dir.join("app")).unwrap();
+        assert_eq!(suite.workspace_for(&dir.join("app")), None);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn the_worktrees_are_in_auto_mode_and_reach_the_issue_folder() {
         let (suite, base) = fixture();
         suite.start("ABC-1", "app", "me/abc-1-x").unwrap();
@@ -214,6 +298,8 @@ mod tests {
         let again = suite.start("ABC-1", "app", "me/abc-1-x").unwrap();
         assert_eq!(again.how, "app: reused; docs: reused");
         assert!(suite.root.join(".dev-worktrees/abc-1/later").symlink_metadata().unwrap().file_type().is_symlink());
+        let w = std::fs::read_to_string(suite.root.join(".dev-worktrees/abc-1/abc-1.code-workspace")).unwrap();
+        assert!(w.contains("\"later\""), "the window file lists the clone linked since: {w}");
         std::fs::remove_dir_all(base).unwrap();
     }
 
