@@ -153,6 +153,19 @@ pub struct StateListParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct PrThreadsParams {
+    /// The repository, owner/name; leave out with `number` to use this session's work item's PR.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// The pull request's number.
+    #[serde(default)]
+    pub number: Option<u64>,
+    /// Only threads whose latest comment is not the PR author's.
+    #[serde(default)]
+    pub awaiting_only: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct StatusParams {
     /// A Linear issue key, e.g. ABC-123.
     pub key: String,
@@ -454,6 +467,14 @@ impl DeskMcp {
         }
     }
 
+    #[tool(description = "A GitHub pull request's review discussion: every inline review thread as its root comment and the replies under it (author, time, file path, line), the review bodies with their state (approved, changes_requested, commented) oldest first, and on each thread `awaiting_author`, true when the PR author has not replied after the latest reviewer comment. Complete past 100 comments. Give repo (owner/name) and number, or neither to read the open PR of this session's work item. awaiting_only keeps only the threads still waiting on the author.")]
+    async fn github_pr_threads(&self, Parameters(p): Parameters<PrThreadsParams>) -> Result<CallToolResult, McpError> {
+        match self.client.post("/github/pr-threads", json!({ "repo": p.repo, "number": p.number, "awaiting_only": p.awaiting_only })).await {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
     #[tool(description = "Move a Linear issue to another workflow state by name (\"In Progress\", \"In Review\"). A status move goes straight through; the error lists the team's states if the name is wrong.")]
     async fn linear_set_status(&self, Parameters(p): Parameters<StatusParams>) -> Result<CallToolResult, McpError> {
         match self.client.post("/linear/status", json!({ "key": p.key, "status": p.status })).await {
@@ -539,7 +560,7 @@ impl ServerHandler for DeskMcp {
             "embarch-desk: the one access point to Linear and Harvest, and the work item this session's \
              time and notes belong to. desk_work_item returns everything the desk holds about the session's \
              item. Read Linear with linear_get_issue, linear_my_issues, linear_search and linear_list_issues, an issue's images and files with linear_get_file, and list the \
-             connected workspaces' team keys with linear_teams; \
+             connected workspaces' team keys with linear_teams; read a pull request's review threads with github_pr_threads; \
              move a status with linear_set_status; propose a comment, an issue or a change to one with linear_draft_comment, \
              linear_draft_issue or linear_draft_edit — they wait for the user's Send on the Desk tab. Read Harvest with \
              harvest_entries and harvest_projects; time is never logged from a session: add notes with \

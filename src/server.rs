@@ -182,6 +182,7 @@ pub fn router(app: Shared) -> Router {
         .route("/linear/projects", get(linear_projects))
         .route("/linear/teams", get(linear_teams))
         .route("/github/repos", get(github_repos))
+        .route("/github/pr-threads", post(github_pr_threads))
         .route("/harvest/entry/{account}/{id}", axum::routing::patch(edit_entry).delete(remove_entry))
         .route("/pickup", get(pickup))
         .route("/items/{id}/start", post(start_work))
@@ -2467,6 +2468,44 @@ async fn linear_projects() -> ApiResult {
 
 async fn linear_teams() -> ApiResult {
     Ok(Json(json!({ "teams": linear::teams(&linear_accounts()?).await? })))
+}
+
+#[derive(Deserialize)]
+struct PrThreadsBody {
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    number: Option<u64>,
+    #[serde(default)]
+    awaiting_only: bool,
+}
+
+/// The PR a call without a repo and number means: the open PR of its
+/// session's work item, else the item's newest.
+fn session_pr(st: &State, sid: &str) -> Option<(String, u64)> {
+    let item = st.items.get(st.sessions.get(sid)?.item_id.as_ref()?)?;
+    let pr = item.prs.iter().find(|p| p.state == "open").or_else(|| item.prs.first())?;
+    Some((pr.repo.clone(), pr.number))
+}
+
+/// A PR's review threads and review bodies (EMB-176), by repo and number or
+/// the session's work item's PR.
+async fn github_pr_threads(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<PrThreadsBody>) -> ApiResult {
+    let (repo, number) = match (b.repo.as_deref().map(str::trim).filter(|r| !r.is_empty()), b.number) {
+        (Some(r), Some(n)) => (r.to_string(), n),
+        (None, None) => {
+            let sid = caller(&headers).0.ok_or_else(|| bad("give a repo and a PR number, or call from a session whose work item has a PR"))?;
+            app.db
+                .read(|st| session_pr(st, &sid))
+                .ok_or_else(|| bad("this session's work item has no pull request; give a repo and a PR number"))?
+        }
+        _ => return Err(bad("a repo and a PR number go together")),
+    };
+    let accounts = Connectors::load()?.github_accounts();
+    if accounts.is_empty() {
+        return Err(bad("no GitHub account is connected, and no gh login"));
+    }
+    Ok(Json(github::pr_threads(&accounts, &repo, number, b.awaiting_only).await.map_err(|e| bad(e.to_string()))?))
 }
 
 async fn github_repos() -> ApiResult {

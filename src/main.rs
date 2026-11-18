@@ -27,6 +27,7 @@ mod server;
 mod service;
 mod store;
 mod suite;
+mod threads;
 mod uri;
 mod worktree;
 

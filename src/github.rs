@@ -144,9 +144,79 @@ pub async fn prs_for(accounts: &[Account], key: &str, repos: &[String]) -> Resul
     Ok(out)
 }
 
+/// A PR's review discussion, complete past 100 comments: every page of its
+/// review comments and reviews, grouped by [`crate::threads::build`]. The
+/// first account that can read the repo answers.
+pub async fn pr_threads(accounts: &[Account], repo: &str, number: u64, awaiting_only: bool) -> Result<Value> {
+    let mut last_err = None;
+    for acct in accounts {
+        match pr_threads_with(acct, repo, number, awaiting_only).await {
+            Ok(v) => return Ok(v),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no GitHub account connected")))
+}
+
+async fn pr_threads_with(acct: &Account, repo: &str, number: u64, awaiting_only: bool) -> Result<Value> {
+    let pr = get(acct, &format!("{API}/repos/{repo}/pulls/{number}")).await?;
+    let author = pr["user"]["login"].as_str().unwrap_or_default().to_string();
+    let comments = all_pages(acct, &format!("{API}/repos/{repo}/pulls/{number}/comments")).await?;
+    let reviews = all_pages(acct, &format!("{API}/repos/{repo}/pulls/{number}/reviews")).await?;
+    Ok(crate::threads::build(repo, number, &author, &comments, &reviews, awaiting_only))
+}
+
+async fn all_pages(acct: &Account, url: &str) -> Result<Vec<Value>> {
+    page_through(|n| async move {
+        let v = get(acct, &format!("{url}?per_page={PAGE_SIZE}&page={n}")).await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    })
+    .await
+}
+
+const PAGE_SIZE: usize = 100;
+const PAGES_CAP: usize = 100_000;
+
+/// Every row of a paged list: `page` takes a 1-based page number and returns
+/// its rows; a page shorter than [`PAGE_SIZE`] is the last.
+async fn page_through<F, Fut>(page: F) -> Result<Vec<Value>>
+where
+    F: Fn(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<Value>>>,
+{
+    let page = &page;
+    crate::refs::take_pages(PAGES_CAP, |p: Option<u32>| async move {
+        let n = p.unwrap_or(1);
+        let rows = page(n).await?;
+        let next = (rows.len() == PAGE_SIZE).then_some(n + 1);
+        Ok((rows, next))
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn more_than_a_hundred_comments_come_back_complete() {
+        let total = 250u64;
+        let rows = page_through(|n| async move {
+            let from = (n as u64 - 1) * PAGE_SIZE as u64;
+            let to = (from + PAGE_SIZE as u64).min(total);
+            Ok((from..to).map(|i| serde_json::json!({ "id": i + 1 })).collect())
+        })
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 250);
+        assert_eq!(rows[249]["id"], 250);
+        let exact = page_through(|n| async move {
+            Ok(if n <= 2 { (0..PAGE_SIZE).map(|i| serde_json::json!({ "id": i })).collect() } else { vec![] })
+        })
+        .await
+        .unwrap();
+        assert_eq!(exact.len(), 200, "a full last page costs one empty request, not a row");
+    }
 
     #[test]
     fn a_desks_repos_scope_the_pr_search() {
