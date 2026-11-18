@@ -452,7 +452,18 @@ fn folder_missing(cwd: &str) -> bool {
 /// The link opening a session's folder: none when `cwd` is unset or gone,
 /// since a window opened on a missing folder cannot resume the chat.
 fn folder_link(cwd: &str, cache: &Cache) -> Option<String> {
-    (!cwd.is_empty() && !folder_missing(cwd)).then(|| uri::folder_uri(cwd, cache.wsl_distro.as_deref()))
+    (!cwd.is_empty() && !folder_missing(cwd)).then(|| window_uri(cwd, cache.wsl_distro.as_deref()))
+}
+
+/// The link opening the window for `path`: the window file of the suite
+/// issue folder holding it, once Start work wrote one, so the link brings
+/// that window up instead of opening the folder alone (decision 91); else
+/// the folder itself.
+fn window_uri(path: &str, wsl_distro: Option<&str>) -> String {
+    match crate::suite::Suite::from_env().and_then(|s| s.workspace_for(std::path::Path::new(path))) {
+        Some(file) => uri::folder_uri(&file.to_string_lossy(), wsl_distro),
+        None => uri::folder_uri(path, wsl_distro),
+    }
 }
 
 fn session_name(cache: &Cache, s: &store::Session) -> String {
@@ -882,7 +893,7 @@ async fn launch_item(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
         st.pending_launches.push(PendingLaunch { item_id: id.clone(), repo: repo.clone(), expires_ms: now + store::LAUNCH_CLAIM_MS });
     });
     Ok(Json(json!({
-        "folder_uri": uri::folder_uri(&repo, app.wsl_distro.as_deref()),
+        "folder_uri": window_uri(&repo, app.wsl_distro.as_deref()),
         "claude_uri": uri::claude_uri(&prompt),
         "repo": repo,
     })))
@@ -3150,7 +3161,7 @@ async fn start_work(Ax(app): Ax<Shared>, Path(id): Path<String>) -> ApiResult {
         "how": prepared.how,
         "moved_to": moved_to,
         "warnings": warnings,
-        "folder_uri": uri::folder_uri(&wt, app.wsl_distro.as_deref()),
+        "folder_uri": window_uri(&wt, app.wsl_distro.as_deref()),
     });
     match mailbox_id {
         Some(m) => out["mailbox_id"] = json!(m),
