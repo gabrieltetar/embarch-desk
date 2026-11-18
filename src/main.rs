@@ -23,6 +23,7 @@ mod memory;
 mod paths;
 mod promptu;
 mod refs;
+mod restack;
 mod server;
 mod service;
 mod store;

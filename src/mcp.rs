@@ -264,6 +264,51 @@ fn with_desk_notes(text: &str, sess: &Value) -> String {
     )
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RestackParams {
+    /// The stacked branch (the one whose PR sits on another PR).
+    pub branch: String,
+    /// The base branch's current tip, as a ref: a local branch, or `origin/<base>` after a fetch.
+    pub base: String,
+    /// Only when the base was rewritten rather than extended: the ref of its old tip, so only the stacked branch's own commits move (`git rebase --onto`).
+    #[serde(default)]
+    pub old_base: Option<String>,
+    /// The repo or worktree folder; the session's working folder when left out.
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RestackResolveParams {
+    /// The conflicted file, as the hunk list names it.
+    pub file: String,
+    /// The hunk's number in the file's current list (1-based); leave out to resolve every hunk of the file the same way.
+    #[serde(default)]
+    pub hunk: Option<usize>,
+    /// ours (the base's side), theirs (the stacked branch's own change) or neither (both sides dropped).
+    pub choice: String,
+    /// The repo or worktree folder; the session's working folder when left out.
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RestackContinueParams {
+    /// False (the default) shows the conflicted files' diff against the base and changes nothing; true stages them and continues the rebase.
+    #[serde(default)]
+    pub confirm: bool,
+    /// The repo or worktree folder; the session's working folder when left out.
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RestackRepoParams {
+    /// The repo or worktree folder; the session's working folder when left out.
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
 fn ok(v: Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(serde_json::to_string_pretty(&v).unwrap_or_default())]))
 }
@@ -298,7 +343,7 @@ fn err(e: anyhow::Error) -> Result<CallToolResult, McpError> {
 impl DeskMcp {
     pub fn new(client: DeskClient) -> Self {
         // Two routers, one per impl block, merged once here; the handler reads the field.
-        Self { tool_router: Self::tool_router() + Self::linear_router(), client: Arc::new(client) }
+        Self { tool_router: Self::tool_router() + Self::linear_router() + Self::restack_router(), client: Arc::new(client) }
     }
 
     #[tool(description = "What this session is working on: its work item (Linear issue, repo) and today's time tile with its lines. Use the desk session id from this session's context.")]
@@ -553,6 +598,42 @@ impl DeskMcp {
     }
 }
 
+#[tool_router(router = restack_router, vis = "pub")]
+impl DeskMcp {
+    #[tool(description = "Restack a branch whose PR sits on another open PR after that base gained commits: rebase `branch` onto `base`'s current tip in this repo or worktree. Answers rebased, or conflict with every conflicted hunk (file, hunk number, start and end line, both sides' text). Resolve each with desk_restack_resolve, never by editing markers. Local only: never pushes, so the push stays yours.")]
+    async fn desk_restack(&self, Parameters(p): Parameters<RestackParams>) -> Result<CallToolResult, McpError> {
+        match crate::restack::start(p.repo.as_deref(), &p.branch, &p.base, p.old_base.as_deref()) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "Resolve a conflicted hunk of a restack as ours (the base's side), theirs (the stacked branch's own change) or neither, without touching markers. Answers the hunks still conflicted; hunk numbers are the file's current ones, so resolving hunk 1 renumbers the rest. Leave `hunk` out to resolve the whole file one way.")]
+    async fn desk_restack_resolve(&self, Parameters(p): Parameters<RestackResolveParams>) -> Result<CallToolResult, McpError> {
+        let r = crate::restack::Choice::parse(&p.choice).and_then(|c| crate::restack::resolve(p.repo.as_deref(), &p.file, p.hunk, c));
+        match r {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "Continue a restack. Without confirm it shows the conflicted files' diff against the base and changes nothing; check it, then call again with confirm=true to stage and continue (the next commit may conflict again, answered like desk_restack). Refused while any conflict marker remains in a tracked file. Never pushes.")]
+    async fn desk_restack_continue(&self, Parameters(p): Parameters<RestackContinueParams>) -> Result<CallToolResult, McpError> {
+        match crate::restack::proceed(p.repo.as_deref(), p.confirm) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
+    #[tool(description = "Abort a restack in progress: the branch goes back to where it was before desk_restack.")]
+    async fn desk_restack_abort(&self, Parameters(p): Parameters<RestackRepoParams>) -> Result<CallToolResult, McpError> {
+        match crate::restack::abort(p.repo.as_deref()) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for DeskMcp {
     fn get_info(&self) -> ServerInfo {
@@ -560,7 +641,7 @@ impl ServerHandler for DeskMcp {
             "embarch-desk: the one access point to Linear and Harvest, and the work item this session's \
              time and notes belong to. desk_work_item returns everything the desk holds about the session's \
              item. Read Linear with linear_get_issue, linear_my_issues, linear_search and linear_list_issues, an issue's images and files with linear_get_file, and list the \
-             connected workspaces' team keys with linear_teams; read a pull request's review threads with github_pr_threads; \
+             connected workspaces' team keys with linear_teams; read a pull request's review threads with github_pr_threads; restack a stacked branch onto its moved base with desk_restack and its resolve, continue and abort steps; \
              move a status with linear_set_status; propose a comment, an issue or a change to one with linear_draft_comment, \
              linear_draft_issue or linear_draft_edit — they wait for the user's Send on the Desk tab. Read Harvest with \
              harvest_entries and harvest_projects; time is never logged from a session: add notes with \
