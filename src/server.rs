@@ -330,6 +330,34 @@ fn open_tile_keys(st: &State) -> Vec<(String, String)> {
         .collect()
 }
 
+/// How long a session's hooks alone keep it live, when `claude agents` has
+/// not answered since them.
+const HOOKS_LIVE_MS: i64 = 30 * 60_000;
+/// How long after a session's last hook `claude agents` must answer without
+/// it before the session is gone: the CLI can send its first hook before it
+/// lists itself.
+const AGENTS_MISS_MS: i64 = 60_000;
+
+/// A session no SessionEnd closed whose process is gone: `claude agents`
+/// answered well after its last hook and does not list it. A window closed
+/// mid-turn kills its sessions with no SessionEnd, and the hooks alone
+/// would keep one busy for [`HOOKS_LIVE_MS`].
+fn vanished(cache: &Cache, s: &store::Session) -> bool {
+    !s.ended && cache.agents_ms > 0 && cache.agents_ms - s.last_ms >= AGENTS_MISS_MS && !cache.agents.contains_key(&s.id)
+}
+
+/// Ended by its SessionEnd, or with its process gone (see [`vanished`]).
+pub fn session_ended(cache: &Cache, s: &store::Session) -> bool {
+    s.ended || vanished(cache, s)
+}
+
+/// Whether a session runs now: `claude agents` lists it, or it has not
+/// ended and a hook came within [`HOOKS_LIVE_MS`] that `claude agents` has
+/// not answered past.
+pub fn session_live(cache: &Cache, s: &store::Session, now: i64) -> bool {
+    cache.agents.contains_key(&s.id) || (!session_ended(cache, s) && now - s.last_ms < HOOKS_LIVE_MS)
+}
+
 /// A session's state — `busy`, `waiting`, `idle` or `ended` — and what it
 /// waits for: the hooks, which are instant, joined with `claude agents`,
 /// read every 30 seconds — whichever saw the session last.
@@ -348,7 +376,7 @@ pub fn session_state(cache: &Cache, s: &store::Session) -> (&'static str, Option
                 .flatten();
             (st, waiting)
         }
-        None if s.ended => ("ended", None),
+        None if session_ended(cache, s) => ("ended", None),
         None if s.waiting.is_some() => ("waiting", s.waiting.clone()),
         None if s.busy => ("busy", None),
         None => ("idle", None),
@@ -365,11 +393,11 @@ const ENDED_CHATS_KEPT: usize = 5;
 /// newest [`ENDED_CHATS_KEPT`] within the card window, so Open chat can
 /// resume one (chat-desk proposal 32).
 fn session_rows(cache: &Cache, sessions: &[&store::Session], now: i64, window_days: i64) -> Vec<Value> {
-    let live = |s: &store::Session| cache.agents.contains_key(&s.id) || (!s.ended && now - s.last_ms < 30 * 60_000);
+    let live = |s: &store::Session| session_live(cache, s, now);
     let mut ended: Vec<&store::Session> = sessions
         .iter()
         .copied()
-        .filter(|s| !live(s) && s.ended && s.client.as_deref() == Some("embarch-chat") && now - s.last_ms < window_days * 86_400_000)
+        .filter(|s| !live(s) && session_ended(cache, s) && s.client.as_deref() == Some("embarch-chat") && now - s.last_ms < window_days * 86_400_000)
         .collect();
     ended.sort_by_key(|s| std::cmp::Reverse(s.last_ms));
     ended.truncate(ENDED_CHATS_KEPT);
@@ -380,7 +408,7 @@ fn session_rows(cache: &Cache, sessions: &[&store::Session], now: i64, window_da
         .chain(ended)
         .map(|s| {
             let a = cache.agents.get(&s.id);
-            let status = a.and_then(|a| a["status"].as_str()).unwrap_or(if s.ended { "ended" } else { "unknown" });
+            let status = a.and_then(|a| a["status"].as_str()).unwrap_or(if session_ended(cache, s) { "ended" } else { "unknown" });
             let name = session_name(cache, s);
             let (state, waiting_for) = session_state(cache, s);
             (
@@ -436,7 +464,7 @@ fn view_sessions(st: &State, cache: &Cache, now: i64) -> Vec<Value> {
         .filter(|s| !State::is_timer_session(&s.id))
         .filter(|s| !s.ignored || !store::is_ignored(&s.cwd, &st.ignore))
         .filter(|s| !s.hidden)
-        .filter(|s| cache.agents.contains_key(&s.id) || now - s.last_ms < 30 * 60_000)
+        .filter(|s| cache.agents.contains_key(&s.id) || now - s.last_ms < HOOKS_LIVE_MS)
         .collect();
     rows.sort_by_key(|s| std::cmp::Reverse(s.last_ms));
     rows.into_iter()
@@ -505,7 +533,7 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, desk: Op
                 .values()
                 .filter(|s| !s.ignored && !State::is_timer_session(&s.id) && s.item_id.as_deref() == Some(&item.id))
                 .collect();
-            let live = sessions.iter().filter(|s| !s.ended && now - s.last_ms < 30 * 60_000).count();
+            let live = sessions.iter().filter(|s| session_live(cache, s, now)).count();
             let today_sessions = sessions.iter().filter(|s| days.date(s.last_ms) == today).count();
             let mut bench: std::collections::BTreeMap<String, (u32, u32)> = Default::default();
             for b in item.bench.iter().filter(|b| now - b.ms < window_days * 86_400_000) {
@@ -538,7 +566,7 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, desk: Op
     let waiting = st
         .sessions
         .values()
-        .filter(|s| !s.ignored && !s.ended && s.item_id.is_none() && !State::is_timer_session(&s.id) && now - s.last_ms < 30 * 60_000)
+        .filter(|s| !s.ignored && s.item_id.is_none() && !State::is_timer_session(&s.id) && session_live(cache, s, now))
         .count();
     json!({
         "now_ms": now,
@@ -559,7 +587,7 @@ pub fn view_json(st: &State, cache: &Cache, now: i64, window_days: i64, desk: Op
             v["desk_id"] = json!(k);
             v
         }),
-        "day": day_json(st, &today, now),
+        "day": day_json(st, cache, &today, now),
         "timer": st.timer.as_ref().map(|t| json!({
             "item_id": t.item_id,
             "title": st.items.get(&t.item_id).map(|i| i.issue.as_ref().map(|r| format!("{} {}", r.key, r.title)).unwrap_or(i.title.clone())),
@@ -2740,7 +2768,7 @@ async fn github_repos() -> ApiResult {
 /// One day's work, grouped by desk — the UI's first — for the list under
 /// the cards: every work item with time, a line, bench activity or a session
 /// that day, with its links, what was done, its status and sessions.
-pub fn day_json(st: &State, date: &str, now: i64) -> Value {
+pub fn day_json(st: &State, cache: &Cache, date: &str, now: i64) -> Value {
     let days = LocalDays;
     let mut rows: Vec<(Option<String>, Value)> = vec![];
     for item in st.items.values() {
@@ -2783,7 +2811,7 @@ pub fn day_json(st: &State, date: &str, now: i64) -> Value {
                 "lines": lines,
                 "note": tile.and_then(|t| t.note.clone()),
                 "sessions": sessions.len(),
-                "live": sessions.iter().filter(|s| !s.ended && now - s.last_ms < 30 * 60_000).count(),
+                "live": sessions.iter().filter(|s| session_live(cache, s, now)).count(),
                 "bench": bench.len(),
                 "bench_failed": bench.iter().filter(|b| !b.ok).count(),
             }),
@@ -2844,7 +2872,8 @@ async fn day(Ax(app): Ax<Shared>, Path(date): Path<String>) -> ApiResult {
             tracing::warn!("reading Harvest for {date}: {e:#}");
         }
     }
-    Ok(Json(app.db.read(|st| day_json(st, &date, now))))
+    let cache = app.cache.lock().expect("cache");
+    Ok(Json(app.db.read(|st| day_json(st, &cache, &date, now))))
 }
 
 // ---------------------------------------------------------------- picking up an issue
@@ -3957,11 +3986,11 @@ mod tests {
             st.add_line(&w, "2026-10-22", "did a thing", "agent", D0 + H);
         }
         st.ui_desk = Some(b.clone());
-        let d = day_json(&st, "2026-10-22", D0 + 2 * H);
+        let d = day_json(&st, &Cache::default(), "2026-10-22", D0 + 2 * H);
         let names: Vec<&str> = d["groups"].as_array().unwrap().iter().map(|g| g["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["Beta", "Alpha"]);
         assert_eq!(d["groups"][0]["items"][0]["lines"][0]["text"], "did a thing");
-        assert_eq!(day_json(&st, "2026-10-21", D0)["groups"].as_array().unwrap().len(), 0);
+        assert_eq!(day_json(&st, &Cache::default(), "2026-10-21", D0)["groups"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -3983,7 +4012,7 @@ mod tests {
         ]);
         let t = tile_json(&st, &w, "2026-10-22");
         assert_eq!((t["captured_hours"].as_f64(), t["logged_hours"].as_f64(), t["hours"].as_f64()), (Some(3.0), Some(2.0), Some(1.0)));
-        let d = day_json(&st, "2026-10-22", D0 + 13 * H);
+        let d = day_json(&st, &Cache::default(), "2026-10-22", D0 + 13 * H);
         let rows: Vec<&Value> = d["groups"].as_array().unwrap().iter().flat_map(|g| g["items"].as_array().unwrap()).collect();
         let item = rows.iter().find(|r| r["title"] == "Bootload").unwrap();
         assert_eq!(item["logged_hours"], 2.0);
@@ -4129,7 +4158,7 @@ mod tests {
         assert_eq!(t["lines"].as_array().unwrap().len(), 1);
         assert_eq!(t["lines"][0]["text"], "after the send");
         assert_eq!((t["note"].clone(), t["sent_note"].as_str()), (Value::Null, Some("ABC-1: bring-up")), "not ready until someone looks");
-        let d = day_json(&st, "2026-10-22", D0 + 13 * H);
+        let d = day_json(&st, &Cache::default(), "2026-10-22", D0 + 13 * H);
         assert_eq!(d["unsent_hours"], 3.0);
         assert_eq!(d["total_hours"], 4.5);
         assert_eq!(past_days_due(&st, &HashMap::new(), "2026-10-23", D0 + 30 * H), ["2026-10-22"]);
@@ -4196,7 +4225,7 @@ mod tests {
         assert_eq!(notes, ["read the contract", "wrote the link"]);
         assert_eq!(hand[0]["lines"].as_array().unwrap().len(), 2, "the card shows the lines it will send");
         assert!(st.fold_tile(&w, "2026-10-22", "2026-10-24", D0).is_err(), "already folded");
-        let d = day_json(&st, "2026-10-22", D0 + 60 * H);
+        let d = day_json(&st, &Cache::default(), "2026-10-22", D0 + 60 * H);
         assert_eq!(d["groups"][0]["items"][0]["folded_into"], "2026-10-24");
         assert_eq!(d["unsent_hours"], 0.0);
         // A week on, the folded tile stays while its target is open.
@@ -4245,7 +4274,7 @@ mod tests {
         let t = tile_json(&st, &w, "2026-10-22");
         assert_eq!((t["hours"].as_f64(), t["captured_hours"].as_f64(), t["logged_hours"].as_f64()), (Some(2.5), Some(2.5), Some(0.5)), "{t}");
         assert_eq!(t["covered"], false);
-        let d = day_json(&st, "2026-10-22", D0 + 60 * H);
+        let d = day_json(&st, &Cache::default(), "2026-10-22", D0 + 60 * H);
         let row = &d["groups"][0]["items"][0];
         assert_eq!((row["hours"].as_f64(), row["captured_hours"].as_f64()), (Some(2.5), Some(2.5)), "{row}");
         assert_eq!(tile_json(&st, &w, "2026-10-24")["hours"], 3.5, "the target carries it once");
@@ -4854,6 +4883,65 @@ mod tests {
         assert_eq!(v["cards"][0]["live_sessions"][0]["state"], "busy");
     }
 
+    /// A card with one session `s` of `client`, busy from a prompt at `D0 + H` and never ended.
+    fn killed_mid_turn(client: Option<&str>) -> State {
+        let mut st = State::default();
+        let git = crate::store::testing::FakeGit::default();
+        let w = st.create_item("x", None, D0);
+        for (name, at) in [("SessionStart", D0), ("UserPromptSubmit", D0 + H)] {
+            let ev: events::HookEvent = serde_json::from_value(json!({"hook_event_name": name, "session_id": "s", "cwd": "/w/r"})).unwrap();
+            events::apply(&mut st, &ev, at, &UtcDays, &git, 7);
+        }
+        st.assign_session("s", &w, D0, &UtcDays, &git);
+        st.sessions.get_mut("s").unwrap().client = client.map(str::to_string);
+        st
+    }
+
+    #[test]
+    fn a_session_killed_mid_turn_ends_once_claude_agents_answers_past_its_last_hook_without_it() {
+        let st = killed_mid_turn(Some("embarch-chat"));
+        let now = D0 + H + 5 * 60_000;
+        // claude agents answered five minutes after the last hook, and does not list it: its window closed mid-turn.
+        let cache = Cache { agents_ms: D0 + H + 5 * 60_000, ..Default::default() };
+        let s = &st.sessions["s"];
+        assert!(s.busy && !s.ended, "the hooks alone still say busy");
+        assert_eq!(session_state(&cache, s), ("ended", None));
+        assert!(!session_live(&cache, s, now));
+        let v = view_json(&st, &cache, now, 7, None, &UtcDays);
+        assert_eq!(v["cards"][0]["sessions"]["live"], 0, "{v}");
+        let rows = v["cards"][0]["live_sessions"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "a panel chat stays on its card as ended, so Open chat can resume it: {v}");
+        assert_eq!((rows[0]["state"].as_str(), rows[0]["status"].as_str()), (Some("ended"), Some("ended")));
+        assert_eq!(v["sessions"][0]["state"], "ended", "the panel's list reads it ended too");
+        let day_live = |c: &Cache| day_json(&st, c, "2026-10-22", now)["groups"][0]["items"][0]["live"].clone();
+        assert_eq!((day_live(&Cache::default()), day_live(&cache)), (json!(1), json!(0)), "the day's row counts it live only on the hooks' word");
+        // A terminal session killed the same way leaves its card's live sessions.
+        let st = killed_mid_turn(None);
+        let v = view_json(&st, &cache, now, 7, None, &UtcDays);
+        assert_eq!(v["cards"][0]["live_sessions"].as_array().unwrap().len(), 0, "{v}");
+    }
+
+    #[test]
+    fn a_session_claude_agents_has_not_answered_past_keeps_its_hooks_half_hour() {
+        let st = killed_mid_turn(Some("embarch-chat"));
+        let s = &st.sessions["s"];
+        let now = D0 + H + 5 * 60_000;
+        // No answer at all, one from before the hook, and one too soon after it: the hooks stand.
+        for agents_ms in [0, D0 + H - 30_000, D0 + H + AGENTS_MISS_MS - 1] {
+            let cache = Cache { agents_ms, ..Default::default() };
+            assert_eq!(session_state(&cache, s), ("busy", None), "agents read at {agents_ms}");
+            assert!(session_live(&cache, s, now), "agents read at {agents_ms}");
+            assert_eq!(view_json(&st, &cache, now, 7, None, &UtcDays)["cards"][0]["sessions"]["live"], 1);
+        }
+        // And the half hour still ends it.
+        assert!(!session_live(&Cache::default(), s, D0 + H + HOOKS_LIVE_MS));
+        // Listed by claude agents, it is live whatever the hooks say.
+        let mut cache = Cache { agents_ms: D0 + 3 * H, ..Default::default() };
+        cache.agents.insert("s".into(), json!({"sessionId": "s", "status": "idle"}));
+        assert_eq!(session_state(&cache, s), ("idle", None));
+        assert!(session_live(&cache, s, D0 + 3 * H));
+    }
+
     #[test]
     fn a_window_on_another_desk_reads_that_desks_cards() {
         let mut st = State::default();
@@ -5388,7 +5476,7 @@ mod tests {
         for part in ["cards", "hand", "day"] {
             assert!(!leaks(&v[part].to_string()), "{part}: {}", v[part]);
         }
-        assert!(!leaks(&day_json(&st, "2026-10-22", D0 + 3 * H).to_string()));
+        assert!(!leaks(&day_json(&st, &Cache::default(), "2026-10-22", D0 + 3 * H).to_string()));
         assert!(leaks(&v["desk_notes"].to_string()), "only the desk's own strip carries them");
     }
 
