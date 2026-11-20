@@ -161,6 +161,7 @@ pub fn router(app: Shared) -> Router {
         .route("/linear/issue/{key}", get(linear_issue))
         .route("/linear/issue/{key}/states", get(linear_issue_states))
         .route("/linear/issue/{key}/file", post(linear_issue_file))
+        .route("/linear/issue/{key}/blocked-by", post(linear_issue_blocked_by))
         .route("/linear/mine", get(linear_mine))
         .route("/linear/open", get(linear_open))
         .route("/linear/search", post(linear_search))
@@ -1735,6 +1736,25 @@ async fn linear_issue(Ax(app): Ax<Shared>, headers: HeaderMap, Path(key): Path<S
 #[derive(serde::Deserialize)]
 struct FileBody {
     url: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BlockedByBody {
+    by: Vec<String>,
+}
+
+/// Record that each issue of `by` blocks `key`, straight through like a status
+/// move, and answer `key`'s blockers after: the fleet holds a blocked issue in
+/// Fleet Ready until every blocker is Done.
+async fn linear_issue_blocked_by(Ax(app): Ax<Shared>, headers: HeaderMap, Path(key): Path<String>, Json(b): Json<BlockedByBody>) -> ApiResult {
+    let accounts = linear_accounts()?;
+    if b.by.is_empty() {
+        return Err(bad("by: name at least one blocking issue"));
+    }
+    match linear::add_blockers(&accounts, key.trim(), &b.by).await {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err(key_error(&app, &headers, &accounts, key.trim(), e).await),
+    }
 }
 
 /// One file an issue lists (decision 81); any other link is refused.

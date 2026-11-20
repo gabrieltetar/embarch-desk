@@ -236,7 +236,9 @@ pub const COMMENTS_FETCH: usize = 50;
 async fn gql_detail(acct: &Account, key: &str, skip: usize) -> Result<Option<Value>> {
     let q = "query($id: String!) { issue(id: $id) { id identifier title url description priorityLabel \
              createdAt updatedAt state { id name type } team { id key name } assignee { name } \
-             project { name } labels { nodes { name } } attachments { nodes { title url } } } }";
+             project { name } labels { nodes { name } } attachments { nodes { title url } } \
+             relations(first: 50) { nodes { type relatedIssue { identifier state { name type } } } } \
+             inverseRelations(first: 50) { nodes { type issue { identifier state { name type } } } } } }";
     let i = match gql(acct, q, json!({ "id": key })).await {
         Ok(d) if d["issue"].is_object() => d["issue"].clone(),
         Ok(_) => return Ok(None),
@@ -311,8 +313,82 @@ fn detail_from(acct: &Account, i: &Value, rows: &[Value], cut: bool, skip: usize
     });
     let attachments = i["attachments"]["nodes"].as_array().cloned().unwrap_or_default();
     v["files"] = json!(crate::files::files_of(i["description"].as_str(), &comments, &attachments));
+    v["blocked_by"] = json!(blocked_by_of(i));
     merge(&mut v, comment_fields(&comments, cut, skip));
     v
+}
+
+/// The issues that block this one, `{key, state, state_type}` each: Linear
+/// keeps "A blocks B" as one relation of type `blocks` on A, so B reads it
+/// among its inverse relations. A `blocked_by` relation on the issue itself is
+/// read too, in case a workspace stores the other direction.
+pub fn blocked_by_of(i: &Value) -> Vec<Value> {
+    let row = |n: &Value| json!({ "key": n["identifier"], "state": n["state"]["name"], "state_type": n["state"]["type"] });
+    let mut out: Vec<Value> = Vec::new();
+    let nodes = |field: &str| i[field]["nodes"].as_array().cloned().unwrap_or_default();
+    for n in nodes("inverseRelations") {
+        if n["type"] == "blocks" && n["issue"].is_object() {
+            out.push(row(&n["issue"]));
+        }
+    }
+    for n in nodes("relations") {
+        if n["type"] == "blocked_by" && n["relatedIssue"].is_object() {
+            out.push(row(&n["relatedIssue"]));
+        }
+    }
+    out.dedup_by(|a, b| a["key"] == b["key"]);
+    out
+}
+
+/// Record that each of `by` blocks `key` (a `blocks` relation from each
+/// blocker), skipping one already recorded, and answer the issue's blockers
+/// after. Straight through, like a status move: the fleet sets these as it
+/// files a plan. A workspace read through Linear's MCP server cannot.
+pub async fn add_blockers(accounts: &[Account], key: &str, by: &[String]) -> Result<Value> {
+    first_with(accounts, key, |acct| async move {
+        if acct.mcp.is_some() {
+            return Err(anyhow!("{}: blocked-by relations need a workspace connected by token", acct.label));
+        }
+        gql_add_blockers(acct, key, by).await
+    })
+    .await
+}
+
+/// The issue's id, key and relations; `None` when this workspace has no such key.
+async fn gql_relations(acct: &Account, key: &str) -> Result<Option<Value>> {
+    let q = "query($id: String!) { issue(id: $id) { id identifier \
+             relations(first: 50) { nodes { type relatedIssue { identifier state { name type } } } } \
+             inverseRelations(first: 50) { nodes { type issue { identifier state { name type } } } } } }";
+    match gql(acct, q, json!({ "id": key })).await {
+        Ok(d) if d["issue"].is_object() => Ok(Some(d["issue"].clone())),
+        Ok(_) => Ok(None),
+        Err(e) if not_found(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+async fn gql_add_blockers(acct: &Account, key: &str, by: &[String]) -> Result<Option<Value>> {
+    let Some(issue) = gql_relations(acct, key).await? else { return Ok(None) };
+    let have: Vec<Value> = blocked_by_of(&issue).iter().map(|b| b["key"].clone()).collect();
+    for blocker in by {
+        let blocker = blocker.trim();
+        if blocker.eq_ignore_ascii_case(key) {
+            return Err(anyhow!("{key} cannot block itself"));
+        }
+        if have.iter().any(|k| k.as_str().is_some_and(|k| k.eq_ignore_ascii_case(blocker))) {
+            continue;
+        }
+        let Some(blocker_id) = gql_issue_id(acct, blocker).await? else {
+            return Err(anyhow!("{blocker} is not in {}'s workspace", key));
+        };
+        let m = "mutation($i: IssueRelationCreateInput!) { issueRelationCreate(input: $i) { success } }";
+        let d = gql(acct, m, json!({ "i": { "issueId": blocker_id, "relatedIssueId": issue["id"], "type": "blocks" } })).await?;
+        if d["issueRelationCreate"]["success"] != true {
+            return Err(anyhow!("Linear did not record {blocker} blocking {key}: {d}"));
+        }
+    }
+    let after = gql_relations(acct, key).await?.unwrap_or(issue);
+    Ok(Some(json!({ "key": after["identifier"], "blocked_by": blocked_by_of(&after) })))
 }
 
 /// One file an issue lists (decision 81), read now with the credentials of the
@@ -844,6 +920,26 @@ pub fn start_state(states: &[Value], current_type: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_by_reads_inverse_blocks_and_direct_blocked_by() {
+        let i = json!({
+            "inverseRelations": { "nodes": [
+                { "type": "blocks", "issue": { "identifier": "EMB-1", "state": { "name": "Done", "type": "completed" } } },
+                { "type": "related", "issue": { "identifier": "EMB-2", "state": { "name": "Backlog", "type": "backlog" } } }
+            ] },
+            "relations": { "nodes": [
+                { "type": "blocks", "relatedIssue": { "identifier": "EMB-9", "state": { "name": "Backlog", "type": "backlog" } } },
+                { "type": "blocked_by", "relatedIssue": { "identifier": "EMB-3", "state": { "name": "Fleet Working", "type": "started" } } }
+            ] }
+        });
+        let b = blocked_by_of(&i);
+        let keys: Vec<&str> = b.iter().filter_map(|r| r["key"].as_str()).collect();
+        assert_eq!(keys, ["EMB-1", "EMB-3"], "a related issue and one this issue blocks are not blockers");
+        assert_eq!(b[0]["state"], "Done");
+        assert_eq!(b[1]["state_type"], "started");
+        assert!(blocked_by_of(&json!({})).is_empty(), "no relation fields reads as no blockers");
+    }
 
     #[test]
     fn a_row_names_its_project_and_the_open_query_is_not_limited_to_the_viewer() {
