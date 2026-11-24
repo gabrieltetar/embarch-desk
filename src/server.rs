@@ -193,6 +193,7 @@ pub fn router(app: Shared) -> Router {
         .route("/promptu", get(promptu_desk))
         .route("/promptu/sheet", get(promptu_sheet))
         .route("/promptu/sheet/{week}/{line}", post(promptu_mark))
+        .route("/promptu/feel/{week}", post(promptu_feel))
         .route("/promptu/apply/{week}", post(promptu_apply))
         .route("/items/{id}/start", post(start_work))
         .route("/items/{id}/finish", post(finish_item))
@@ -2799,6 +2800,21 @@ async fn promptu_mark(Ax(app): Ax<Shared>, Path((week, line)): Path<(String, Str
     Ok(Json(v))
 }
 
+#[derive(Deserialize)]
+struct FeelBody {
+    feel: String,
+}
+
+async fn promptu_feel(Ax(app): Ax<Shared>, Path(week): Path<String>, Json(b): Json<FeelBody>) -> ApiResult {
+    check_week(&week)?;
+    if !matches!(b.feel.as_str(), "better" | "same" | "worse") {
+        return Err(bad("feel is better, same or worse"));
+    }
+    let v = crate::promptu::feel(&crate::promptu::current_dirs(), &week, &b.feel).await?;
+    app.cache.lock().expect("cache").promptu_desk = None;
+    Ok(Json(v))
+}
+
 async fn promptu_apply(Ax(app): Ax<Shared>, Path(week): Path<String>) -> ApiResult {
     check_week(&week)?;
     let v = crate::promptu::apply(&crate::promptu::current_dirs(), &week).await?;
@@ -4459,6 +4475,16 @@ mod tests {
         assert_eq!(pick_starter(true, false), (Starter::Summarize, Some(PROMPTU_ABSENT)), "absent: the old starter, and a warning");
         assert_eq!(pick_starter(false, true), (Starter::Summarize, None), "turned off: the old starter, nothing to warn of");
         assert_eq!(pick_starter(false, false), (Starter::Summarize, None));
+    }
+
+    #[tokio::test]
+    async fn the_feel_route_refuses_a_bad_feel_or_week_before_any_command_runs() {
+        let (app, dir) = scratch_app();
+        let post = |week: &str, feel: &str| promptu_feel(Ax(app.clone()), Path(week.to_string()), Json(FeelBody { feel: feel.to_string() }));
+        assert!(post("2026-W48", "great").await.is_err(), "not better, same or worse");
+        assert!(post("2026-W48", "").await.is_err());
+        assert!(post("--json", "same").await.is_err(), "a week that reads as a flag");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]

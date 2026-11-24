@@ -103,6 +103,11 @@ pub async fn mark(dirs: &[PathBuf], week: &str, line: &str, verdict: &str, note:
     run(dirs, &a).await
 }
 
+/// `POST /promptu/feel/{week}`: `week mark --feel`, which takes no line id.
+pub async fn feel(dirs: &[PathBuf], week: &str, feel: &str) -> Result<Value, Fail> {
+    run(dirs, &["week", "mark", "--feel", feel, "--week", week, "--json"]).await
+}
+
 /// `POST /promptu/apply/{week}`: `week apply`, each line's result in the answer.
 pub async fn apply(dirs: &[PathBuf], week: &str) -> Result<Value, Fail> {
     run(dirs, &["week", "apply", "--week", week, "--json"]).await
@@ -188,7 +193,7 @@ mod tests {
             "#!/bin/sh\necho \"$@\" >> {log}\ncase \"$1 $2\" in\n\
              'desk --json') echo '{{\"promptu\":1,\"open\":3,\"week\":\"2026-W48\"}}';;\n\
              'week show') echo '{{\"promptu\":1,\"week\":\"2026-W48\",\"groups\":[]}}';;\n\
-             'week mark') case \"$3\" in l9) echo 'no line l9' >&2; exit 2;; esac; echo '{{\"changed\":[{{\"id\":\"l1\",\"status\":\"cut\"}}],\"open\":2}}';;\n\
+             'week mark') case \"$3\" in --feel) echo '{{\"week\":\"2026-W48\",\"changed\":[],\"open\":2}}'; exit 0;; l9) echo 'no line l9' >&2; exit 2;; esac; echo '{{\"changed\":[{{\"id\":\"l1\",\"status\":\"cut\"}}],\"open\":2}}';;\n\
              'week apply') echo '{{\"applied\":1,\"failed\":1,\"lines\":[{{\"id\":\"l1\",\"status\":\"applied\"}},{{\"id\":\"l2\",\"status\":\"failed\"}}]}}'; exit 1;;\n\
              *) exit 3;;\nesac\n",
             log = d.join("calls.log").display()
@@ -212,6 +217,7 @@ mod tests {
         let m = mark(&dirs, "2026-W48", "l1", "cut", Some("too broad")).await.unwrap();
         assert_eq!(m["changed"][0]["status"], "cut");
         mark(&dirs, "2026-W48", "l1", "approve", Some("")).await.unwrap();
+        assert_eq!(feel(&dirs, "2026-W48", "better").await.unwrap()["open"], 2);
         // Exit 1 is a line that failed: the answer still carries every line's result.
         let a = apply(&dirs, "2026-W48").await.unwrap();
         assert_eq!(a["lines"][1]["status"], "failed");
@@ -223,6 +229,7 @@ mod tests {
                 "week show --week 2026-W47 --json",
                 "week mark l1 --verdict cut --week 2026-W48 --json --note too broad",
                 "week mark l1 --verdict approve --week 2026-W48 --json",
+                "week mark --feel better --week 2026-W48 --json",
                 "week apply --week 2026-W48 --json",
             ]
         );
@@ -239,7 +246,7 @@ mod tests {
         let d = scratch();
         let dirs = [d.join("empty")];
         assert_eq!(desk(&dirs).await, json!({ "promptu": 1, "open": 0 }));
-        for r in [sheet(&dirs, None).await, mark(&dirs, "2026-W48", "l1", "cut", None).await, apply(&dirs, "2026-W48").await] {
+        for r in [sheet(&dirs, None).await, mark(&dirs, "2026-W48", "l1", "cut", None).await, feel(&dirs, "2026-W48", "same").await, apply(&dirs, "2026-W48").await] {
             match r {
                 Err(Fail::Missing(m)) => assert!(m.contains("promptu is not installed"), "{m}"),
                 other => panic!("{other:?}"),
