@@ -61,6 +61,8 @@ pub struct Cache {
     pub started_ms: i64,
     /// Linear sign-ins through its MCP server, by the state each handed out.
     pub signins: HashMap<String, SignIn>,
+    /// `promptu desk --json` and when it was read: `GET /promptu` is cached 60 s.
+    pub promptu_desk: Option<(i64, Value)>,
 }
 
 /// A Linear sign-in through Linear's MCP server, from the link the desk hands
@@ -188,6 +190,10 @@ pub fn router(app: Shared) -> Router {
         .route("/github/pr-threads", post(github_pr_threads))
         .route("/harvest/entry/{account}/{id}", axum::routing::patch(edit_entry).delete(remove_entry))
         .route("/pickup", get(pickup))
+        .route("/promptu", get(promptu_desk))
+        .route("/promptu/sheet", get(promptu_sheet))
+        .route("/promptu/sheet/{week}/{line}", post(promptu_mark))
+        .route("/promptu/apply/{week}", post(promptu_apply))
         .route("/items/{id}/start", post(start_work))
         .route("/items/{id}/finish", post(finish_item))
         .route("/items/{id}/repos", post(add_repo))
@@ -2725,6 +2731,79 @@ async fn set_open(Ax(app): Ax<Shared>, Json(b): Json<OpenBody>) -> ApiResult {
     })?;
     app.cache.lock().expect("cache").pr_checked.clear();
     Ok(Json(json!({ "desk": desk })))
+}
+
+// The Desk tab's Promptu section (decision 65): each route runs one `promptu`
+// command and passes its JSON on. HTTP only, like ✓ on a tile: no MCP tool
+// reaches these, an agent never marks or applies a sheet.
+
+const PROMPTU_DESK_TTL_MS: i64 = 60_000;
+
+impl From<crate::promptu::Fail> for ApiError {
+    fn from(f: crate::promptu::Fail) -> Self {
+        use crate::promptu::Fail;
+        match f {
+            Fail::Missing(m) => ApiError(StatusCode::SERVICE_UNAVAILABLE, m),
+            Fail::Refused(m) => bad(if m.is_empty() { "promptu refused".to_string() } else { m }),
+            Fail::Broken(m) => ApiError(StatusCode::BAD_GATEWAY, m),
+        }
+    }
+}
+
+fn check_week(w: &str) -> Result<(), ApiError> {
+    if crate::promptu::valid_week(w) { Ok(()) } else { Err(bad(format!("`{w}` is not an ISO week like 2026-W48"))) }
+}
+
+async fn promptu_desk(Ax(app): Ax<Shared>) -> ApiResult {
+    let now = now_ms();
+    if let Some((at, v)) = &app.cache.lock().expect("cache").promptu_desk {
+        if now - at < PROMPTU_DESK_TTL_MS {
+            return Ok(Json(v.clone()));
+        }
+    }
+    let v = crate::promptu::desk(&crate::promptu::current_dirs()).await;
+    app.cache.lock().expect("cache").promptu_desk = Some((now, v.clone()));
+    Ok(Json(v))
+}
+
+#[derive(Deserialize)]
+struct SheetQuery {
+    #[serde(default)]
+    week: Option<String>,
+}
+
+async fn promptu_sheet(axum::extract::Query(q): axum::extract::Query<SheetQuery>) -> ApiResult {
+    if let Some(w) = &q.week {
+        check_week(w)?;
+    }
+    Ok(Json(crate::promptu::sheet(&crate::promptu::current_dirs(), q.week.as_deref()).await?))
+}
+
+#[derive(Deserialize)]
+struct MarkBody {
+    verdict: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+async fn promptu_mark(Ax(app): Ax<Shared>, Path((week, line)): Path<(String, String)>, Json(b): Json<MarkBody>) -> ApiResult {
+    check_week(&week)?;
+    if !crate::promptu::valid_line(&line) {
+        return Err(bad(format!("`{line}` is not a line or group id")));
+    }
+    if b.verdict != "approve" && b.verdict != "cut" {
+        return Err(bad("verdict is approve or cut"));
+    }
+    let v = crate::promptu::mark(&crate::promptu::current_dirs(), &week, &line, &b.verdict, b.note.as_deref()).await?;
+    app.cache.lock().expect("cache").promptu_desk = None;
+    Ok(Json(v))
+}
+
+async fn promptu_apply(Ax(app): Ax<Shared>, Path(week): Path<String>) -> ApiResult {
+    check_week(&week)?;
+    let v = crate::promptu::apply(&crate::promptu::current_dirs(), &week).await?;
+    app.cache.lock().expect("cache").promptu_desk = None;
+    Ok(Json(v))
 }
 
 async fn linear_projects() -> ApiResult {

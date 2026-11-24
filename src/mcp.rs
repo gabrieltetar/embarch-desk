@@ -749,6 +749,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn no_tool_reaches_the_promptu_routes() {
+        // An agent never marks or applies a weekly sheet (decision 65): the routes are the tab's.
+        let tools = DeskMcp::tool_router().list_all();
+        assert!(tools.iter().all(|t| !t.name.contains("promptu") && !t.name.contains("sheet")));
+        let prod = include_str!("mcp.rs").split("mod tests {").next().unwrap();
+        assert!(!prod.contains(&format!("\"/{}", "promptu")) && !prod.contains(&format!("/{}/", "promptu")), "a client call names a promptu route");
+        assert!(!prod.contains("promptu::"), "the MCP server runs no promptu command");
+    }
+
+    #[test]
     fn the_pull_is_a_session_tool_a_note_takes_a_kind_and_a_desk_note_its_session_and_text() {
         let tools = DeskMcp::tool_router().list_all();
         let tool = |name: &str| tools.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("no tool {name}"));
