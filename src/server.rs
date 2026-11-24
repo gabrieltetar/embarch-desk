@@ -167,6 +167,7 @@ pub fn router(app: Shared) -> Router {
         .route("/linear/search", post(linear_search))
         .route("/linear/issues", post(linear_issues))
         .route("/linear/status", post(linear_status))
+        .route("/linear/issue/{key}/archive", post(linear_archive))
         .route("/drafts", post(create_draft))
         .route("/drafts/{id}", axum::routing::patch(patch_draft).get(get_draft))
         .route("/drafts/{id}/revise", post(revise_draft))
@@ -1902,6 +1903,18 @@ async fn linear_issues(Ax(app): Ax<Shared>, headers: HeaderMap, Json(b): Json<St
         ));
     }
     Ok(Json(v))
+}
+
+/// Archive an issue: HTTP only, for `fleet-linear.py archive-done`, never an
+/// MCP tool. Archiving takes it out of the workspace's active count, which
+/// Linear's free plan caps; it still reads by key.
+async fn linear_archive(Ax(app): Ax<Shared>, headers: HeaderMap, Path(key): Path<String>) -> ApiResult {
+    let accounts = linear_accounts()?;
+    let key = key.trim();
+    if let Err(e) = linear::archive(&accounts, key).await {
+        return Err(key_error(&app, &headers, &accounts, key, e).await);
+    }
+    Ok(Json(json!({ "key": key, "archived": true })))
 }
 
 #[derive(Deserialize)]
@@ -4572,6 +4585,29 @@ mod tests {
         assert!(!m.contains("no connected Linear workspace has"), "{m}");
         assert_eq!(app.db.read(|st| st.items.len()), 1);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn archive_looks_the_key_up_then_archives_it_and_a_key_no_workspace_has_is_refused() {
+        async fn gql(Json(b): Json<Value>) -> Json<Value> {
+            let q = b["query"].as_str().unwrap_or_default();
+            if q.contains("issueArchive") {
+                return Json(json!({"data": {"issueArchive": {"success": b["variables"]["id"] == "i1"}}}));
+            }
+            if b["variables"]["id"] == "ABC-1" {
+                Json(json!({"data": {"issue": {"id": "i1"}}}))
+            } else {
+                Json(json!({"errors": [{"message": "Entity not found: Issue"}]}))
+            }
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/graphql", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, Router::new().route("/graphql", post(gql))).await.ok() });
+        crate::linear::TEST_URL.with(|u| *u.borrow_mut() = Some(url));
+        let accts = [crate::connectors::Account::new("work", "k")];
+        crate::linear::archive(&accts, "ABC-1").await.expect("ABC-1 is archived");
+        let e = crate::linear::archive(&accts, "ABC-2").await.expect_err("no workspace has ABC-2");
+        assert!(e.to_string().contains("ABC-2"), "{e}");
     }
 
     fn line_body(v: Value) -> LineBody {

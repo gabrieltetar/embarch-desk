@@ -793,6 +793,25 @@ pub async fn post_comment(accounts: &[Account], key: &str, body: &str, parent: O
     .await
 }
 
+/// Archive an issue, taking it out of the workspace's active count. Linear's
+/// free plan caps unarchived issues, and on 2026-11-23 the suite's workspace
+/// hit the cap with most of its issues Done, so every filing was refused. Only
+/// the HTTP route reaches this; an archived issue still reads by its key.
+pub async fn archive(accounts: &[Account], key: &str) -> Result<()> {
+    first_with(accounts, key, |acct| async move {
+        if acct.mcp.is_some() {
+            bail!("linear ({}): Linear's MCP server has no archive tool; archiving needs an API-key account", acct.label);
+        }
+        let Some(id) = gql_issue_id(acct, key).await? else { return Ok(None) };
+        let d = gql(acct, "mutation($id: String!) { issueArchive(id: $id) { success } }", json!({ "id": id })).await?;
+        if d["issueArchive"]["success"].as_bool() != Some(true) {
+            bail!("Linear refused to archive {key}");
+        }
+        Ok(Some(()))
+    })
+    .await
+}
+
 /// The issue's id in this workspace; `None` when it has no such key.
 async fn gql_issue_id(acct: &Account, key: &str) -> Result<Option<Value>> {
     match gql(acct, "query($id: String!) { issue(id: $id) { id } }", json!({ "id": key })).await {
