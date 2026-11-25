@@ -154,6 +154,7 @@ pub fn router(app: Shared) -> Router {
         .route("/tiles/{id}/approve", post(approve_tile))
         .route("/tiles/{id}/discard", post(discard_tile))
         .route("/tiles/{id}/fold", post(fold_tile))
+        .route("/tiles/{id}/move", post(move_tile))
         .route("/harvest/targets", get(harvest_targets))
         .route("/connectors", get(list_connectors).post(add_connector))
         .route("/connectors/{kind}/{label}", delete(remove_connector))
@@ -259,14 +260,10 @@ fn tile_json(st: &State, item_id: &str, date: &str) -> Value {
     let id = format!("{item_id}@{date}");
     let seconds = st.tile_seconds(item_id, date);
     let t = st.tiles.get(&id);
-    let folded = t.is_some_and(|t| t.status == TileStatus::Folded);
     let captured = seconds as f64 / 3600.0;
     let logged = st.logged_hours(item_id, date);
-    // The tile proposes only what Harvest doesn't already hold for this item
-    // that day (decision 41). A folded tile's seconds are already that gap,
-    // frozen at the fold, so they are not reduced again (decision 60).
-    let computed = if folded { captured } else { (captured - logged).max(0.0) };
-    let computed = (computed * 100.0).round() / 100.0;
+    // Only what Harvest doesn't already hold (41); a folded tile's frozen gap as it is (60).
+    let computed = st.computed_hours(item_id, date);
     let override_hours = t.and_then(|t| t.hours_override);
     // Its own lines and those of the tiles folded into it, as the polish
     // reads them (decision 58).
@@ -1542,6 +1539,34 @@ async fn fold_tile(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<Fo
     let now = now_ms();
     app.db.write(|st| st.fold_tile(&item, &date, &b.into, now)).map_err(bad)?;
     Ok(Json(app.db.read(|st| tile_json(st, &item, &b.into))))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MoveBody {
+    /// The work item that takes the hours: its desk item id or issue key.
+    to_item: String,
+    /// Hours to move; 0 moves only the lines.
+    #[serde(default)]
+    hours: f64,
+    /// Ids of this tile's own lines that go with the hours.
+    #[serde(default)]
+    lines: Vec<String>,
+}
+
+/// Move part of an open tile's hours, and named lines, to another item's
+/// tile on the same day (decision 92). Answers both tiles.
+async fn move_tile(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<MoveBody>) -> ApiResult {
+    let (item, date) = split_tile_id(&id)?;
+    let now = now_ms();
+    let to = app.db.write(|st| {
+        let t = b.to_item.trim();
+        let to = st.items.get(t).map(|i| i.id.clone()).or_else(|| st.item_by_key(t).map(|i| i.id.clone()));
+        let to = to.ok_or_else(|| missing(format!("no work item {t:?}: not an issue key or a desk item id on any desk; desk_create_item makes one from an issue key")))?;
+        st.move_hours(&item, &to, &date, b.hours, &b.lines, now).map_err(bad)?;
+        Ok::<_, ApiError>(to)
+    })?;
+    Ok(Json(app.db.read(|st| json!({ "from": tile_json(st, &item, &date), "to": tile_json(st, &to, &date) }))))
 }
 
 // ---------------------------------------------------------------- connectors
@@ -2908,7 +2933,9 @@ pub fn day_json(st: &State, cache: &Cache, date: &str, now: i64) -> Value {
             .flatten()
             .filter(|e| st.item_for_entry(e).as_deref() == Some(item.id.as_str()))
             .collect();
-        if seconds == 0 && lines.is_empty() && bench.is_empty() && sessions.is_empty() && entries.is_empty() {
+        // Typed hours keep a row with nothing else, such as a move's target (decision 92).
+        let typed = tile.is_some_and(|t| t.hours_override.is_some());
+        if seconds == 0 && !typed && lines.is_empty() && bench.is_empty() && sessions.is_empty() && entries.is_empty() {
             continue;
         }
         let t = tile_json(st, &item.id, date);
@@ -2916,6 +2943,7 @@ pub fn day_json(st: &State, cache: &Cache, date: &str, now: i64) -> Value {
             item.desk_id.clone(),
             json!({
                 "id": item.id,
+                "tile": t["id"],
                 "title": item.title,
                 "issue": item.issue,
                 "prs": item.prs,
@@ -2944,7 +2972,7 @@ pub fn day_json(st: &State, cache: &Cache, date: &str, now: i64) -> Value {
         rows.push((
             st.desk_for_entry(e),
             json!({
-                "id": null, "title": title, "issue": null, "prs": [], "hours": 0.0, "captured_hours": 0.0,
+                "id": null, "tile": null, "title": title, "issue": null, "prs": [], "hours": 0.0, "captured_hours": 0.0,
                 "logged_hours": e.hours, "harvest_entries": [e], "status": "harvest_only", "harvest": null,
                 "lines": [], "note": null, "sessions": 0, "live": 0, "bench": 0, "bench_failed": 0,
             }),
@@ -4397,6 +4425,127 @@ mod tests {
         let row = &d["groups"][0]["items"][0];
         assert_eq!((row["hours"].as_f64(), row["captured_hours"].as_f64()), (Some(2.5), Some(2.5)), "{row}");
         assert_eq!(tile_json(&st, &w, "2026-10-24")["hours"], 3.5, "the target carries it once");
+    }
+
+    /// Two items with time on 2026-10-22 (`5h` and `1h`) and one with none.
+    fn three_items_one_day(st: &mut State) -> (String, String, String) {
+        let a = st.create_item("umbrella", Some(store::IssueRef { key: "ABC-1".into(), ..Default::default() }), D0);
+        let b = st.create_item("sub", Some(store::IssueRef { key: "ABC-2".into(), ..Default::default() }), D0);
+        let c = st.create_item("other", None, D0);
+        for (sid, w, hours) in [("s1", &a, 5), ("s2", &c, 1)] {
+            let mut s = crate::store::testing::session(sid);
+            s.item_id = Some(w.clone());
+            crate::store::record_activity(&mut s, D0 + 9 * H, &UtcDays);
+            crate::store::record_activity(&mut s, D0 + (9 + hours) * H, &UtcDays);
+            st.sessions.insert(sid.into(), s);
+        }
+        (a, b, c)
+    }
+
+    #[test]
+    fn a_move_splits_a_tiles_hours_onto_another_items_tile_and_the_two_sum_to_the_original() {
+        let mut st = State::default();
+        let (a, b, c) = three_items_one_day(&mut st);
+        st.add_line(&a, "2026-10-22", "worked on the sub-issue", "agent", D0 + 10 * H);
+        st.add_line(&a, "2026-10-22", "worked on the umbrella", "agent", D0 + 11 * H);
+        let line = st.tiles[&format!("{a}@2026-10-22")].lines[0].id.clone();
+        let unsent = day_json(&st, &Cache::default(), "2026-10-22", D0 + 15 * H)["unsent_hours"].clone();
+        assert_eq!(unsent, 6.0);
+        assert!(!st.tile_keys().contains(&(b.clone(), "2026-10-22".into())), "no time, no tile");
+
+        st.move_hours(&a, &b, "2026-10-22", 2.0, std::slice::from_ref(&line), D0 + 15 * H).unwrap();
+        let (ta, tb) = (tile_json(&st, &a, "2026-10-22"), tile_json(&st, &b, "2026-10-22"));
+        assert_eq!((ta["hours"].as_f64(), tb["hours"].as_f64()), (Some(3.0), Some(2.0)), "{ta} {tb}");
+        assert_eq!((ta["status"].as_str(), tb["status"].as_str()), (Some("open"), Some("open")));
+        let texts = |t: &Value| t["lines"].as_array().unwrap().iter().map(|l| l["text"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!((texts(&ta), texts(&tb)), (vec!["worked on the umbrella".to_string()], vec!["worked on the sub-issue".to_string()]));
+
+        // Onto a tile with its own time: its hours, plus the move.
+        st.move_hours(&a, &c, "2026-10-22", 0.75, &[], D0 + 15 * H).unwrap();
+        assert_eq!(tile_json(&st, &a, "2026-10-22")["hours"], 2.25);
+        assert_eq!(tile_json(&st, &c, "2026-10-22")["hours"], 1.75);
+
+        // The target shows on the Desk tab: in the hand, on its card, in the day.
+        let v = view_json(&st, &Cache::default(), D0 + 15 * H, 7, None, &UtcDays);
+        let hand: Vec<(&str, f64)> = v["hand"].as_array().unwrap().iter().map(|t| (t["item_title"].as_str().unwrap(), t["hours"].as_f64().unwrap())).collect();
+        assert!(hand.contains(&("sub", 2.0)), "{hand:?}");
+        let card = v["cards"].as_array().unwrap().iter().find(|c| c["id"] == b.as_str()).expect("the target's card");
+        assert_eq!(card["tiles"][0]["hours"], 2.0);
+        let d = day_json(&st, &Cache::default(), "2026-10-22", D0 + 15 * H);
+        let rows: Vec<&Value> = d["groups"].as_array().unwrap().iter().flat_map(|g| g["items"].as_array().unwrap()).collect();
+        let row = rows.iter().find(|r| r["id"] == b.as_str()).expect("the target's row in the day");
+        assert_eq!((row["tile"].as_str(), row["hours"].as_f64()), (Some(format!("{b}@2026-10-22").as_str()), Some(2.0)));
+        assert_eq!(d["unsent_hours"], unsent, "a move changes no total");
+
+        // The rest, back to zero: the source stays open at 0 h, for its ✕.
+        st.move_hours(&a, &b, "2026-10-22", 2.25, &[], D0 + 16 * H).unwrap();
+        assert_eq!(tile_json(&st, &a, "2026-10-22")["hours"], 0.0);
+        assert_eq!(tile_json(&st, &b, "2026-10-22")["hours"], 4.25);
+        assert!(open_tile_keys(&st).contains(&(a.clone(), "2026-10-22".into())));
+    }
+
+    #[test]
+    fn a_move_from_or_to_a_sent_discarded_or_folded_tile_is_refused_naming_its_state_and_changes_nothing() {
+        let mut st = State::default();
+        let (a, b, c) = three_items_one_day(&mut st);
+        let id = |w: &str| format!("{w}@2026-10-22");
+        let set = |st: &mut State, w: &str, s: TileStatus| st.tile_mut(w, "2026-10-22").status = s;
+        let refused = |st: &mut State, from: &str, to: &str, hours: f64, lines: &[String]| -> String {
+            let before = serde_json::to_string(&st.tiles).unwrap();
+            let e = st.move_hours(from, to, "2026-10-22", hours, lines, D0).expect_err("moved");
+            assert_eq!(serde_json::to_string(&st.tiles).unwrap(), before, "a refusal changed a tile: {e}");
+            e
+        };
+        assert!(refused(&mut st, &a, &b, 5.5, &[]).contains("proposes 5.00 h"));
+        assert!(refused(&mut st, &a, &a, 1.0, &[]).contains("another work item"));
+        assert!(refused(&mut st, &a, &b, 0.0, &[]).contains("nothing to move"));
+        assert!(refused(&mut st, &a, &b, -1.0, &[]).contains("0 or more"));
+        assert!(refused(&mut st, &a, &b, 1.0, &["n-none".into()]).contains("no line n-none"));
+        assert!(refused(&mut st, &b, &a, 1.0, &[]).contains("no tile on 2026-10-22"), "the source needs time or a record");
+        assert!(refused(&mut st, &a, "w-none", 1.0, &[]).contains("no work item w-none"));
+        assert!(st.move_hours(&a, &b, "2026-10-2", 1.0, &[], D0).is_err());
+
+        set(&mut st, &a, TileStatus::Approved);
+        assert!(refused(&mut st, &a, &b, 1.0, &[]).contains("already in Harvest (sent)"));
+        set(&mut st, &a, TileStatus::Discarded);
+        assert!(refused(&mut st, &a, &b, 1.0, &[]).contains("was discarded"));
+        set(&mut st, &a, TileStatus::Folded);
+        st.tile_mut(&a, "2026-10-22").folded_into = Some("2026-10-24".into());
+        assert!(refused(&mut st, &a, &b, 1.0, &[]).contains("was folded into 2026-10-24"));
+        set(&mut st, &a, TileStatus::Open);
+
+        set(&mut st, &c, TileStatus::Approved);
+        let e = refused(&mut st, &a, &c, 1.0, &[]);
+        assert!(e.contains(&c) && e.contains("already in Harvest"), "{e}");
+        set(&mut st, &c, TileStatus::Open);
+        st.items.get_mut(&b).unwrap().archived = true;
+        assert!(refused(&mut st, &a, &b, 1.0, &[]).contains("archived"));
+        st.items.get_mut(&b).unwrap().archived = false;
+        st.tile_mut(&c, "2026-10-22").hours_override = Some(23.5);
+        assert!(refused(&mut st, &a, &c, 1.0, &[]).contains("past 24"));
+        assert!(!st.tiles.contains_key(&id(&b)), "no target tile was made");
+    }
+
+    #[tokio::test]
+    async fn the_move_route_takes_an_issue_key_or_an_item_id_and_answers_both_tiles() {
+        let (app, dir) = scratch_app();
+        let (a, b, _) = app.db.write(three_items_one_day);
+        let body = |v: Value| Json(serde_json::from_value::<MoveBody>(v).unwrap());
+        let tile = format!("{a}@2026-10-22");
+        let Ok(Json(v)) = move_tile(Ax(app.clone()), Path(tile.clone()), body(json!({"to_item": "abc-2", "hours": 1.5}))).await else { panic!("by key") };
+        assert_eq!((v["from"]["hours"].as_f64(), v["to"]["hours"].as_f64()), (Some(3.5), Some(1.5)), "{v}");
+        assert_eq!(v["to"]["id"], format!("{b}@2026-10-22"));
+        let Ok(Json(v)) = move_tile(Ax(app.clone()), Path(tile.clone()), body(json!({"to_item": b, "hours": 0.5}))).await else { panic!("by id") };
+        assert_eq!(v["to"]["hours"], 2.0);
+        let Err(ApiError(code, msg)) = move_tile(Ax(app.clone()), Path(tile.clone()), body(json!({"to_item": "NOPE-1", "hours": 1}))).await else { panic!("unknown") };
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert!(msg.contains("NOPE-1"), "{msg}");
+        app.db.write(|st| st.tile_mut(&a, "2026-10-22").status = TileStatus::Approved);
+        let Err(ApiError(code, msg)) = move_tile(Ax(app.clone()), Path(tile), body(json!({"to_item": b, "hours": 1}))).await else { panic!("sent") };
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("sent"), "{msg}");
+        assert!(serde_json::from_value::<MoveBody>(json!({"to_item": b, "hours": 1, "into": "x"})).is_err(), "an unknown field is refused");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

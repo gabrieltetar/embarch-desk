@@ -632,8 +632,9 @@ pub struct Tile {
     pub lines: Vec<Line>,
     #[serde(default)]
     pub note: Option<String>,
-    /// Hours a person typed (decision 57). Only that: nothing the desk
-    /// computed or sent ever lands here (decision 61).
+    /// Hours a person typed (decision 57), or a move between items set on
+    /// both its tiles at someone's ask (decision 92). Never what the desk
+    /// computed or sent (decision 61).
     #[serde(default)]
     pub hours_override: Option<f64>,
     /// The hours ✓ sent to Harvest, kept so the approved record reads true.
@@ -912,6 +913,11 @@ pub fn is_date(s: &str) -> bool {
     s.len() == 10 && chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
 }
 
+/// Hours to the hundredth, as tiles report them.
+pub fn round_hours(h: f64) -> f64 {
+    (h * 100.0).round() / 100.0
+}
+
 /// A folder as the mailbox compares it: no trailing slash.
 pub fn norm_folder(path: &str) -> String {
     let p = path.trim();
@@ -1142,6 +1148,111 @@ impl State {
         t.folded_into = Some(into.to_string());
         t.acted_ms = Some(now);
         t.final_seconds = Some(seconds);
+        Ok(())
+    }
+
+    /// What a tile proposes when nobody typed its hours: the gap Harvest's
+    /// entries for its item that day left (decision 41), or a folded tile's
+    /// frozen gap, which is not reduced again (decision 60). To the
+    /// hundredth of an hour.
+    pub fn computed_hours(&self, item_id: &str, date: &str) -> f64 {
+        let folded = self.tiles.get(&format!("{item_id}@{date}")).is_some_and(|t| t.status == TileStatus::Folded);
+        let captured = self.tile_seconds(item_id, date) as f64 / 3600.0;
+        let gap = if folded { captured } else { (captured - self.logged_hours(item_id, date)).max(0.0) };
+        round_hours(gap)
+    }
+
+    /// The hours an open tile proposes: typed, else computed.
+    pub fn open_hours(&self, item_id: &str, date: &str) -> f64 {
+        self.tiles
+            .get(&format!("{item_id}@{date}"))
+            .and_then(|t| t.hours_override)
+            .unwrap_or_else(|| self.computed_hours(item_id, date))
+    }
+
+    /// Why a tile cannot take part in a move (decision 92), naming its
+    /// state; `None` for an open one.
+    fn unmovable(&self, item_id: &str, date: &str) -> Option<String> {
+        let t = self.tiles.get(&format!("{item_id}@{date}"))?;
+        match t.status {
+            TileStatus::Open => None,
+            TileStatus::Approved => Some("is already in Harvest (sent)".into()),
+            TileStatus::Discarded => Some("was discarded".into()),
+            TileStatus::Folded => Some(format!("was folded into {}", t.folded_into.as_deref().unwrap_or("a later day"))),
+        }
+    }
+
+    /// Move `hours`, and the lines named by id, from an item's open tile on
+    /// `date` to another item's tile on the same date (decision 92). The
+    /// target tile is made when its item has no time that day. Both tiles
+    /// end with typed hours that sum to what they proposed before, and stay
+    /// open for the owner's ✓. Nothing changes on a refusal.
+    pub fn move_hours(&mut self, from: &str, to: &str, date: &str, hours: f64, line_ids: &[String], now: i64) -> Result<(), String> {
+        if !is_date(date) {
+            return Err("a move names a YYYY-MM-DD date".into());
+        }
+        if from == to {
+            return Err("a move goes to another work item; Fold moves a tile to a later day of its own".into());
+        }
+        if !hours.is_finite() || hours < 0.0 {
+            return Err("hours must be a number of hours, 0 or more".into());
+        }
+        let hours = round_hours(hours);
+        if hours == 0.0 && line_ids.is_empty() {
+            return Err("nothing to move: give hours, lines or both".into());
+        }
+        if !self.items.contains_key(from) {
+            return Err(format!("no work item {from}"));
+        }
+        match self.items.get(to) {
+            None => return Err(format!("no work item {to}")),
+            Some(i) if i.archived => return Err(format!("work item {to} is archived; its tile would not show on the Desk tab")),
+            Some(_) => {}
+        }
+        if !self.tile_keys().contains(&(from.to_string(), date.to_string())) {
+            return Err(format!("no tile on {date} for work item {from}"));
+        }
+        if let Some(why) = self.unmovable(from, date) {
+            return Err(format!("this tile {why}; only an open tile moves hours"));
+        }
+        if let Some(why) = self.unmovable(to, date) {
+            return Err(format!("{to}'s tile on {date} {why}; only an open tile takes hours"));
+        }
+        let have = round_hours(self.open_hours(from, date));
+        if hours > have {
+            return Err(format!("this tile proposes {have:.2} h; it cannot give {hours:.2} h"));
+        }
+        let take = round_hours(self.open_hours(to, date));
+        if take + hours > 24.0 {
+            return Err(format!("{to}'s tile on {date} would hold {:.2} h, past 24", take + hours));
+        }
+        let own: Vec<&Line> = self.tiles.get(&format!("{from}@{date}")).map(|t| t.lines.iter().collect()).unwrap_or_default();
+        let mut ids: Vec<&String> = vec![];
+        for id in line_ids {
+            if !own.iter().any(|l| &l.id == id) {
+                return Err(format!("no line {id} on this tile; a folded tile's lines stay with it"));
+            }
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let (before_from, before_to) = (self.notes_ms(from), self.notes_ms(to));
+        let src = self.tile_mut(from, date);
+        let moved: Vec<Line> = src.lines.iter().filter(|l| ids.contains(&&l.id)).cloned().collect();
+        src.lines.retain(|l| !ids.contains(&&l.id));
+        if hours > 0.0 {
+            src.hours_override = Some(round_hours(have - hours));
+        }
+        let dst = self.tile_mut(to, date);
+        if hours > 0.0 {
+            dst.hours_override = Some(round_hours(take + hours));
+        }
+        if !moved.is_empty() {
+            dst.lines.extend(moved);
+            dst.lines.sort_by_key(|l| l.ms);
+            self.notes_moved(from, before_from, now);
+            self.notes_moved(to, before_to, now);
+        }
         Ok(())
     }
 
