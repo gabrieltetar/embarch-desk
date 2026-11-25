@@ -34,6 +34,8 @@ pub const ISSUES_CAP: usize = 1000;
 pub const PRS_PER_REPO: usize = 300;
 /// The most recently updated Linear projects it keeps.
 pub const PROJECTS_CAP: usize = 200;
+/// The most recently updated Linear documents it keeps, of the indexed projects.
+pub const DOCUMENTS_CAP: usize = 500;
 /// How often the sync loop refreshes one desk's index.
 pub const REFRESH_MS: i64 = 5 * 60_000;
 
@@ -65,6 +67,32 @@ pub struct RefProject {
     pub team_keys: Vec<String>,
 }
 
+/// A Linear document of an indexed project: title and link only, never its text.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RefDocument {
+    pub id: String,
+    pub title: String,
+    pub url: String,
+    /// The UUID of the indexed project it belongs to.
+    pub project_id: String,
+    pub project_name: String,
+    /// When Linear last updated it, in epoch milliseconds; 0 where unread.
+    pub updated_ms: i64,
+}
+
+/// An RFC 3339 timestamp as epoch milliseconds.
+pub fn iso_ms(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|t| t.timestamp_millis())
+}
+
+/// Newest update first (ties by id, so the order is stable), cut at `cap`.
+pub fn newest_documents(mut rows: Vec<RefDocument>, cap: usize) -> Vec<RefDocument> {
+    rows.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms).then_with(|| a.id.cmp(&b.id)));
+    rows.dedup_by(|a, b| a.id == b.id);
+    rows.truncate(cap);
+    rows
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RefPr {
     pub repo: String,
@@ -92,6 +120,10 @@ pub struct RefIndex {
     /// it, which then reads as empty.
     #[serde(default)]
     pub projects: Vec<RefProject>,
+    /// The Linear documents of those projects, newest update first; absent
+    /// from an index written before it, which then reads as empty.
+    #[serde(default)]
+    pub documents: Vec<RefDocument>,
 }
 
 /// What one desk's index is drawn from.
@@ -118,6 +150,7 @@ impl Scope {
 pub struct Fetched {
     pub issues: Option<Vec<RefIssue>>,
     pub projects: Option<Vec<RefProject>>,
+    pub documents: Option<Vec<RefDocument>>,
     /// Per repo of the scope, in its order.
     pub prs: Vec<(String, Option<Vec<RefPr>>)>,
 }
@@ -166,6 +199,19 @@ pub async fn fetch(linear_accounts: &[Account], gh: &[Account], scope: &Scope) -
             }
         },
     };
+    // The documents are those of the projects just read; with no projects
+    // read there is nothing to ask about, and the rows already held stay.
+    let documents = match (&scope.linear, &projects) {
+        (None, _) => Some(vec![]),
+        (Some(_), None) => None,
+        (Some(b), Some(ps)) => match linear::scope_documents(linear_accounts, b, ps, DOCUMENTS_CAP).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("reference index: Linear documents: {e:#}");
+                None
+            }
+        },
+    };
     let mut prs = vec![];
     for repo in &scope.repos {
         let got = match github::repo_prs(gh, repo, PRS_PER_REPO).await {
@@ -177,7 +223,7 @@ pub async fn fetch(linear_accounts: &[Account], gh: &[Account], scope: &Scope) -
         };
         prs.push((repo.clone(), got));
     }
-    Fetched { issues, projects, prs }
+    Fetched { issues, projects, documents, prs }
 }
 
 /// The issue keys in a PR's title or branch, in order, once each — the
@@ -364,7 +410,7 @@ impl Store {
         let changed = {
             let mut inner = self.lock();
             let parts = usize::from(scope.linear.is_some()) + scope.repos.len();
-            let ok = usize::from(scope.linear.is_some() && (got.issues.is_some() || got.projects.is_some())) + got.prs.iter().filter(|(_, p)| p.is_some()).count();
+            let ok = usize::from(scope.linear.is_some() && (got.issues.is_some() || got.projects.is_some() || got.documents.is_some())) + got.prs.iter().filter(|(_, p)| p.is_some()).count();
             let old = inner.desks.get(desk_id).cloned();
             let same_scope = old.as_ref().is_some_and(|o| o.linear_scope == linear_scope && o.repos == scope.repos);
             if parts > 0 && ok == 0 && (old.is_none() || same_scope) {
@@ -381,6 +427,11 @@ impl Store {
                 None if old.linear_scope == linear_scope => old.index.projects.clone(),
                 None => vec![],
             };
+            let documents = match got.documents {
+                Some(v) => v,
+                None if old.linear_scope == linear_scope => old.index.documents.clone(),
+                None => vec![],
+            };
             let known = prefixes(&issues, scope);
             let mut prs = vec![];
             for (repo, rows) in got.prs {
@@ -392,12 +443,12 @@ impl Store {
             for p in &mut prs {
                 p.keys = pr_keys(&p.title, &p.branch, &known);
             }
-            let moved = old.index.synced_ms.is_none() || old.index.issues != issues || old.index.projects != projects || old.index.prs != prs;
+            let moved = old.index.synced_ms.is_none() || old.index.issues != issues || old.index.projects != projects || old.index.documents != documents || old.index.prs != prs;
             if !moved && same_scope {
                 return false;
             }
             let synced_ms = if moved { Some(now) } else { old.index.synced_ms };
-            let index = RefIndex { desk_id: Some(desk_id.to_string()), synced_ms, issues, prs, projects };
+            let index = RefIndex { desk_id: Some(desk_id.to_string()), synced_ms, issues, prs, projects, documents };
             inner.desks.insert(desk_id.to_string(), Entry { linear_scope, repos: scope.repos.clone(), index });
             inner.version += 1;
             moved
@@ -483,7 +534,7 @@ mod tests {
         let dir = scratch();
         let s = Store::open(&dir);
         let sc = scope(&[]);
-        let with = |p: Option<Vec<RefProject>>| Fetched { issues: Some(vec![issue("ABC-1", "Done")]), projects: p, prs: vec![] };
+        let with = |p: Option<Vec<RefProject>>| Fetched { issues: Some(vec![issue("ABC-1", "Done")]), projects: p, documents: None, prs: vec![] };
         assert!(s.apply("k1", &sc, with(Some(vec![project("p1", "Alpha"), project("p2", "Beta")])), 100));
         let v = s.json(Some("k1"));
         assert_eq!(v["projects"][0]["name"], "Alpha");
@@ -502,6 +553,42 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    fn document(id: &str, title: &str, updated_ms: i64) -> RefDocument {
+        RefDocument { id: id.into(), title: title.into(), url: format!("https://linear.app/ws/document/{id}"), project_id: "p1".into(), project_name: "Alpha".into(), updated_ms }
+    }
+
+    #[test]
+    fn documents_are_newest_first_capped_kept_on_a_failed_fetch_dropped_on_a_changed_scope_and_move_synced_ms_on_a_retitle() {
+        let rows = vec![document("d1", "Old", 10), document("d2", "New", 30), document("d3", "Mid", 20)];
+        let top: Vec<String> = newest_documents(rows.clone(), 2).into_iter().map(|d| d.id).collect();
+        assert_eq!(top, ["d2", "d3"], "the cap keeps the newest");
+        let many: Vec<RefDocument> = (0..DOCUMENTS_CAP as i64 + 5).map(|i| document(&format!("d{i}"), "t", i)).collect();
+        let kept = newest_documents(many, DOCUMENTS_CAP);
+        assert_eq!((kept.len(), kept[0].updated_ms), (DOCUMENTS_CAP, DOCUMENTS_CAP as i64 + 4));
+        assert_eq!(iso_ms("2026-11-25T01:00:00.000Z"), Some(1_795_568_400_000));
+
+        let dir = scratch();
+        let s = Store::open(&dir);
+        let sc = scope(&[]);
+        let with = |d: Option<Vec<RefDocument>>| Fetched { issues: Some(vec![issue("ABC-1", "Done")]), projects: Some(vec![project("p1", "Alpha")]), documents: d, prs: vec![] };
+        assert!(s.apply("k1", &sc, with(Some(newest_documents(rows.clone(), 10))), 100));
+        let v = s.json(Some("k1"));
+        assert_eq!(v["documents"][0], serde_json::json!({"id": "d2", "title": "New", "url": "https://linear.app/ws/document/d2",
+            "project_id": "p1", "project_name": "Alpha", "updated_ms": 30}));
+        assert!(!s.apply("k1", &sc, with(None), 200), "a failed document fetch keeps the rows");
+        assert_eq!(s.json(Some("k1"))["documents"].as_array().unwrap().len(), 3);
+        assert_eq!(s.synced_ms("k1"), Some(100));
+        let mut retitled = rows.clone();
+        retitled[0].title = "Older".into();
+        assert!(s.apply("k1", &sc, with(Some(newest_documents(retitled, 10))), 300), "a retitle is a change");
+        assert_eq!(s.synced_ms("k1"), Some(300));
+        let mut other = scope(&[]);
+        other.linear.as_mut().unwrap().team_id = "t2".into();
+        assert!(s.apply("k1", &other, with(None), 400));
+        assert_eq!(s.json(Some("k1"))["documents"], serde_json::json!([]));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn a_refs_json_from_before_projects_loads_and_answers_an_empty_list() {
         let dir = scratch();
@@ -513,6 +600,7 @@ mod tests {
         let s = Store::open(&dir);
         assert_eq!(s.synced_ms("k1"), Some(5));
         assert_eq!(s.json(Some("k1"))["projects"], serde_json::json!([]));
+        assert_eq!(s.json(Some("k1"))["documents"], serde_json::json!([]));
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -551,7 +639,7 @@ mod tests {
         let dir = scratch();
         let s = Store::open(&dir);
         let v = s.json(Some("k1"));
-        assert_eq!(v, serde_json::json!({"desk_id": "k1", "synced_ms": null, "issues": [], "prs": [], "projects": []}));
+        assert_eq!(v, serde_json::json!({"desk_id": "k1", "synced_ms": null, "issues": [], "prs": [], "projects": [], "documents": []}));
         assert_eq!(s.synced_ms("k1"), None);
         std::fs::remove_dir_all(dir).ok();
     }
@@ -562,7 +650,7 @@ mod tests {
         let s = Store::open(&dir);
         let sc = scope(&["o/a", "o/b"]);
         let got = || Fetched {
-            projects: None,
+            projects: None, documents: None,
             issues: Some(vec![issue("ABC-12", "Done"), issue("ABC-7", "Canceled")]),
             prs: vec![
                 ("o/a".into(), Some(vec![pr("o/a", 7, "Widget", "user/abc-12-widget")])),
@@ -589,7 +677,7 @@ mod tests {
         let s = Store::open(&dir);
         let sc = scope(&["o/a", "o/b"]);
         let full = Fetched {
-            projects: None,
+            projects: None, documents: None,
             issues: Some(vec![issue("ABC-1", "Done")]),
             prs: vec![
                 ("o/a".into(), Some(vec![pr("o/a", 1, "ABC-1 one", "")])),
@@ -597,21 +685,21 @@ mod tests {
             ],
         };
         assert!(s.apply("k1", &sc, full, 100));
-        let partial = Fetched { issues: None, projects: None, prs: vec![("o/a".into(), Some(vec![])), ("o/b".into(), None)] };
+        let partial = Fetched { issues: None, projects: None, documents: None, prs: vec![("o/a".into(), Some(vec![])), ("o/b".into(), None)] };
         assert!(s.apply("k1", &sc, partial, 200), "o/a lost its PR");
         let v = s.json(Some("k1"));
         assert_eq!(v["issues"][0]["key"], "ABC-1");
         assert_eq!(v["prs"].as_array().unwrap().len(), 1);
         assert_eq!(v["prs"][0]["repo"], "o/b");
-        let failed = Fetched { issues: None, projects: None, prs: vec![("o/a".into(), None), ("o/b".into(), None)] };
+        let failed = Fetched { issues: None, projects: None, documents: None, prs: vec![("o/a".into(), None), ("o/b".into(), None)] };
         assert!(!s.apply("k1", &sc, failed, 300));
         assert_eq!(s.synced_ms("k1"), Some(200));
         // A desk moved to another team does not keep the old team's issues.
         let mut other = scope(&[]);
         other.linear.as_mut().unwrap().team_id = "t2".into();
-        assert!(s.apply("k1", &other, Fetched { issues: None, projects: None, prs: vec![] }, 400));
+        assert!(s.apply("k1", &other, Fetched { issues: None, projects: None, documents: None, prs: vec![] }, 400));
         assert_eq!(s.json(Some("k1"))["issues"], serde_json::json!([]));
-        assert!(!s.apply("k9", &sc, Fetched { issues: None, projects: None, prs: vec![("o/a".into(), None), ("o/b".into(), None)] }, 500));
+        assert!(!s.apply("k9", &sc, Fetched { issues: None, projects: None, documents: None, prs: vec![("o/a".into(), None), ("o/b".into(), None)] }, 500));
         assert_eq!(s.json(Some("k9"))["synced_ms"], Value::Null, "a first refresh that failed is no sync");
         std::fs::remove_dir_all(dir).ok();
     }
@@ -622,7 +710,7 @@ mod tests {
         let s = Store::open(&dir);
         let sc = scope(&["o/a"]);
         let got = Fetched {
-            projects: None,
+            projects: None, documents: None,
             issues: Some(vec![issue("ABC-12", "Done")]),
             prs: vec![("o/a".into(), Some(vec![pr("o/a", 7, "Widget", "user/abc-12-widget")]))],
         };
@@ -665,7 +753,7 @@ mod tests {
                 let (s, sc) = (&s, &sc);
                 t.spawn(move || {
                     for round in 1..=25 {
-                        let got = Fetched { issues: Some(vec![issue(&format!("ABC-{round}"), "Done")]), projects: None, prs: vec![] };
+                        let got = Fetched { issues: Some(vec![issue(&format!("ABC-{round}"), "Done")]), projects: None, documents: None, prs: vec![] };
                         assert!(s.apply(&format!("k{n}"), sc, got, round));
                     }
                 });
@@ -686,7 +774,7 @@ mod tests {
         let dir = scratch();
         let s = Store::open(&dir);
         let sc = scope(&[]);
-        let one = |key: &str| Fetched { issues: Some(vec![issue(key, "Done")]), projects: None, prs: vec![] };
+        let one = |key: &str| Fetched { issues: Some(vec![issue(key, "Done")]), projects: None, documents: None, prs: vec![] };
         assert!(s.apply("k1", &sc, one("ABC-1"), 100));
         {
             let mut inner = s.lock();
@@ -718,7 +806,7 @@ mod tests {
     fn a_save_the_file_already_holds_writes_nothing() {
         let dir = scratch();
         let s = Store::open(&dir);
-        assert!(s.apply("k1", &scope(&[]), Fetched { issues: Some(vec![issue("ABC-1", "Done")]), projects: None, prs: vec![] }, 100));
+        assert!(s.apply("k1", &scope(&[]), Fetched { issues: Some(vec![issue("ABC-1", "Done")]), projects: None, documents: None, prs: vec![] }, 100));
         let file = dir.join("refs.json");
         std::fs::write(&file, b"{}").unwrap();
         s.persist();

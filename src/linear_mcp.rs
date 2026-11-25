@@ -558,6 +558,39 @@ fn ref_project_from(p: &Value) -> Option<crate::refs::RefProject> {
     })
 }
 
+/// The documents of the given projects, one `list_documents` read per project,
+/// titles and links only (no `content` field is asked for). The tool's
+/// arguments (`projectId`, `orderBy`, `limit`, `cursor`, `fields`) are as the
+/// server's tool list gives them.
+pub async fn scope_documents(acct: &Account, projects: &[crate::refs::RefProject], cap: usize) -> Result<Vec<crate::refs::RefDocument>> {
+    let mut all = vec![];
+    for p in projects {
+        let id = p.id.as_str();
+        let rows = crate::refs::take_pages(cap, |after: Option<String>| async move {
+            let args = json!({ "limit": PAGE, "orderBy": "updatedAt", "projectId": id, "fields": ["title", "url", "updatedAt", "project"] });
+            let v = call(acct, "list_documents", scoped(args, None, after)).await?;
+            let rows: Vec<crate::refs::RefDocument> = v["documents"].as_array().into_iter().flatten().filter_map(|d| ref_document_from(d, id, &p.name)).collect();
+            Ok((rows, next_cursor(&v)))
+        })
+        .await?;
+        all.extend(rows);
+    }
+    Ok(crate::refs::newest_documents(all, cap))
+}
+
+/// One document row as the server spells it; a row that names no project
+/// takes the one it was listed under.
+fn ref_document_from(d: &Value, project_id: &str, project_name: &str) -> Option<crate::refs::RefDocument> {
+    Some(crate::refs::RefDocument {
+        id: d["id"].as_str()?.to_string(),
+        title: d["title"].as_str().unwrap_or_default().to_string(),
+        url: d["url"].as_str().unwrap_or_default().to_string(),
+        project_id: project_id.to_string(),
+        project_name: d["project"]["name"].as_str().or(d["project"].as_str()).unwrap_or(project_name).to_string(),
+        updated_ms: d["updatedAt"].as_str().and_then(crate::refs::iso_ms).unwrap_or(0),
+    })
+}
+
 fn project_rows(acct: &Account, v: &Value) -> Vec<Value> {
     v["projects"]
         .as_array()
@@ -648,6 +681,16 @@ pub async fn create_issue(acct: &Account, team_id: &str, title: &str, descriptio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_documents_row_reads_the_servers_spelling() {
+        let d = ref_document_from(&json!({ "id": "d1", "title": "Spec", "url": "https://linear.app/ws/document/spec-d1", "updatedAt": "2026-11-25T01:00:00.000Z",
+            "project": { "name": "Alpha" } }), "u1", "Fallback")
+        .unwrap();
+        assert_eq!((d.title.as_str(), d.project_id.as_str(), d.project_name.as_str(), d.updated_ms), ("Spec", "u1", "Alpha", 1_795_568_400_000));
+        assert_eq!(ref_document_from(&json!({ "id": "d2" }), "u1", "Fallback").unwrap().project_name, "Fallback");
+        assert!(ref_document_from(&json!({ "title": "no id" }), "u1", "A").is_none());
+    }
 
     #[test]
     fn a_projects_row_reads_the_servers_spelling() {

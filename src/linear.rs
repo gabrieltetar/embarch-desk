@@ -619,6 +619,50 @@ fn ref_project_from(n: &Value) -> Option<crate::refs::RefProject> {
     })
 }
 
+/// The Linear documents of the given projects (the reference index's own),
+/// titles and links only: trashed ones left out, newest update first up to
+/// `cap` (decision 56). A document's text is never requested.
+pub async fn scope_documents(accounts: &[Account], b: &LinearBinding, projects: &[crate::refs::RefProject], cap: usize) -> Result<Vec<crate::refs::RefDocument>> {
+    let acct = accounts
+        .iter()
+        .find(|a| a.label == b.account)
+        .ok_or_else(|| anyhow!("no Linear account {:?} connected", b.account))?;
+    if projects.is_empty() {
+        return Ok(vec![]);
+    }
+    if acct.mcp.is_some() {
+        return linear_mcp::scope_documents(acct, projects, cap).await;
+    }
+    let ids: Vec<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+    let q = "query($p: [ID!], $a: String) { documents(first: 100, after: $a, orderBy: updatedAt, \
+             filter: { project: { id: { in: $p } } }) { nodes { id title url trashed updatedAt project { id name } } \
+             pageInfo { hasNextPage endCursor } } }";
+    let ids = &ids;
+    let rows = crate::refs::take_pages(cap, |after: Option<String>| async move {
+        let d = gql(acct, q, json!({ "p": ids, "a": after })).await?;
+        let page = &d["documents"];
+        let rows: Vec<crate::refs::RefDocument> = page["nodes"].as_array().into_iter().flatten().filter_map(ref_document_from).collect();
+        let next = if page["pageInfo"]["hasNextPage"] == true { page["pageInfo"]["endCursor"].as_str().map(str::to_string) } else { None };
+        Ok((rows, next))
+    })
+    .await?;
+    Ok(crate::refs::newest_documents(rows, cap))
+}
+
+fn ref_document_from(n: &Value) -> Option<crate::refs::RefDocument> {
+    if n["trashed"] == true {
+        return None;
+    }
+    Some(crate::refs::RefDocument {
+        id: n["id"].as_str()?.to_string(),
+        title: n["title"].as_str().unwrap_or_default().to_string(),
+        url: n["url"].as_str().unwrap_or_default().to_string(),
+        project_id: n["project"]["id"].as_str().unwrap_or_default().to_string(),
+        project_name: n["project"]["name"].as_str().unwrap_or_default().to_string(),
+        updated_ms: n["updatedAt"].as_str().and_then(crate::refs::iso_ms).unwrap_or(0),
+    })
+}
+
 /// Every Linear project in every connected workspace, with its teams — what
 /// the desk form picks from.
 pub async fn projects(accounts: &[Account]) -> Result<Vec<Value>> {
@@ -988,6 +1032,15 @@ pub fn start_state(states: &[Value], current_type: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_documents_graphql_row_keeps_title_and_link_and_drops_a_trashed_one() {
+        let n = json!({ "id": "d1", "title": "Spec", "url": "https://linear.app/ws/document/spec-d1", "updatedAt": "2026-11-25T01:00:00.000Z",
+            "project": { "id": "u1", "name": "Alpha" } });
+        let d = ref_document_from(&n).unwrap();
+        assert_eq!((d.title.as_str(), d.project_id.as_str(), d.project_name.as_str(), d.updated_ms), ("Spec", "u1", "Alpha", 1_795_568_400_000));
+        assert!(ref_document_from(&json!({ "id": "d2", "trashed": true })).is_none());
+    }
 
     #[test]
     fn a_project_row_keeps_its_url_and_team_keys_and_a_trashed_one_goes() {
