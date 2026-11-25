@@ -527,6 +527,37 @@ pub async fn projects(acct: &Account) -> Result<Vec<Value>> {
     .await
 }
 
+/// The Linear projects in a desk's scope: the one a project-bound desk names
+/// (`get_project`), or a team's, archived ones included (`list_projects`).
+pub async fn scope_projects(acct: &Account, b: &LinearBinding, cap: usize) -> Result<Vec<crate::refs::RefProject>> {
+    if !b.project_id.is_empty() {
+        let v = call(acct, "get_project", json!({ "query": b.project_id })).await?;
+        return Ok(ref_project_from(if v["project"].is_object() { &v["project"] } else { &v }).into_iter().collect());
+    }
+    crate::refs::take_pages(cap, |after: Option<String>| async move {
+        let args = json!({
+            "limit": PAGE, "orderBy": "updatedAt", "includeArchived": true, "team": b.team_id,
+            "fields": ["uuid", "name", "status", "url", "teams"]
+        });
+        let v = call(acct, "list_projects", scoped(args, None, after)).await?;
+        let rows = v["projects"].as_array().into_iter().flatten().filter_map(ref_project_from).collect();
+        Ok((rows, next_cursor(&v)))
+    })
+    .await
+}
+
+/// One project row as the server spells it; a team is an object with a `key`
+/// or the key itself.
+fn ref_project_from(p: &Value) -> Option<crate::refs::RefProject> {
+    Some(crate::refs::RefProject {
+        id: p["uuid"].as_str().or(p["id"].as_str())?.to_string(),
+        name: p["name"].as_str().unwrap_or_default().to_string(),
+        state: p["status"]["type"].as_str().or(p["status"].as_str()).unwrap_or_default().to_string(),
+        url: p["url"].as_str().unwrap_or_default().to_string(),
+        team_keys: p["teams"].as_array().into_iter().flatten().filter_map(|t| t["key"].as_str().or(t.as_str()).map(str::to_string)).collect(),
+    })
+}
+
 fn project_rows(acct: &Account, v: &Value) -> Vec<Value> {
     v["projects"]
         .as_array()
@@ -617,6 +648,16 @@ pub async fn create_issue(acct: &Account, team_id: &str, title: &str, descriptio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_projects_row_reads_the_servers_spelling() {
+        let p = ref_project_from(&json!({ "uuid": "u1", "name": "Alpha", "status": { "type": "planned" }, "url": "https://linear.app/ws/project/a",
+            "teams": [{ "key": "ABC" }, "XY"] }))
+        .unwrap();
+        assert_eq!((p.id.as_str(), p.state.as_str(), p.url.as_str()), ("u1", "planned", "https://linear.app/ws/project/a"));
+        assert_eq!(p.team_keys, ["ABC", "XY"]);
+        assert!(ref_project_from(&json!({ "name": "no id" })).is_none());
+    }
 
     fn acct() -> Account {
         Account::new("client", "t")

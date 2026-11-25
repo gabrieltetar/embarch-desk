@@ -570,6 +570,55 @@ fn ref_issue_from(n: &Value) -> Option<crate::refs::RefIssue> {
     })
 }
 
+/// The Linear projects in a desk's scope: the one a project-bound desk names,
+/// or a team-bound desk's whole team, archived ones included and trashed ones
+/// not, newest update first up to `cap` (decision 56).
+pub async fn scope_projects(accounts: &[Account], b: &LinearBinding, cap: usize) -> Result<Vec<crate::refs::RefProject>> {
+    let acct = accounts
+        .iter()
+        .find(|a| a.label == b.account)
+        .ok_or_else(|| anyhow!("no Linear account {:?} connected", b.account))?;
+    let (field, id) = scope_filter(b);
+    if id.is_empty() {
+        return Ok(vec![]);
+    }
+    if acct.mcp.is_some() {
+        return linear_mcp::scope_projects(acct, b, cap).await;
+    }
+    const FIELDS: &str = "id name state url trashed teams { nodes { key } }";
+    if field == "project" {
+        let q = format!("query($p: String!) {{ project(id: $p) {{ {FIELDS} }} }}");
+        let d = gql(acct, &q, json!({ "p": id })).await?;
+        return Ok(ref_project_from(&d["project"]).into_iter().collect());
+    }
+    let q = format!(
+        "query($t: String!, $a: String) {{ team(id: $t) {{ projects(first: 100, after: $a, orderBy: updatedAt, includeArchived: true) \
+         {{ nodes {{ {FIELDS} }} pageInfo {{ hasNextPage endCursor }} }} }} }}"
+    );
+    let q = q.as_str();
+    crate::refs::take_pages(cap, |after: Option<String>| async move {
+        let d = gql(acct, q, json!({ "t": id, "a": after })).await?;
+        let page = &d["team"]["projects"];
+        let rows = page["nodes"].as_array().into_iter().flatten().filter_map(ref_project_from).collect();
+        let next = if page["pageInfo"]["hasNextPage"] == true { page["pageInfo"]["endCursor"].as_str().map(str::to_string) } else { None };
+        Ok((rows, next))
+    })
+    .await
+}
+
+fn ref_project_from(n: &Value) -> Option<crate::refs::RefProject> {
+    if n["trashed"] == true {
+        return None;
+    }
+    Some(crate::refs::RefProject {
+        id: n["id"].as_str()?.to_string(),
+        name: n["name"].as_str().unwrap_or_default().to_string(),
+        state: n["state"].as_str().unwrap_or_default().to_string(),
+        url: n["url"].as_str().unwrap_or_default().to_string(),
+        team_keys: n["teams"]["nodes"].as_array().into_iter().flatten().filter_map(|t| t["key"].as_str().map(str::to_string)).collect(),
+    })
+}
+
 /// Every Linear project in every connected workspace, with its teams — what
 /// the desk form picks from.
 pub async fn projects(accounts: &[Account]) -> Result<Vec<Value>> {
@@ -939,6 +988,16 @@ pub fn start_state(states: &[Value], current_type: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_project_row_keeps_its_url_and_team_keys_and_a_trashed_one_goes() {
+        let n = json!({ "id": "u1", "name": "Alpha", "state": "started", "url": "https://linear.app/ws/project/alpha-1", "trashed": false,
+            "teams": { "nodes": [{ "key": "ABC" }, { "key": "XY" }] } });
+        let p = ref_project_from(&n).unwrap();
+        assert_eq!((p.id.as_str(), p.state.as_str(), p.url.as_str()), ("u1", "started", "https://linear.app/ws/project/alpha-1"));
+        assert_eq!(p.team_keys, ["ABC", "XY"]);
+        assert!(ref_project_from(&json!({ "id": "u2", "trashed": true })).is_none());
+    }
 
     #[test]
     fn blocked_by_reads_inverse_blocks_and_direct_blocked_by() {

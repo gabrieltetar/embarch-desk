@@ -5149,6 +5149,13 @@ mod tests {
                     keys: vec![],
                 }]),
             )],
+            projects: Some(vec![refs::RefProject {
+                id: "u1".into(),
+                name: "Alpha".into(),
+                state: "started".into(),
+                url: "https://linear.app/ws/project/alpha-1".into(),
+                team_keys: vec!["ABC".into()],
+            }]),
         };
         (scope, got)
     }
@@ -5170,15 +5177,16 @@ mod tests {
         let (app, dir) = scratch_app();
         let a = app.db.write(|st| st.put_desk(store::Desk { name: "Alpha".into(), ..Default::default() }, D0));
         let b = app.db.write(|st| st.put_desk(store::Desk { name: "Beta".into(), ..Default::default() }, D0));
-        assert_eq!(get_refs(&app, None).await.unwrap(), json!({"desk_id": null, "synced_ms": null, "issues": [], "prs": []}), "no desk open");
+        assert_eq!(get_refs(&app, None).await.unwrap(), json!({"desk_id": null, "synced_ms": null, "issues": [], "prs": [], "projects": []}), "no desk open");
         app.db.write(|st| st.ui_desk = Some(a.clone()));
-        assert_eq!(get_refs(&app, None).await.unwrap(), json!({"desk_id": a, "synced_ms": null, "issues": [], "prs": []}), "empty before the first sync");
+        assert_eq!(get_refs(&app, None).await.unwrap(), json!({"desk_id": a, "synced_ms": null, "issues": [], "prs": [], "projects": []}), "empty before the first sync");
         assert_eq!(get_refs(&app, Some("k404")).await, Err(StatusCode::NOT_FOUND));
         let (scope, got) = refs_index();
         assert!(app.refs.apply(&b, &scope, got, D0 + H));
         let want = json!({
             "desk_id": b, "synced_ms": D0 + H,
             "issues": [{"key": "ABC-12", "title": "Add the widget", "state": "Done", "url": "https://linear.app/ws/issue/ABC-12"}],
+            "projects": [{"id": "u1", "name": "Alpha", "state": "started", "url": "https://linear.app/ws/project/alpha-1", "team_keys": ["ABC"]}],
             "prs": [{"repo": "owner/repo", "number": 7, "title": "Widget", "state": "merged", "draft": false,
                      "url": "https://github.com/owner/repo/pull/7", "branch": "feature/abc-12-widget", "keys": ["ABC-12"]}],
         });
@@ -5389,7 +5397,7 @@ mod tests {
                                 // A network that drops packets: the first fetch hangs until let go.
                                 gate.wait_for(|o| *o).await.ok();
                             }
-                            refs::Fetched { issues: None, prs: scope.repos.iter().map(|r| (r.clone(), Some(vec![]))).collect() }
+                            refs::Fetched { issues: None, projects: None, prs: scope.repos.iter().map(|r| (r.clone(), Some(vec![]))).collect() }
                         }
                     })
                     .await
