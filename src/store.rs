@@ -1170,8 +1170,8 @@ impl State {
             .unwrap_or_else(|| self.computed_hours(item_id, date))
     }
 
-    /// Why a tile cannot take part in a move (decision 92), naming its
-    /// state; `None` for an open one.
+    /// Why a tile cannot take part in a move (decision 92) or take an
+    /// agent's typed hours (93), naming its state; `None` for an open one.
     fn unmovable(&self, item_id: &str, date: &str) -> Option<String> {
         let t = self.tiles.get(&format!("{item_id}@{date}"))?;
         match t.status {
@@ -1253,6 +1253,32 @@ impl State {
             self.notes_moved(from, before_from, now);
             self.notes_moved(to, before_to, now);
         }
+        Ok(())
+    }
+
+    /// Type an open tile's hours at the owner's ask (decision 93), or with
+    /// `None` clear them back to computed. The tile is made when its item
+    /// has a card but no time that day. Nothing reaches Harvest before the
+    /// owner's ✓, and nothing changes on a refusal.
+    pub fn set_hours(&mut self, item_id: &str, date: &str, hours: Option<f64>) -> Result<(), String> {
+        if !is_date(date) {
+            return Err("a tile names a YYYY-MM-DD date".into());
+        }
+        if hours.is_some_and(|h| !h.is_finite() || !(0.0..=24.0).contains(&h)) {
+            return Err("hours must be a number from 0 to 24".into());
+        }
+        match self.items.get(item_id) {
+            None => return Err(format!("no work item {item_id}")),
+            Some(i) if i.archived => return Err(format!("work item {item_id} is archived; its tile would not show on the Desk tab")),
+            Some(_) => {}
+        }
+        if let Some(why) = self.unmovable(item_id, date) {
+            return Err(format!("this tile {why}; only an open tile takes typed hours"));
+        }
+        if hours.is_none() && !self.tiles.contains_key(&format!("{item_id}@{date}")) {
+            return Ok(());
+        }
+        self.tile_mut(item_id, date).hours_override = hours.map(round_hours);
         Ok(())
     }
 

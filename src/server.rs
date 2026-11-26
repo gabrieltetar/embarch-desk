@@ -155,6 +155,7 @@ pub fn router(app: Shared) -> Router {
         .route("/tiles/{id}/discard", post(discard_tile))
         .route("/tiles/{id}/fold", post(fold_tile))
         .route("/tiles/{id}/move", post(move_tile))
+        .route("/tiles/{id}/hours", post(set_tile_hours))
         .route("/harvest/targets", get(harvest_targets))
         .route("/connectors", get(list_connectors).post(add_connector))
         .route("/connectors/{kind}/{label}", delete(remove_connector))
@@ -1567,6 +1568,36 @@ async fn move_tile(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<Mo
         Ok::<_, ApiError>(to)
     })?;
     Ok(Json(app.db.read(|st| json!({ "from": tile_json(st, &item, &date), "to": tile_json(st, &to, &date) }))))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HoursBody {
+    /// A number types the tile's hours, `null` clears them back to computed.
+    /// Required: serde refuses a missing field that has `deserialize_with`,
+    /// so a slip clears nothing.
+    #[serde(deserialize_with = "number_or_null")]
+    hours: Option<f64>,
+}
+
+fn number_or_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    Option::<f64>::deserialize(d)
+}
+
+/// An agent types an open tile's hours at the owner's ask, or clears them
+/// (decision 93). The tile's item is a desk item id or an issue key.
+/// Answers the tile.
+async fn set_tile_hours(Ax(app): Ax<Shared>, Path(id): Path<String>, Json(b): Json<HoursBody>) -> ApiResult {
+    let (item, date) = split_tile_id(&id)?;
+    let hours = b.hours;
+    let item = app.db.write(|st| {
+        let t = item.trim();
+        let w = st.items.get(t).map(|i| i.id.clone()).or_else(|| st.item_by_key(t).map(|i| i.id.clone()));
+        let w = w.ok_or_else(|| missing(format!("no work item {t:?}: not an issue key or a desk item id on any desk; desk_create_item makes one from an issue key")))?;
+        st.set_hours(&w, &date, hours).map_err(bad)?;
+        Ok::<_, ApiError>(w)
+    })?;
+    Ok(Json(app.db.read(|st| tile_json(st, &item, &date))))
 }
 
 // ---------------------------------------------------------------- connectors
@@ -4545,6 +4576,84 @@ mod tests {
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert!(msg.contains("sent"), "{msg}");
         assert!(serde_json::from_value::<MoveBody>(json!({"to_item": b, "hours": 1, "into": "x"})).is_err(), "an unknown field is refused");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn typed_hours_set_an_open_tile_make_a_cards_tile_and_clear_back_to_computed() {
+        let mut st = State::default();
+        let (a, b, _) = three_items_one_day(&mut st);
+        let hours = |st: &State, w: &str| tile_json(st, w, "2026-10-22")["hours"].as_f64();
+
+        st.set_hours(&a, "2026-10-22", Some(1.234)).unwrap();
+        assert_eq!(hours(&st, &a), Some(1.23), "to the hundredth");
+        let d = day_json(&st, &Cache::default(), "2026-10-22", D0 + 15 * H);
+        assert!((d["unsent_hours"].as_f64().unwrap() - 2.23).abs() < 1e-9, "typed hours change the day's total, unlike a move: {}", d["unsent_hours"]);
+
+        assert!(!st.tile_keys().contains(&(b.clone(), "2026-10-22".into())));
+        st.set_hours(&b, "2026-10-22", Some(0.75)).unwrap();
+        assert_eq!(hours(&st, &b), Some(0.75), "a card with no time that day gets its tile");
+        assert_eq!(tile_json(&st, &b, "2026-10-22")["status"], "open");
+
+        st.set_hours(&a, "2026-10-22", None).unwrap();
+        assert_eq!(hours(&st, &a), Some(5.0), "null goes back to computed");
+        let before = serde_json::to_string(&st.tiles).unwrap();
+        st.set_hours(&a, "2026-10-23", None).unwrap();
+        assert_eq!(serde_json::to_string(&st.tiles).unwrap(), before, "clearing a day with no tile makes none");
+    }
+
+    #[test]
+    fn typed_hours_on_a_sent_discarded_folded_or_archived_tile_are_refused_naming_why_and_change_nothing() {
+        let mut st = State::default();
+        let (a, b, _) = three_items_one_day(&mut st);
+        let set = |st: &mut State, s: TileStatus| st.tile_mut(&a, "2026-10-22").status = s;
+        let refused = |st: &mut State, w: &str, date: &str, h: Option<f64>| -> String {
+            let before = serde_json::to_string(&st.tiles).unwrap();
+            let e = st.set_hours(w, date, h).expect_err("set");
+            assert_eq!(serde_json::to_string(&st.tiles).unwrap(), before, "a refusal changed a tile: {e}");
+            e
+        };
+        assert!(refused(&mut st, &a, "2026-10-22", Some(24.5)).contains("0 to 24"));
+        assert!(refused(&mut st, &a, "2026-10-22", Some(-1.0)).contains("0 to 24"));
+        assert!(refused(&mut st, &a, "2026-10-22", Some(f64::NAN)).contains("0 to 24"));
+        assert!(refused(&mut st, &a, "2026-10-2", Some(1.0)).contains("YYYY-MM-DD"));
+        assert!(refused(&mut st, "w-none", "2026-10-22", Some(1.0)).contains("no work item w-none"));
+
+        set(&mut st, TileStatus::Approved);
+        assert!(refused(&mut st, &a, "2026-10-22", Some(1.0)).contains("already in Harvest (sent)"));
+        assert!(refused(&mut st, &a, "2026-10-22", None).contains("already in Harvest (sent)"));
+        set(&mut st, TileStatus::Discarded);
+        assert!(refused(&mut st, &a, "2026-10-22", Some(1.0)).contains("was discarded"));
+        set(&mut st, TileStatus::Folded);
+        st.tile_mut(&a, "2026-10-22").folded_into = Some("2026-10-24".into());
+        assert!(refused(&mut st, &a, "2026-10-22", Some(1.0)).contains("was folded into 2026-10-24"));
+
+        st.items.get_mut(&b).unwrap().archived = true;
+        assert!(refused(&mut st, &b, "2026-10-22", Some(1.0)).contains("archived"));
+        assert!(!st.tiles.contains_key(&format!("{b}@2026-10-22")), "no tile was made");
+    }
+
+    #[tokio::test]
+    async fn the_hours_route_takes_an_issue_key_or_an_item_id_and_needs_the_hours_field() {
+        let (app, dir) = scratch_app();
+        let (a, b, _) = app.db.write(three_items_one_day);
+        let body = |v: Value| Json(serde_json::from_value::<HoursBody>(v).unwrap());
+        let Ok(Json(v)) = set_tile_hours(Ax(app.clone()), Path("abc-2@2026-10-22".into()), body(json!({"hours": 0.92}))).await else { panic!("by key") };
+        assert_eq!((v["id"].as_str(), v["hours"].as_f64()), (Some(format!("{b}@2026-10-22").as_str()), Some(0.92)), "{v}");
+        let tile = format!("{a}@2026-10-22");
+        let Ok(Json(v)) = set_tile_hours(Ax(app.clone()), Path(tile.clone()), body(json!({"hours": 2}))).await else { panic!("by id") };
+        assert_eq!(v["hours"], 2.0);
+        let Ok(Json(v)) = set_tile_hours(Ax(app.clone()), Path(tile.clone()), body(json!({"hours": null}))).await else { panic!("clear") };
+        assert_eq!(v["hours"], 5.0);
+        assert!(serde_json::from_value::<HoursBody>(json!({})).is_err(), "a body without hours clears nothing");
+        assert!(serde_json::from_value::<HoursBody>(json!({"hours": 1, "note": "x"})).is_err(), "an unknown field is refused");
+        let Err(ApiError(code, msg)) = set_tile_hours(Ax(app.clone()), Path("NOPE-1@2026-10-22".into()), body(json!({"hours": 1}))).await else { panic!("unknown") };
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert!(msg.contains("NOPE-1"), "{msg}");
+        app.db.write(|st| st.tile_mut(&a, "2026-10-22").status = TileStatus::Approved);
+        let Err(ApiError(code, msg)) = set_tile_hours(Ax(app.clone()), Path(tile), body(json!({"hours": 1}))).await else { panic!("sent") };
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("sent"), "{msg}");
         std::fs::remove_dir_all(dir).ok();
     }
 

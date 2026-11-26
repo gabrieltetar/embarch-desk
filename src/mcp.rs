@@ -115,6 +115,23 @@ pub struct MoveParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SetHoursParams {
+    /// The tile: `<item id>@<YYYY-MM-DD>` as desk_day lists it under `tile`, or `<issue key>@<YYYY-MM-DD>`. Its item needs a card; desk_create_item makes one from an issue key.
+    pub tile: String,
+    /// Required. The hours to type, 0 to 24, to the hundredth; null clears the typed hours back to what the desk computed.
+    #[serde(deserialize_with = "number_or_null")]
+    #[schemars(required, extend("type" = ["number", "null"]))]
+    pub hours: Option<f64>,
+}
+
+/// A missing `hours` is refused rather than read as null, so a slip never
+/// clears typed hours: serde reports a missing field that has
+/// `deserialize_with`.
+fn number_or_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    <Option<f64> as serde::Deserialize>::deserialize(d)
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct CreateParams {
     /// A Linear issue key (`ABC-123`).
     #[serde(default)]
@@ -527,6 +544,14 @@ impl DeskMcp {
         }
     }
 
+    #[tool(description = "Type an open tile's hours, when the user asks you to change a day's time on a work item: dropping idle time, or setting the hours a split should land on. Unlike desk_move_hours it changes the day's total. The tile is made when the item has a card but no time that day; null hours clears the typed value back to what the desk computed. A typed value stops a tile that is still counting (today's, with a live session) from counting further, as on the Desk tab. The tile stays open for the user's check mark on the Desk tab; nothing reaches Harvest. A sent, discarded or folded tile is refused with its state. Answers the tile.")]
+    async fn desk_set_hours(&self, Parameters(p): Parameters<SetHoursParams>) -> Result<CallToolResult, McpError> {
+        match self.client.post(&format!("/tiles/{}/hours", crate::uri::encode(p.tile.trim())), json!({ "hours": p.hours })).await {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        }
+    }
+
     #[tool(description = "Create a work item: from a Linear issue_key, or a standalone one from a title. Returns its id; an issue that already has a card returns that card.")]
     async fn desk_create_item(&self, Parameters(p): Parameters<CreateParams>) -> Result<CallToolResult, McpError> {
         match self.client.post("/items", json!({ "issue_key": p.issue_key, "title": p.title, "desk": p.desk })).await {
@@ -762,9 +787,9 @@ impl ServerHandler for DeskMcp {
              connected workspaces' team keys with linear_teams; read a pull request's review threads with github_pr_threads and propose replies to them with github_draft_review_replies; restack a stacked branch onto its moved base with desk_restack and its resolve, continue and abort steps; \
              move a status with linear_set_status; propose a comment, an issue or a change to one with linear_draft_comment, \
              linear_draft_issue or linear_draft_edit — they wait for the user's Send on the Desk tab; change one still waiting with desk_revise_draft, which keeps the user's edits, and read what the user changed with desk_get_draft. Read Harvest with \
-             harvest_entries and harvest_projects; time is never logged from a session: add notes with \
-             desk_add_line and the user sends the tile. Read any day's tiles with desk_day, and split a tile's hours \
-             across work items with desk_move_hours; the moved tiles still wait for the user's send. A rule the user sets for every session in this desk's \
+             harvest_entries and harvest_projects; time is never logged to Harvest from a session: add notes with \
+             desk_add_line and the user sends the tile. Read any day's tiles with desk_day; when the user asks, split a tile's hours \
+             across work items with desk_move_hours and type a tile's hours with desk_set_hours; those tiles still wait for the user's send. A rule the user sets for every session in this desk's \
              repos (always, never, from now on, in this repo) is a desk note, added with desk_add_desk_note, \
              never a line. desk_timer_start/stop track work away from Claude. \
              The session's context carries its desk session id; when the desk asks which work item a session \

@@ -53,10 +53,11 @@ A desk can hold **standing notes**: working agreements for every session in its 
 
 ## Harvest and time
 
-- **Never log time from a session.** There is no tool for it, by design: the session's time is already captured on its tile.
+- **Never log time to Harvest from a session.** There is no tool for it, by design: the session's time is already captured on its tile, and only the user's ✓ sends it.
 - Read what is logged with `harvest_entries` (default this week) and `harvest_projects`.
 - Read any day's tiles as the desk holds them with `desk_day`: each work item's tile id, hours, status and lines with their ids, and the Harvest entries no card claims.
 - **When the user asks to split a day's time across work items**, move hours (and, by id, the lines that go with them) from one item's open tile to another item's tile on the same day with `desk_move_hours`. The target needs a card (`desk_create_item` makes one from an issue key); its tile is made if it has no time that day. Both tiles keep waiting for the user's ✓, so a move never reaches Harvest. Check the result against `desk_day`.
+- **When the user asks to change a tile's hours** — drop idle time, or set what a split should land on — type them with `desk_set_hours` (a tile id or `<issue key>@<date>`, and the hours; `null` goes back to computed). Unlike a move it changes the day's total, so do it only at the user's ask. The tile is made for a card with no time that day, and it keeps waiting for the user's ✓. Check the result against `desk_day`.
 - "Start tracking X" / "stop tracking" for work away from Claude — the bench, a call, a meeting — is `desk_timer_start` / `desk_timer_stop`.
 
 ## The work item
