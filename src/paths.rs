@@ -21,6 +21,11 @@ fn home() -> Result<PathBuf> {
 
 /// `EMBARCH_DESK_CONFIG_DIR` overrides it, which is how the tests and a
 /// scratch instance stay off the real files.
+///
+/// This rule is written three times; a change to it moves all three in
+/// the same pass as the two client copies: `embarch-api`'s
+/// `crates/embarch-core-client/src/desk_discovery.rs` and `embarch-chat`'s
+/// `src/desk/rule.ts`.
 pub fn config_dir() -> Result<PathBuf> {
     if let Some(d) = std::env::var_os("EMBARCH_DESK_CONFIG_DIR") {
         return Ok(PathBuf::from(d));
@@ -32,6 +37,8 @@ pub fn config_dir() -> Result<PathBuf> {
     Ok(base.join("embarch-desk"))
 }
 
+/// Same rule as `config_dir`, over `EMBARCH_DESK_DATA_DIR`; the client copies
+/// (`desk_discovery.rs`, `rule.ts`) must change with it.
 pub fn data_dir() -> Result<PathBuf> {
     if let Some(d) = std::env::var_os("EMBARCH_DESK_DATA_DIR") {
         return Ok(PathBuf::from(d));
@@ -43,6 +50,8 @@ pub fn data_dir() -> Result<PathBuf> {
     Ok(base.join("embarch-desk"))
 }
 
+/// Same rule as `config_dir`; the client copies (`desk_discovery.rs`,
+/// `rule.ts`) must change with it.
 pub fn port() -> u16 {
     std::env::var("EMBARCH_DESK_PORT")
         .ok()
@@ -80,7 +89,8 @@ pub fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 /// The bearer the desk checks, generated on first read. Hooks, the MCP
-/// server and `embarch-ui` all run as the same user and read the same file.
+/// server and `embarch-ui` all run as the same user and read the same file. The file name and location are part of the
+/// rule the two client copies repeat (`desk_discovery.rs`, `rule.ts`).
 pub fn desk_token() -> Result<String> {
     let path = config_dir()?.join("desk-token");
     if let Ok(t) = std::fs::read_to_string(&path) {
