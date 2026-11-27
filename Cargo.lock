@@ -407,6 +407,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "embarch-user-unit",
  "getrandom 0.2.17",
  "reqwest",
  "ring",
@@ -418,6 +419,13 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "embarch-user-unit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]

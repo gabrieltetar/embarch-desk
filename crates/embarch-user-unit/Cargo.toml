@@ -1,0 +1,9 @@
+[package]
+name = "embarch-user-unit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Writes and drives a systemd user unit for an EmbArch binary: unit text quoted for a WSL PATH, the unit's folder, and a systemctl --user wrapper. std and anyhow only."
+
+[dependencies]
+anyhow = "1.0.103"

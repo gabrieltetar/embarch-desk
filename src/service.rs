@@ -6,9 +6,8 @@
 //! binary under `embarch-desk-NAME.service`, with its own port, config and
 //! data folders, and its own Claude login and `gh` account.
 
-use anyhow::{bail, ensure, Context, Result};
-use std::path::PathBuf;
-use std::process::Command;
+use anyhow::{ensure, Context, Result};
+use embarch_user_unit::{xdg_dir, Unit};
 
 const UNIT: &str = "embarch-desk.service";
 
@@ -50,8 +49,8 @@ impl Instance {
         let port = port.context("an instance needs its own --port")?;
         ensure!(port != crate::paths::DEFAULT_PORT, "port {port} is the first desk's");
         Ok(Some(Instance {
-            config_dir: xdg("XDG_CONFIG_HOME", &[".config"])?.join(format!("embarch-desk-{name}")).display().to_string(),
-            data_dir: xdg("XDG_DATA_HOME", &[".local", "share"])?.join(format!("embarch-desk-{name}")).display().to_string(),
+            config_dir: xdg_dir("XDG_CONFIG_HOME", &[".config"])?.join(format!("embarch-desk-{name}")).display().to_string(),
+            data_dir: xdg_dir("XDG_DATA_HOME", &[".local", "share"])?.join(format!("embarch-desk-{name}")).display().to_string(),
             name,
             port,
             claude_config_dir,
@@ -77,17 +76,6 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn xdg(var: &str, under_home: &[&str]) -> Result<PathBuf> {
-    match std::env::var_os(var).filter(|s| !s.is_empty()) {
-        Some(x) => Ok(PathBuf::from(x)),
-        None => {
-            let mut p = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
-            p.extend(under_home);
-            Ok(p)
-        }
-    }
-}
-
 fn unit_name(instance: Option<&str>) -> Result<String> {
     match instance {
         None => Ok(UNIT.to_string()),
@@ -98,16 +86,6 @@ fn unit_name(instance: Option<&str>) -> Result<String> {
     }
 }
 
-fn unit_path(unit: &str) -> Result<PathBuf> {
-    Ok(xdg("XDG_CONFIG_HOME", &[".config"])?.join("systemd").join("user").join(unit))
-}
-
-/// One word of a unit line, double-quoted so a space stays inside it: `\`
-/// and `"` escaped, `%` doubled because systemd expands specifiers.
-fn quoted(word: &str) -> String {
-    format!("\"{}\"", word.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%"))
-}
-
 /// The unit text. PATH is carried over from the installing shell: the desk
 /// runs `claude`, `gh`, `git` and `wslpath`, and a user service starts with
 /// systemd's bare default PATH, which has none of the user's own bins. Under
@@ -116,18 +94,15 @@ fn quoted(word: &str) -> String {
 /// assignment and the binary's path are quoted; `$` is doubled in ExecStart
 /// alone, the one of the two that expands variables.
 pub fn unit_text(exe: &str, path_env: &str, instance: Option<&Instance>) -> String {
-    let exe = quoted(&exe.replace('$', "$$"));
-    let mut env = vec![quoted(&format!("PATH={path_env}"))];
+    let mut vars: Vec<(&str, String)> = Vec::new();
     let mut description = "EmbArch desk: work items, connectors and time tiles".to_string();
     if let Some(i) = instance {
         description = format!("EmbArch desk ({}): work items and connectors", i.name);
-        let mut vars = vec![
-            ("EMBARCH_DESK_PORT", i.port.to_string()),
-            ("EMBARCH_DESK_CONFIG_DIR", i.config_dir.clone()),
-            ("EMBARCH_DESK_DATA_DIR", i.data_dir.clone()),
-            ("EMBARCH_DESK_TIME", if i.time { "on" } else { "off" }.to_string()),
-            ("EMBARCH_DESK_DIRECT_WRITES", if i.direct_writes { "on" } else { "off" }.to_string()),
-        ];
+        vars.push(("EMBARCH_DESK_PORT", i.port.to_string()));
+        vars.push(("EMBARCH_DESK_CONFIG_DIR", i.config_dir.clone()));
+        vars.push(("EMBARCH_DESK_DATA_DIR", i.data_dir.clone()));
+        vars.push(("EMBARCH_DESK_TIME", if i.time { "on" } else { "off" }.to_string()));
+        vars.push(("EMBARCH_DESK_DIRECT_WRITES", if i.direct_writes { "on" } else { "off" }.to_string()));
         if let Some(d) = &i.claude_config_dir {
             vars.push(("CLAUDE_CONFIG_DIR", d.clone()));
         }
@@ -140,60 +115,28 @@ pub fn unit_text(exe: &str, path_env: &str, instance: Option<&Instance>) -> Stri
         if let Some(d) = &i.suite_docs {
             vars.push(("EMBARCH_DESK_SUITE_DOCS", d.clone()));
         }
-        env.extend(vars.into_iter().map(|(k, v)| quoted(&format!("{k}={v}"))));
     }
-    let env: String = env.iter().map(|e| format!("Environment={e}\n")).collect();
-    format!(
-        "[Unit]\n\
-         Description={description}\n\
-         After=network-online.target\n\n\
-         [Service]\n\
-         ExecStart={exe} serve\n\
-         {env}\
-         Restart=on-failure\n\
-         RestartSec=5\n\n\
-         [Install]\n\
-         WantedBy=default.target\n"
-    )
-}
-
-fn systemctl(args: &[&str]) -> Result<String> {
-    let out = Command::new("systemctl").arg("--user").args(args).output().context("running systemctl --user")?;
-    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    if !out.status.success() && args[0] != "status" {
-        bail!("systemctl --user {}: {}", args.join(" "), text.trim());
-    }
-    Ok(text)
+    embarch_user_unit::unit_text(&Unit { description: &description, exe, args: &["serve"], path_env, vars: &vars })
 }
 
 pub fn install(instance: Option<Instance>) -> Result<()> {
     let unit = instance.as_ref().map_or_else(|| UNIT.to_string(), Instance::unit);
     let exe = std::env::current_exe()?.canonicalize()?;
     let path_env = std::env::var("PATH").unwrap_or_default();
-    let p = unit_path(&unit)?;
-    std::fs::create_dir_all(p.parent().expect("unit dir"))?;
-    std::fs::write(&p, unit_text(&exe.display().to_string(), &path_env, instance.as_ref()))?;
-    systemctl(&["daemon-reload"])?;
-    systemctl(&["enable", "--now", &unit])?;
-    systemctl(&["restart", &unit])?;
+    let text = unit_text(&exe.display().to_string(), &path_env, instance.as_ref());
+    let p = embarch_user_unit::install(&unit, &text)?;
     println!("installed {} → {} serve; it starts with your user session", p.display(), exe.display());
     Ok(())
 }
 
 pub fn uninstall(instance: Option<&str>) -> Result<()> {
-    let unit = unit_name(instance)?;
-    let _ = systemctl(&["disable", "--now", &unit]);
-    let p = unit_path(&unit)?;
-    if p.exists() {
-        std::fs::remove_file(&p)?;
-    }
-    systemctl(&["daemon-reload"])?;
+    let p = embarch_user_unit::uninstall(&unit_name(instance)?)?;
     println!("removed {}; your state and tokens are untouched", p.display());
     Ok(())
 }
 
 pub fn status(instance: Option<&str>) -> Result<()> {
-    print!("{}", systemctl(&["status", "--no-pager", &unit_name(instance)?])?);
+    print!("{}", embarch_user_unit::status(&unit_name(instance)?)?);
     Ok(())
 }
 
@@ -207,17 +150,26 @@ mod tests {
         assert!(u.contains("WantedBy=default.target"));
     }
 
+    /// The text the desk wrote before the writer moved to `embarch-user-unit`,
+    /// pinned byte for byte, for the first desk and for an instance.
     #[test]
-    fn a_path_with_spaces_stays_one_assignment() {
-        let u = super::unit_text(
-            "/h/My Apps/$x/embarch-desk",
-            "/h/.local/bin:/mnt/c/Program Files/Git/cmd:/mnt/c/Users/u/AppData/Local/Programs/Microsoft VS Code/bin:/mnt/c/50%\\\"q\"",
-            None,
-        );
-        assert!(u.contains("\nExecStart=\"/h/My Apps/$$x/embarch-desk\" serve\n"));
-        assert!(u.contains(
-            "\nEnvironment=\"PATH=/h/.local/bin:/mnt/c/Program Files/Git/cmd:/mnt/c/Users/u/AppData/Local/Programs/Microsoft VS Code/bin:/mnt/c/50%%\\\\\\\"q\\\"\"\n"
-        ));
+    fn the_unit_text_is_what_the_desk_always_wrote() {
+        let first = "[Unit]\nDescription=EmbArch desk: work items, connectors and time tiles\nAfter=network-online.target\n\n[Service]\nExecStart=\"/h/My Apps/$$x/embarch-desk\" serve\nEnvironment=\"PATH=/usr/bin:/mnt/c/Program Files/Git\"\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n";
+        assert_eq!(super::unit_text("/h/My Apps/$x/embarch-desk", "/usr/bin:/mnt/c/Program Files/Git", None), first);
+        let i = super::Instance {
+            name: "dev".into(),
+            port: 4892,
+            config_dir: "/c".into(),
+            data_dir: "/d".into(),
+            claude_config_dir: Some("/cl".into()),
+            gh_config_dir: None,
+            time: true,
+            direct_writes: false,
+            suite_root: None,
+            suite_docs: Some("docs".into()),
+        };
+        let dev = "[Unit]\nDescription=EmbArch desk (dev): work items and connectors\nAfter=network-online.target\n\n[Service]\nExecStart=\"/b/embarch-desk\" serve\nEnvironment=\"PATH=/usr/bin\"\nEnvironment=\"EMBARCH_DESK_PORT=4892\"\nEnvironment=\"EMBARCH_DESK_CONFIG_DIR=/c\"\nEnvironment=\"EMBARCH_DESK_DATA_DIR=/d\"\nEnvironment=\"EMBARCH_DESK_TIME=on\"\nEnvironment=\"EMBARCH_DESK_DIRECT_WRITES=off\"\nEnvironment=\"CLAUDE_CONFIG_DIR=/cl\"\nEnvironment=\"EMBARCH_DESK_SUITE_DOCS=docs\"\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n";
+        assert_eq!(super::unit_text("/b/embarch-desk", "/usr/bin", Some(&i)), dev);
     }
 
     #[test]
